@@ -74,6 +74,45 @@ def kimi_k3_decode(
     )
 
 
+@torch.library.custom_op(
+    "mok::_kimi_k3_route_and_project", mutates_args=("scratch",)
+)
+def _kimi_k3_route_and_project(
+    hidden_states: torch.Tensor,
+    router_weight: torch.Tensor,
+    router_correction_bias: torch.Tensor,
+    routed_expert_down_proj: torch.Tensor,
+    scratch: torch.Tensor,
+    active_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Runs the fused Kimi K3 router and routed latent-down projection stage.
+
+    This private operator exposes the one-launch device stage that the final
+    persistent decode kernel calls directly; it is not part of the public API.
+
+    Inputs:
+        hidden_states:           bfloat16 [M, 7168]
+        router_weight:           bfloat16 [896, 7168]
+        router_correction_bias:  float32 [896]
+        routed_expert_down_proj: bfloat16 [3584, 7168]
+        scratch:                 uint8 [kimi_k3_decode_workspace_bytes()]
+        active_tokens:           int in [1, M]
+
+    Outputs:
+        expert_ids:     int32 [M, 16]
+        expert_weights: float32 [M, 16]
+        latent_x:       bfloat16 [M, 3584]
+    """
+    return _C._kimi_k3_route_and_project(
+        hidden_states,
+        router_weight,
+        router_correction_bias,
+        routed_expert_down_proj,
+        scratch,
+        active_tokens,
+    )
+
+
 @torch.library.custom_op("mok::pack_kimi_k3_mxfp4", mutates_args=())
 def pack_kimi_k3_mxfp4(
     weight: torch.Tensor,

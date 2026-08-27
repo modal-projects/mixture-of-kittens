@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cuda_bf16.h>
+
 #include <cstdint>
 
 namespace kimi_k3_decode {
@@ -12,12 +14,98 @@ inline constexpr int kNumExperts = 896;
 inline constexpr int kTopK = 16;
 inline constexpr int kTensorParallelSize = 8;
 inline constexpr int kMaxTokens = 128;
+inline constexpr int kMaxRoutes = kMaxTokens * kTopK;
 
 static constexpr int NUM_PHASE_COUNTERS = 16;
 static constexpr int SCRATCH_ALIGNMENT = 256;
+
+/// Round one region of 32-bit words up to the scratch alignment.
+inline constexpr int scratch_region_bytes(const int words) {
+    return ((words * 4 + SCRATCH_ALIGNMENT - 1) / SCRATCH_ALIGNMENT) * SCRATCH_ALIGNMENT;
+}
+
+// Scratch regions, in declaration order, each starting on a 256-byte boundary.
+inline constexpr int kPhaseBytes = 0;
+inline constexpr int kExpertIdBytes =
+    kPhaseBytes + scratch_region_bytes(NUM_PHASE_COUNTERS);
+inline constexpr int kExpertWeightBytes =
+    kExpertIdBytes + scratch_region_bytes(kMaxRoutes);
+inline constexpr int kExpertCountBytes =
+    kExpertWeightBytes + scratch_region_bytes(kMaxRoutes);
+inline constexpr int kExpertOffsetBytes =
+    kExpertCountBytes + scratch_region_bytes(kNumExperts);
+inline constexpr int kAssignmentTokenBytes =
+    kExpertOffsetBytes + scratch_region_bytes(kNumExperts + 1);
+inline constexpr int kAssignmentSlotBytes =
+    kAssignmentTokenBytes + scratch_region_bytes(kMaxRoutes);
+
 static constexpr int SCRATCH_BYTES =
-    ((NUM_PHASE_COUNTERS * sizeof(int) + SCRATCH_ALIGNMENT - 1)
-     / SCRATCH_ALIGNMENT) * SCRATCH_ALIGNMENT;
+    kAssignmentSlotBytes + scratch_region_bytes(kMaxRoutes);
+
+// Generation-tagged completion counters. Each role's last CTA clears its arrival
+// counter and bumps its generation, so a reused workspace never needs a host reset.
+inline constexpr int kRouterArrivals = 0;
+inline constexpr int kRouterGeneration = 1;
+inline constexpr int kProjectionArrivals = 2;
+inline constexpr int kProjectionGeneration = 3;
+
+/// Typed device pointers into one decode workspace.
+struct Scratch {
+    int *phase;
+    int *expert_ids;
+    float *expert_weights;
+    int *expert_counts;
+    int *expert_offsets;
+    int *assignment_tokens;
+    int *assignment_slots;
+};
+
+__host__ __device__ inline Scratch scratch_view(std::uint8_t *base) {
+    return Scratch{
+        reinterpret_cast<int *>(base + kPhaseBytes),
+        reinterpret_cast<int *>(base + kExpertIdBytes),
+        reinterpret_cast<float *>(base + kExpertWeightBytes),
+        reinterpret_cast<int *>(base + kExpertCountBytes),
+        reinterpret_cast<int *>(base + kExpertOffsetBytes),
+        reinterpret_cast<int *>(base + kAssignmentTokenBytes),
+        reinterpret_cast<int *>(base + kAssignmentSlotBytes),
+    };
+}
+
+/// Round an active token count up to the decode contract's capacity bucket.
+inline constexpr int capacity_bucket(const int active_tokens) {
+    int capacity = 1;
+    while (capacity < active_tokens) capacity *= 2;
+    return capacity;
+}
+
+// Every CTA in the fused route-and-project launch runs two warpgroups: the
+// router spreads its 896 expert rows over all eight warps, and the tcgen05
+// projection drives its MMA pipeline from the first warpgroup.
+inline constexpr int kDecodeCtaThreads = 256;
+
+/// Largest capacity bucket the direct-register CUDA-core projection covers.
+inline constexpr int kMaxCoreCapacity = 8;
+
+/// Accumulate the 8 BF16 products held in one 16-byte pair of vectors.
+__device__ __forceinline__ float accumulate_bf16_octet(
+    const float4 &left,
+    const float4 &right,
+    float total
+) {
+    const __nv_bfloat162 *const left_pairs =
+        reinterpret_cast<const __nv_bfloat162 *>(&left);
+    const __nv_bfloat162 *const right_pairs =
+        reinterpret_cast<const __nv_bfloat162 *>(&right);
+    #pragma unroll
+    for (int pair = 0; pair < 4; pair++) {
+        const float2 a = __bfloat1622float2(left_pairs[pair]);
+        const float2 b = __bfloat1622float2(right_pairs[pair]);
+        total = fmaf(a.x, b.x, total);
+        total = fmaf(a.y, b.y, total);
+    }
+    return total;
+}
 
 inline constexpr int kExpertW1W3PackedRows = 384;
 inline constexpr int kExpertW1W3PackedColumns = 1824;

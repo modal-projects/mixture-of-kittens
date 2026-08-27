@@ -378,7 +378,7 @@ def test_workspace_create_is_caller_owned_with_canonical_layout(
         assert created.device == device
         assert created.max_tokens == 128
 
-        assert created.scratch.shape == (256,)
+        assert created.scratch.shape == (40448,)
         assert created.scratch.dtype == torch.uint8
         assert created.collective_buffer.shape == (128, 10752)
         assert created.collective_buffer.dtype == torch.bfloat16

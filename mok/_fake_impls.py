@@ -1,6 +1,7 @@
 import torch
 
 from . import ops as _ops  # noqa: F401
+from .kimi_k3 import KIMI_K3_TOPK
 
 
 @torch.library.register_fake("mok::kimi_k3_decode")
@@ -34,6 +35,26 @@ def _kimi_k3_decode_fake(
     active_tokens: int,
 ) -> torch.Tensor:
     return hidden_states.new_empty(hidden_states.shape)
+
+
+@torch.library.register_fake("mok::_kimi_k3_route_and_project")
+def _kimi_k3_route_and_project_fake(
+    hidden_states: torch.Tensor,
+    router_weight: torch.Tensor,
+    router_correction_bias: torch.Tensor,
+    routed_expert_down_proj: torch.Tensor,
+    scratch: torch.Tensor,
+    active_tokens: int,
+) -> tuple[
+    torch.Tensor, torch.Tensor,  # expert_ids, expert_weights
+    torch.Tensor,  # latent_x
+]:
+    tokens = hidden_states.shape[0]
+    return (
+        hidden_states.new_empty((tokens, KIMI_K3_TOPK), dtype=torch.int32),
+        hidden_states.new_empty((tokens, KIMI_K3_TOPK), dtype=torch.float32),
+        hidden_states.new_empty((tokens, routed_expert_down_proj.shape[0])),
+    )
 
 
 @torch.library.register_fake("mok::pack_kimi_k3_mxfp4")
