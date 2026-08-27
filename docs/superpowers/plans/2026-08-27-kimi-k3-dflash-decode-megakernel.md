@@ -584,6 +584,11 @@ git commit -m "feat: fuse Kimi K3 routing and latent projection"
 - Create: `csrc/kimi_k3_decode/expert_mxfp4.cuh`
 - Modify: `csrc/kimi_k3_decode/kernel.cuh`
 - Modify: `csrc/kimi_k3_decode/types.cuh`
+- Modify: `csrc/kimi_k3_decode/entrypoints.cuh`
+- Modify: `csrc/bindings.cu`
+- Modify: `mok/ops.py`
+- Modify: `mok/_fake_impls.py`
+- Modify: `tests/test_kimi_k3_api.py`
 - Create: `tests/test_kimi_k3_expert.py`
 
 **Interfaces:**
@@ -602,7 +607,8 @@ router weights.
 Run:
 
 ```bash
-torchrun --standalone --nproc-per-node=1 -m pytest -q tests/test_kimi_k3_expert.py
+source .venv/bin/activate
+script -qec "modal shell --env rahul-dev modal_app.py::gpu_info --cmd 'cd /root/mok && torchrun --standalone --nproc-per-node=1 -m pytest -q tests/test_kimi_k3_expert.py'" /dev/null
 ```
 
 Expected: routed partials remain empty or zero.
@@ -617,6 +623,18 @@ for the 384-wide local gate/up output. Do not use ThunderKittens' K96
 
 Use expert-major assignment ranges so one CTA cluster reuses an expert's
 weights across all selected rows. Do not launch work for zero-token experts.
+
+Extend the scratch struct with aligned storage for MXFP8 latent data/scales,
+MXFP8 SiTU data/scales, an FP32 routed accumulator, and generation-tagged
+quantization/expert completion counters. Update the existing workspace-byte
+test from the same C++ source of truth.
+
+Add a private `mok::_kimi_k3_routed_experts` operator across Python, fake,
+C++, and pybind. It consumes `latent_x`, the Task 5 scratch assignment state,
+the six prepared expert tensors, a mutable BF16 routed-output buffer, scratch,
+and active token count. It returns the active `[M,3584]` view for tests. The
+production decode ABI remains unchanged; Task 9 invokes the same device
+functions from the final persistent grid.
 
 - [ ] **Step 4: Implement FP32 SiTU and MXFP4 down projection**
 
@@ -636,7 +654,8 @@ completed per-token partial to BF16 before the TP8 collective.
 Run:
 
 ```bash
-torchrun --standalone --nproc-per-node=1 -m pytest -q tests/test_kimi_k3_expert.py
+source .venv/bin/activate
+script -qec "modal shell --env rahul-dev modal_app.py::gpu_info --cmd 'cd /root/mok && torchrun --standalone --nproc-per-node=1 -m pytest -q tests/test_kimi_k3_expert.py'" /dev/null
 ```
 
 Expected: relative L1 at most `0.05`, cosine at least `0.999`, maximum absolute
@@ -645,7 +664,7 @@ error at most `1.0`, and no non-finite values.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add csrc/kimi_k3_decode tests/test_kimi_k3_expert.py
+git add csrc/kimi_k3_decode csrc/bindings.cu mok/ops.py mok/_fake_impls.py tests/test_kimi_k3_api.py tests/test_kimi_k3_expert.py
 git commit -m "feat: add Kimi K3 MXFP4 routed experts"
 ```
 
