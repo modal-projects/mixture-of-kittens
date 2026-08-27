@@ -119,10 +119,12 @@ def peer_device(device: torch.device) -> Iterator[torch.device]:
 def _make_structured_weights(device: torch.device) -> ExpertWeights:
     """Make full native-layout weights with a cheap, nonzero exact FP4 path.
 
-    Every W1/W3 row selects latent column 0, and every W2 row selects SiTU
-    column 0.  The same path is installed for all 896 experts so the exhaustive
-    assignment distribution has an analytical reference while still exercising
-    every expert range and every output tile.
+    Every W1/W3 row sums latent columns 0 and 1, and every W2 row selects SiTU
+    column 0.  The two-input path exercises both nibbles of the packed FP4 byte
+    and avoids making the end-to-end error metric hinge on one scalar through
+    two required MXFP8 quantizations.  The same path is installed for all 896
+    experts so the exhaustive assignment distribution has an analytical
+    reference while still exercising every expert range and every output tile.
     """
     free_bytes, _ = torch.cuda.mem_get_info(device)
     if free_bytes < 4 * 1024**3:
@@ -147,9 +149,9 @@ def _make_structured_weights(device: torch.device) -> ExpertWeights:
         dtype=torch.uint8,
         device=device,
     )
-    # E2M1 code 0x2 is +1.0; the high nibble remains zero.
-    w1_packed[:, :, 0] = 0x02
-    w3_packed[:, :, 0] = 0x02
+    # E2M1 code 0x2 is +1.0. Populate both nibbles to select columns 0 and 1.
+    w1_packed[:, :, 0] = 0x22
+    w3_packed[:, :, 0] = 0x22
     w2_packed[:, :, 0] = 0x02
     return ExpertWeights(
         w1_packed, w1_scale, w3_packed, w3_scale, w2_packed, w2_scale
