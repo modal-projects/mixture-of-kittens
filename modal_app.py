@@ -72,9 +72,18 @@ CUDA_STUBS = "/usr/local/cuda/lib64/stubs"
 app = modal.App("mixture-of-kittens")
 
 
+# Only the paths needed to build and run MoK are copied into the image. Using an explicit
+# allowlist (instead of the whole repo) keeps the image content-hash stable, so Modal's
+# layer cache is reused across runs and unrelated files (logs, .venv, .cursor, editor
+# state) never invalidate the cached compile.
+BUILD_DIRS = ("csrc", "mok", "benchmarks", "tests", "third_party/ThunderKittens")
+BUILD_FILES = ("setup.py", "pyproject.toml", "Makefile", "README.md", "LICENSE")
+REMOTE_ROOT = "/root/mok"
+
+
 def build_image(spec: GPUSpec) -> modal.Image:
     """Build a MoK image for one architecture. Modal caches each distinct image."""
-    return (
+    image = (
         modal.Image.from_registry(f"nvidia/cuda:{spec.cuda_tag}", add_python="3.12")
         .apt_install("build-essential", "git")
         # setuptools>=80 is required by the repo build (PEP 639 license metadata);
@@ -83,25 +92,20 @@ def build_image(spec: GPUSpec) -> modal.Image:
         .pip_install(spec.torch_spec, index_url=spec.torch_index)
         .pip_install("pytest>=9,<10", "numpy")
         .env({"MOK_ARCH": spec.mok_arch})
-        .add_local_dir(
-            ".",
-            remote_path="/root/mok",
-            copy=True,
-            ignore=[
-                ".git",
-                ".venv",
-                "**/__pycache__",
-                "**/*.so",
-                "**/*.egg-info",
-                "figures",
-            ],
-        )
-        .run_commands(
-            # Build the CUDA extension during image build; stub dir provides libcuda.
-            f"cd /root/mok && LIBRARY_PATH={CUDA_STUBS} pip install -e . --no-build-isolation",
-        )
-        .workdir("/root/mok")
     )
+    for directory in BUILD_DIRS:
+        image = image.add_local_dir(
+            directory,
+            remote_path=f"{REMOTE_ROOT}/{directory}",
+            copy=True,
+            ignore=["**/__pycache__", "**/*.so", "**/*.egg-info", "**/.git"],
+        )
+    for file in BUILD_FILES:
+        image = image.add_local_file(file, remote_path=f"{REMOTE_ROOT}/{file}", copy=True)
+    return image.run_commands(
+        # Build the CUDA extension during image build; stub dir provides libcuda.
+        f"cd {REMOTE_ROOT} && LIBRARY_PATH={CUDA_STUBS} pip install -e . --no-build-isolation",
+    ).workdir(REMOTE_ROOT)
 
 
 IMAGE = build_image(SPEC)
