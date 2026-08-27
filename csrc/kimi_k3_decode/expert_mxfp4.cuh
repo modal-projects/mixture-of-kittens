@@ -211,6 +211,7 @@ void mixed_mma_probe_kernel(
         reinterpret_cast<std::uint8_t *>(scale_b_shared.data)
             [scale_factor_1x_offset(row, 0)] = b_scale[row];
     }
+    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
     __syncthreads();
 
     __shared__ semaphore compute_done;
@@ -604,6 +605,8 @@ void kimi_k3_routed_experts_kernel(
                         kExpertW1W3PackedColumns,
                         kExpertW1W3ScaleColumns,
                         output_base, k_group);
+                    asm volatile(
+                        "fence.proxy.async.shared::cta;\n" ::: "memory");
                     __syncthreads();
                     if (warpid() == 0) {
                         asm volatile(
@@ -665,6 +668,8 @@ void kimi_k3_routed_experts_kernel(
                         kExpertW2PackedColumns,
                         kExpertW2ScaleColumns,
                         output_base, k_group);
+                    asm volatile(
+                        "fence.proxy.async.shared::cta;\n" ::: "memory");
                     __syncthreads();
                     if (warpid() == 0) {
                         asm volatile(
