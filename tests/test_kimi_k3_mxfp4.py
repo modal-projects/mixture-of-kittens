@@ -340,7 +340,7 @@ def test_pack_mxfp4_rejects_wrong_dtype(device: torch.device) -> None:
         pack_kimi_k3_mxfp4(weight, padded_k=64)
 
 
-def test_pack_mxfp4_rejects_cpu_tensor() -> None:
+def test_pack_mxfp4_rejects_cpu_tensor(device: torch.device) -> None:
     from mok.kimi_k3 import pack_kimi_k3_mxfp4
 
     weight = torch.zeros(1, 2, 64, dtype=torch.bfloat16)
@@ -775,7 +775,7 @@ def test_prepare_weights_rejects_invalid_tp_rank(
         )
 
 
-def test_mxfp4_operator_fakes_match_registered_schemas() -> None:
+def test_mxfp4_operator_fakes_match_registered_schemas(device: torch.device) -> None:
     import inspect
 
     from mok import _fake_impls
@@ -789,3 +789,19 @@ def test_mxfp4_operator_fakes_match_registered_schemas() -> None:
             argument.name for argument in operator.default._schema.arguments
         )
         assert tuple(inspect.signature(fake).parameters) == schema_names
+
+
+def test_mxfp4_operator_fakes_report_prepared_shapes(device: torch.device) -> None:
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        weight = torch.empty(896, 384, 3584, dtype=torch.bfloat16, device=device)
+        packed, scale = torch.ops.mok.pack_kimi_k3_mxfp4(weight, 3648)
+        assert packed.shape == (896, 384, 1824)
+        assert scale.shape == (896, 384, 114)
+        assert packed.dtype == torch.uint8
+        assert scale.dtype == torch.uint8
+
+        restored = torch.ops.mok.dequant_kimi_k3_mxfp4(packed, scale, 3584)
+        assert restored.shape == (896, 384, 3584)
+        assert restored.dtype == torch.bfloat16
