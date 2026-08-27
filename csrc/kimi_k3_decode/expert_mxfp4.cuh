@@ -312,6 +312,7 @@ __device__ __forceinline__ void load_quantized_activation_tile(
          index += kDecodeCtaThreads) {
         reinterpret_cast<std::uint8_t *>(scale_shared.data)[index] = 0x7fu;
     }
+    __syncthreads();
     for (int row = thread; row < kMmaM; row += kDecodeCtaThreads) {
         std::uint8_t scale = 0x7fu;
         if (row < batch_rows) {
@@ -361,6 +362,7 @@ __device__ __forceinline__ void load_mxfp4_weight_tile(
          index += kDecodeCtaThreads) {
         reinterpret_cast<std::uint8_t *>(scale_shared.data)[index] = 0x7fu;
     }
+    __syncthreads();
     for (int row = thread; row < kMmaN; row += kDecodeCtaThreads) {
         const long long row_index =
             static_cast<long long>(expert) * rows + output_base + row;
