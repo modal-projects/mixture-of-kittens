@@ -1,4 +1,5 @@
 import torch
+from torch._subclasses.fake_tensor import is_fake
 
 from . import _C
 
@@ -217,6 +218,8 @@ def _kimi_k3_routed_experts(
     """
     arguments = locals()
     for field, alignment in _ROUTED_EXPERT_ALIGNMENT:
+        if is_fake(arguments[field]):
+            continue
         past = arguments[field].data_ptr() % alignment
         if past:
             raise RuntimeError(

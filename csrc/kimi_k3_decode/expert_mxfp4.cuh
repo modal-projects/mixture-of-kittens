@@ -76,6 +76,10 @@ __device__ __forceinline__ void mixed_mma(
     kittens::st_descriptor<mixed_operand_tile, kittens::transpose::N> b_desc(b);
     constexpr std::uint32_t instruction =
         mixed_instruction_descriptor<SCALE_FACTOR_ID>();
+    // The operands are populated by ordinary shared-memory stores. Publish
+    // those writes to the asynchronous tcgen05 proxy before every issue; a CTA
+    // barrier alone does not establish this cross-proxy ordering.
+    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
     asm volatile(
         "{\n\t"
         ".reg .pred p;\n\t"
