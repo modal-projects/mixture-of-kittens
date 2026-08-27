@@ -112,18 +112,47 @@ __device__ __forceinline__ std::uint8_t quantize_e4m3(
     return static_cast<std::uint8_t>(pair);
 }
 
+// OCP MX v1.0 and PTX ISA 9.3 both define an E8M0 scale as 2^(byte - 127) with
+// byte 255 reserved for NaN, so byte 0 is the exact minimum scale 2^-127 and
+// byte 254 the maximum.
+inline constexpr unsigned int kMinE8M0ScaleByte = 0u;
+inline constexpr unsigned int kUnitE8M0ScaleByte = 0x7fu;
+inline constexpr unsigned int kMaxE8M0ScaleByte = 254u;
+
+// E4M3 tops out at 448 = 1.75 * 2^8, so a significand above 1.75 needs one more
+// binade of headroom than one at or below it.
+inline constexpr unsigned int kOneAndThreeQuartersMantissa = 0x600000u;
+
+/// Return the E8M0 byte whose scale keeps every E4M3 magnitude at most 448.
+///
+/// The exponent is derived from the input's own bits rather than from
+/// `absolute_max * (1/448)`. That product underflows toward zero for small
+/// blocks, so it needed a floor, and any floor pins every block beneath it to
+/// one coarse scale and flushes those activations to zero instead of using the
+/// scales E8M0 actually has. Working on the exponent keeps the full range
+/// reachable and also avoids the rounding of the 1/448 multiply near a binade
+/// boundary.
 __device__ __forceinline__ std::uint8_t select_e8m0_scale(
     const float absolute_max
 ) {
-    if (absolute_max == 0.0f) return 0x7fu;
-    const float candidate = fmaxf(absolute_max * (1.0f / 448.0f), 1.0e-12f);
-    std::uint16_t pair;
-    asm volatile(
-        "{cvt.rp.satfinite.ue8m0x2.f32 %0, %1, %1;}"
-        : "=h"(pair)
-        : "f"(candidate)
-    );
-    return static_cast<std::uint8_t>(pair);
+    if (absolute_max == 0.0f) {
+        return static_cast<std::uint8_t>(kUnitE8M0ScaleByte);
+    }
+    const unsigned int bits = __float_as_uint(absolute_max);
+    const unsigned int exponent_field = (bits >> 23) & 0xffu;
+    // Subnormal magnitudes are below 2^-126, and 2^-126 / 448 is already below
+    // 2^-134, so the minimum scale is the only available answer.
+    if (exponent_field == 0u) {
+        return static_cast<std::uint8_t>(kMinE8M0ScaleByte);
+    }
+    const int exponent = static_cast<int>(exponent_field) - 127;
+    const unsigned int mantissa = bits & 0x7fffffu;
+    const int scale_exponent =
+        (mantissa <= kOneAndThreeQuartersMantissa) ? exponent - 8
+                                                  : exponent - 7;
+    return static_cast<std::uint8_t>(
+        min(max(scale_exponent + 127, static_cast<int>(kMinE8M0ScaleByte)),
+            static_cast<int>(kMaxE8M0ScaleByte)));
 }
 
 static __global__ __launch_bounds__(kDecodeCtaThreads, 1)
@@ -563,9 +592,13 @@ void kimi_k3_routed_experts_kernel(
     __syncthreads();
 
     quantize_latent_rows(latent_x, scratch, active_tokens);
+    // Every thread flushes its own MXFP8 writes, and the barrier then holds the
+    // publishing thread until all of those flushes have landed device-wide, so a
+    // consumer that sees the new generation cannot read a stale block.
+    __threadfence();
     __syncthreads();
     if (thread == 0) {
-        scratch.phase[kExpertQuantizationArrivals] = 0;
+        atomicExch(&scratch.phase[kExpertQuantizationArrivals], 0);
         atomicAdd(&scratch.phase[kExpertQuantizationGeneration], 1);
     }
     __syncthreads();
@@ -715,9 +748,11 @@ void kimi_k3_routed_experts_kernel(
         routed_output[index] =
             __float2bfloat16(scratch.routed_accumulator[index]);
     }
+    // Same ordering for the routed partial: flush per thread, barrier, publish.
+    __threadfence();
     __syncthreads();
     if (thread == 0) {
-        scratch.phase[kExpertCompletionArrivals] = 0;
+        atomicExch(&scratch.phase[kExpertCompletionArrivals], 0);
         atomicAdd(&scratch.phase[kExpertCompletionGeneration], 1);
     }
     __syncthreads();

@@ -22,6 +22,9 @@ TOPK = 16
 MAX_TOKENS = 128
 MAX_ASSIGNMENTS = MAX_TOKENS * TOPK
 CAPACITY_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128)
+PROBE_COLUMNS = 128
+GAIN_PERIOD = 5.0
+ADDRESS_EXPERTS = (1, 447, 895)
 GROUP = 32
 ALIGNMENT = 256
 UNIT_SCALE = 0x7F
@@ -122,15 +125,17 @@ def _latent_column_for_row(row: int) -> int:
     return row * HIDDEN // INTERMEDIATE
 
 
-def _down_row_gain(device: torch.device) -> torch.Tensor:
+def _down_row_gain(device: torch.device, phase: int = 0) -> torch.Tensor:
     """Give each of the 3584 down-projection rows a distinguishable gain.
 
-    The period is three, which is coprime with the 128-wide output tile, so a
-    tile written to the wrong ``output_base`` changes the result instead of
-    landing on an identical value.  Each gain is exactly representable in E2M1.
+    The period is five, which divides neither the 128-wide output tile nor the
+    384-wide intermediate, so a tile written to the wrong ``output_base`` and a
+    row displaced by a whole intermediate both change the result instead of
+    landing on an identical value.  A period of three would have been blind to
+    the 384 displacement.  Each gain is exactly representable in E2M1.
     """
     rows = torch.arange(HIDDEN, dtype=torch.float32, device=device)
-    return torch.pow(2.0, -(rows % 3.0)).bfloat16()
+    return torch.pow(2.0, -((rows + phase) % GAIN_PERIOD)).bfloat16()
 
 
 def _make_structured_weights(device: torch.device) -> ExpertWeights:
@@ -349,16 +354,46 @@ def _assert_expert_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
     assert float(maximum) <= 1.0
 
 
+def _e8m0_scale_bytes(absolute_max: torch.Tensor) -> torch.Tensor:
+    """Model the kernel's E8M0 scale-byte selection over the whole float range.
+
+    OCP MX v1.0 and PTX ISA 9.3 both define the E8M0 scale as ``2^(byte - 127)``
+    with byte 255 reserved for NaN, so byte 0 is the exact minimum scale
+    ``2^-127`` and byte 254 the maximum.  The selected scale is the smallest
+    power of two that keeps ``absolute_max / scale`` inside E4M3's 448 maximum,
+    and ``448 == 1.75 * 2^8`` is what puts the mantissa threshold at 1.75.
+    """
+    mantissa, exponent = torch.frexp(absolute_max.float())
+    # frexp returns a mantissa in [0.5, 1), so 1.75 in [1, 2) becomes 0.875.
+    scale_exponent = torch.where(mantissa <= 0.875, exponent - 9, exponent - 8)
+    scale_bytes = (scale_exponent + 127).clamp(0, 254).to(torch.uint8)
+    return torch.where(
+        absolute_max == 0,
+        torch.full_like(scale_bytes, UNIT_SCALE),
+        scale_bytes,
+    )
+
+
+def _mxfp8_quantize_reference(
+    values: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the dequantized block-32 MXFP8 values and their E8M0 scale bytes."""
+    grouped = values.float().reshape(*values.shape[:-1], -1, GROUP)
+    scale_bytes = _e8m0_scale_bytes(grouped.abs().amax(dim=-1))
+    scale = torch.pow(2.0, (scale_bytes.int() - 127).float()).unsqueeze(-1)
+    quantized = (grouped / scale).to(torch.float8_e4m3fn).float()
+    return (quantized * scale).reshape(values.shape), scale_bytes
+
+
 def _mxfp8_dequant_reference(values: torch.Tensor) -> torch.Tensor:
-    """Reference the E4M3/E8M0 round-up quantizer used by mixed MMA."""
-    values = values.float()
-    absolute_max = values.abs().amax(dim=-1, keepdim=True)
-    safe = absolute_max.clamp_min(torch.finfo(torch.float32).tiny)
-    exponent = torch.ceil(torch.log2(safe / 448.0)).clamp(-126, 127)
-    scale = torch.pow(2.0, exponent)
-    scale = torch.where(absolute_max == 0, torch.ones_like(scale), scale)
-    quantized = (values / scale).to(torch.float8_e4m3fn).float()
-    return quantized * scale
+    """Reference the E4M3/E8M0 quantizer used by mixed MMA.
+
+    Derived from the scale byte rather than from ``log2``, so it stays exact at
+    the bottom of the E8M0 range where a float ``absolute_max / 448`` becomes
+    subnormal.
+    """
+    dequantized, _ = _mxfp8_quantize_reference(values)
+    return dequantized
 
 
 def test_workspace_bytes_matches_extended_expert_scratch(
@@ -412,6 +447,79 @@ def test_sm103_mixed_mxfp8_by_mxfp4_instruction_probe(
     assert actual.shape == (rows, 128)
     assert actual.dtype == torch.float32
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "exponent", [-125, -121, -100, -60, -49, -32, 0]
+)
+def test_mixed_mma_probe_spans_the_full_e8m0_activation_range(
+    device: torch.device,
+    exponent: int,
+) -> None:
+    """Activation scales must reach the E8M0 minimum, not an arbitrary floor.
+
+    ``exponent == -121`` makes the selected scale byte exactly 0, the minimum
+    ``2^-127`` that OCP MX v1.0 and PTX ISA 9.3 define; ``-125`` asks for a
+    smaller scale than E8M0 has and must clamp onto that same boundary.  Row 0
+    is left as an all-zero block.  Every A value is a power-of-two multiple of
+    an E2M1 code point and B carries the compensating inverse scale, so the
+    whole product is exactly representable and a correct kernel returns a
+    nonzero result at every exponent.
+    """
+    from mok import _C
+    from mok.ops import dequant_kimi_k3_mxfp4, pack_kimi_k3_mxfp4
+
+    rows = 16
+    code_points = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    a = torch.zeros(rows, GROUP, dtype=torch.bfloat16, device=device)
+    for row in range(1, rows):
+        a[row] = code_points.repeat(4).roll(row) * (2.0**exponent)
+    b = torch.zeros(1, PROBE_COLUMNS, GROUP, dtype=torch.bfloat16, device=device)
+    for row in range(PROBE_COLUMNS):
+        b[0, row] = code_points.repeat(4).roll(row + 3) * (
+            2.0 ** (-exponent - 6)
+        )
+    b_packed, b_scale = pack_kimi_k3_mxfp4(b, GROUP)
+    exact_b = dequant_kimi_k3_mxfp4(b_packed, b_scale, GROUP)[0].float()
+
+    actual = _C._kimi_k3_mixed_mma_probe(a, b_packed[0], b_scale[0])
+    expected = _mxfp8_dequant_reference(a) @ exact_b.T
+
+    assert torch.equal(actual[0], torch.zeros_like(actual[0]))
+    assert float(actual[1:].abs().max()) > 0.0
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-4)
+
+
+def test_activation_scale_bytes_reach_the_e8m0_minimum(
+    device: torch.device,
+    weights: ExpertWeights,
+    scratch: torch.Tensor,
+) -> None:
+    """The published latent scale bytes must span down to byte 0, not stop early."""
+    latent = torch.zeros(4, HIDDEN, dtype=torch.bfloat16, device=device)
+    # One row per interesting binade: normal, deep below any practical floor,
+    # exactly on the E8M0 minimum byte, and past it so the byte clamps to zero.
+    for row, exponent in enumerate((0, -60, -119, -125)):
+        latent[row] = 2.0**exponent
+    _write_assignments(scratch, [(0, token, 0, 1.0) for token in range(4)])
+
+    _call(latent, weights, torch.empty_like(latent), scratch, 4)
+
+    published = _region(scratch, "latent_scale", torch.uint8)[
+        : 4 * (HIDDEN // GROUP)
+    ].view(4, HIDDEN // GROUP)
+    _, expected = _mxfp8_quantize_reference(latent.float())
+    assert torch.equal(published, expected)
+    # 2^-119 lands on the minimum byte exactly and 2^-125 clamps onto it, while
+    # 2^-60 must still pick a byte strictly below the 2^0 row's.
+    assert int(published[2].max()) == 0
+    assert int(published[3].max()) == 0
+    assert int(published[1].max()) < int(published[0].min())
 
 
 @pytest.mark.parametrize("rows", [1, 2, 8, 16])
@@ -546,6 +654,108 @@ def test_empty_experts_are_skipped_and_cannot_change_output(
             tensor[895].copy_(original)
 
 
+def _install_expert_pattern(
+    weights: ExpertWeights, expert: int, phase: int, device: torch.device
+) -> None:
+    """Give one expert a shard that no other expert can imitate.
+
+    The gate/up rows are displaced by whole latent scale groups and the down
+    rows carry a shifted gain phase, so reading the wrong expert changes both
+    which latent columns are reduced and how each output tile is weighted.
+    """
+    from mok.ops import pack_kimi_k3_mxfp4
+
+    rows = torch.arange(INTERMEDIATE, device=device)
+    columns = (
+        torch.tensor(
+            [_latent_column_for_row(row) for row in range(INTERMEDIATE)],
+            device=device,
+        )
+        + GROUP * phase
+    ) % HIDDEN
+    gate_dense = torch.zeros(
+        1, INTERMEDIATE, HIDDEN, dtype=torch.bfloat16, device=device
+    )
+    gate_dense[0, rows, columns] = 1.0
+    up_dense = torch.zeros_like(gate_dense)
+    up_dense[0, rows, columns] = 0.5
+    down_dense = _down_row_gain(device, phase).view(1, HIDDEN, 1).expand(
+        1, HIDDEN, INTERMEDIATE
+    ).contiguous()
+
+    for dense, packed, scale in (
+        (gate_dense, weights.w1_packed, weights.w1_scale),
+        (up_dense, weights.w3_packed, weights.w3_scale),
+        (down_dense, weights.w2_packed, weights.w2_scale),
+    ):
+        expert_packed, expert_scale = pack_kimi_k3_mxfp4(dense, dense.size(-1))
+        packed[expert].copy_(expert_packed[0])
+        scale[expert].copy_(expert_scale[0])
+
+
+def test_selected_expert_ids_are_addressed_exactly(
+    device: torch.device,
+    weights: ExpertWeights,
+    scratch: torch.Tensor,
+) -> None:
+    """Route to a low, a middle, and the final expert with distinct shards.
+
+    Each selected expert also differs from the shared shard every other expert
+    carries, so reading expert 0, aliasing the expert stride onto a neighbour,
+    swapping the two selected experts of a token, or misaddressing the final
+    expert all change the result.  Only the selected slices are dequantized.
+    """
+    tensors = (
+        weights.w1_packed,
+        weights.w1_scale,
+        weights.w3_packed,
+        weights.w3_scale,
+        weights.w2_packed,
+        weights.w2_scale,
+    )
+    saved = {
+        expert: tuple(tensor[expert].clone() for tensor in tensors)
+        for expert in ADDRESS_EXPERTS
+    }
+    try:
+        for phase, expert in enumerate(ADDRESS_EXPERTS, start=1):
+            _install_expert_pattern(weights, expert, phase, device)
+
+        latent = _random_latent(device, 6, 7100)
+        assignments: list[Assignment] = []
+        for token in range(6):
+            assignments.append(
+                (ADDRESS_EXPERTS[token % 3], token, 0, 0.375)
+            )
+            assignments.append(
+                (ADDRESS_EXPERTS[(token + 1) % 3], token, 1, 0.625)
+            )
+        _write_assignments(scratch, assignments)
+
+        actual = _call(latent, weights, torch.empty_like(latent), scratch, 6)
+        expected = _reference(latent, weights, assignments, 6)
+        _assert_expert_close(actual, expected)
+
+        # Prove the shards discriminate: every addressing bug this test is meant
+        # to catch must move the reference well past the max-abs tolerance.
+        collapsed = [(0, token, slot, weight)
+                     for _, token, slot, weight in assignments]
+        swapped = [
+            (ADDRESS_EXPERTS[(ADDRESS_EXPERTS.index(expert) + 1) % 3],
+             token, slot, weight)
+            for expert, token, slot, weight in assignments
+        ]
+        neighbour = [(expert - 1, token, slot, weight)
+                     for expert, token, slot, weight in assignments]
+        for wrong in (collapsed, swapped, neighbour):
+            deviation = _reference(latent, weights, wrong, 6) - expected
+            assert float(deviation.abs().max()) > 1.0
+    finally:
+        for expert, originals in saved.items():
+            for tensor, original in zip(tensors, originals):
+                tensor[expert].copy_(original)
+
+
 def test_active_token_mask_zeros_inactive_output_rows(
     device: torch.device,
     weights: ExpertWeights,
@@ -586,6 +796,65 @@ def test_reused_scratch_resets_accumulator_and_generation_counters(
     assert int(generations[2][5] - generations[1][5]) == 1
     assert int(generations[1][8] - generations[0][8]) == 1
     assert int(generations[2][8] - generations[1][8]) == 1
+
+
+def _published_latent(scratch: torch.Tensor, rows: int) -> torch.Tensor:
+    """Dequantize the MXFP8 latent the quantization stage published."""
+    codes = _region(scratch, "latent_mxfp8", torch.uint8)[
+        : rows * HIDDEN
+    ].view(rows, HIDDEN)
+    scale_bytes = _region(scratch, "latent_scale", torch.uint8)[
+        : rows * (HIDDEN // GROUP)
+    ].view(rows, HIDDEN // GROUP)
+    scale = torch.pow(2.0, (scale_bytes.int() - 127).float())
+    values = codes.view(torch.float8_e4m3fn).float().view(rows, -1, GROUP)
+    return (values * scale.unsqueeze(-1)).reshape(rows, HIDDEN)
+
+
+def test_replayed_generations_publish_fresh_quantized_and_routed_state(
+    device: torch.device,
+    weights: ExpertWeights,
+    scratch: torch.Tensor,
+) -> None:
+    """Consume both published stages on every replay of one reused workspace.
+
+    Each replay uses a different latent and a different row count, so any stale
+    MXFP8 block or stale routed row left over from an earlier generation is a
+    value mismatch rather than a silently plausible result.
+    """
+    replays = ((1, 7000), (8, 7001), (3, 7002), (16, 7003), (2, 7004), (8, 7005))
+    quantization: list[int] = []
+    completion: list[int] = []
+
+    for rows, seed in replays:
+        latent = _random_latent(device, rows, seed)
+        assignments = [(0, token, 0, 1.0) for token in range(rows)]
+        _write_assignments(scratch, assignments)
+        routed = torch.full_like(latent, float("nan"))
+
+        actual = _call(latent, weights, routed, scratch, rows)
+
+        # Stage one: the published MXFP8 latent and its E8M0 scale bytes.
+        expected_latent, expected_scales = _mxfp8_quantize_reference(
+            latent.float()
+        )
+        published_scales = _region(scratch, "latent_scale", torch.uint8)[
+            : rows * (HIDDEN // GROUP)
+        ].view(rows, HIDDEN // GROUP)
+        assert torch.equal(published_scales, expected_scales)
+        assert torch.equal(_published_latent(scratch, rows), expected_latent)
+
+        # Stage two: the routed output for this generation.
+        _assert_expert_close(actual, _reference(latent, weights, assignments, rows))
+
+        phase = _region(scratch, "phase", torch.int32)
+        assert int(phase[4]) == 0, "quantization arrivals must be reset"
+        assert int(phase[7]) == 0, "completion arrivals must be reset"
+        quantization.append(int(phase[5]))
+        completion.append(int(phase[8]))
+
+    assert quantization == [quantization[0] + step for step in range(len(replays))]
+    assert completion == [completion[0] + step for step in range(len(replays))]
 
 
 def test_expert_stage_uses_the_tensor_devices_current_stream(
@@ -708,6 +977,104 @@ def test_expert_stage_rejects_undersized_scratch_and_wrong_weight_layout(
     )
     with pytest.raises(RuntimeError, match="expert_w1_packed"):
         _call(latent, invalid, routed, scratch, 1)
+
+
+def _offset_copy(source: torch.Tensor, element_offset: int) -> torch.Tensor:
+    """Copy ``source`` into a contiguous view starting at a nonzero storage offset.
+
+    The caching allocator hands out 256-byte-aligned blocks, so the returned view
+    is under-aligned by exactly ``element_offset`` elements while staying
+    contiguous and correctly shaped: the shape of pointer no dtype, shape, or
+    contiguity check would notice.
+    """
+    flat = torch.empty(
+        source.numel() + element_offset, dtype=source.dtype, device=source.device
+    )
+    assert flat.data_ptr() % ALIGNMENT == 0
+    view = flat[element_offset:].view(source.shape)
+    view.copy_(source)
+    assert view.is_contiguous()
+    assert view.storage_offset() == element_offset
+    return view
+
+
+def _expert_call_arguments(
+    device: torch.device, weights: ExpertWeights, scratch: torch.Tensor
+) -> dict[str, object]:
+    latent = torch.zeros(1, HIDDEN, dtype=torch.bfloat16, device=device)
+    latent[:, 0] = 0.5
+    _write_assignments(scratch, [(0, 0, 0, 1.0)])
+    return {
+        "latent_x": latent,
+        "expert_w1_packed": weights.w1_packed,
+        "expert_w1_scale": weights.w1_scale,
+        "expert_w3_packed": weights.w3_packed,
+        "expert_w3_scale": weights.w3_scale,
+        "expert_w2_packed": weights.w2_packed,
+        "expert_w2_scale": weights.w2_scale,
+        "routed_output": torch.empty_like(latent),
+        "scratch": scratch,
+        "active_tokens": 1,
+    }
+
+
+# Every expert-stage tensor, with an element offset that under-aligns it.
+_EXPERT_ALIGNMENT_CASES = tuple(
+    (field, 1, 16)
+    for field in (
+        "latent_x",
+        "expert_w1_packed",
+        "expert_w1_scale",
+        "expert_w3_packed",
+        "expert_w3_scale",
+        "expert_w2_packed",
+        "expert_w2_scale",
+        "routed_output",
+    )
+) + (("scratch", 16, ALIGNMENT),)
+
+
+@pytest.mark.parametrize(("field", "element_offset", "alignment"),
+                         _EXPERT_ALIGNMENT_CASES)
+def test_expert_stage_rejects_every_misaligned_offset_view(
+    device: torch.device,
+    weights: ExpertWeights,
+    scratch: torch.Tensor,
+    field: str,
+    element_offset: int,
+    alignment: int,
+) -> None:
+    from mok import ops
+
+    arguments = _expert_call_arguments(device, weights, scratch)
+    misaligned = _offset_copy(arguments[field], element_offset)
+    assert misaligned.data_ptr() % alignment != 0
+    arguments[field] = misaligned
+
+    with pytest.raises(RuntimeError, match=rf"{field}.*{alignment}"):
+        ops._kimi_k3_routed_experts(**arguments)
+
+
+@pytest.mark.parametrize(("field", "element_offset", "alignment"),
+                         _EXPERT_ALIGNMENT_CASES)
+def test_c_entrypoint_rejects_every_misaligned_offset_view(
+    device: torch.device,
+    weights: ExpertWeights,
+    scratch: torch.Tensor,
+    field: str,
+    element_offset: int,
+    alignment: int,
+) -> None:
+    """The extension must guard itself: callers can bypass ``mok.ops`` entirely."""
+    from mok import _C
+
+    arguments = _expert_call_arguments(device, weights, scratch)
+    arguments[field] = _offset_copy(arguments[field], element_offset)
+
+    with pytest.raises(RuntimeError, match=rf"{field}.*{alignment}"):
+        _C._kimi_k3_routed_experts(
+            *(arguments[name] for name in _EXPERT_ARGUMENTS)
+        )
 
 
 def _profiled_kernel_names(call: Callable[[], object]) -> list[str]:
