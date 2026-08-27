@@ -74,6 +74,31 @@ def kimi_k3_decode(
     )
 
 
+# The fused stage reads hidden states and both projection weights through 16-byte
+# vector loads and TMA descriptors, and indexes scratch through 256-byte aligned
+# regions, so a contiguous view at an under-aligned storage offset would fault or
+# silently shift every region. The extension enforces this too, for callers that
+# reach past this operator; repeating it here names the offending argument before
+# any device work is queued. The correction bias is only read as a scalar float,
+# so its natural alignment is enough.
+_ROUTE_AND_PROJECT_ALIGNMENT = (
+    ("hidden_states", 16),
+    ("router_weight", 16),
+    ("routed_expert_down_proj", 16),
+    ("scratch", 256),
+)
+
+
+def _check_route_and_project_alignment(arguments: dict[str, torch.Tensor]) -> None:
+    for field, alignment in _ROUTE_AND_PROJECT_ALIGNMENT:
+        past = arguments[field].data_ptr() % alignment
+        if past:
+            raise RuntimeError(
+                f"MoK: _kimi_k3_route_and_project requires {field} aligned to "
+                f"{alignment} bytes, got a pointer {past} bytes past one"
+            )
+
+
 @torch.library.custom_op(
     "mok::_kimi_k3_route_and_project", mutates_args=("scratch",)
 )
@@ -103,6 +128,14 @@ def _kimi_k3_route_and_project(
         expert_weights: float32 [M, 16]
         latent_x:       bfloat16 [M, 3584]
     """
+    _check_route_and_project_alignment(
+        {
+            "hidden_states": hidden_states,
+            "router_weight": router_weight,
+            "routed_expert_down_proj": routed_expert_down_proj,
+            "scratch": scratch,
+        }
+    )
     return _C._kimi_k3_route_and_project(
         hidden_states,
         router_weight,

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import inspect
+import json
 import math
 import os
-from collections.abc import Iterator
+import tempfile
+from collections.abc import Callable, Iterator
 
 import pytest
 import torch
@@ -29,6 +31,20 @@ _ROUTE_AND_PROJECT_ARGUMENTS = (
     "routed_expert_down_proj",
     "scratch",
     "active_tokens",
+)
+
+
+# The stage reads these tensors with 16-byte vector loads and TMA descriptors and
+# indexes scratch through 256-byte aligned regions, so each first element must sit
+# on the matching boundary. Each case pairs the reported field with the private
+# helper's argument name, the element offset that breaks the boundary, and the
+# boundary itself. ``router_correction_bias`` is only ever read as a scalar float,
+# so it is deliberately absent.
+_ROUTE_AND_PROJECT_ALIGNMENT = (
+    ("hidden_states", "hidden_states", 1, 16),
+    ("router_weight", "router_weight", 1, 16),
+    ("routed_expert_down_proj", "latent_down_proj", 1, 16),
+    ("scratch", "scratch", 16, 256),
 )
 
 
@@ -822,3 +838,193 @@ def test_route_and_project_rejects_float32_hidden_states(
 
     with pytest.raises(RuntimeError, match="hidden_states"):
         _route_and_project(**arguments)
+
+
+def _offset_copy(source: torch.Tensor, element_offset: int) -> torch.Tensor:
+    """Copy ``source`` into a contiguous view starting at a nonzero storage offset.
+
+    The caching allocator hands out 256-byte-aligned blocks, so the returned view
+    is under-aligned by exactly ``element_offset`` elements while remaining
+    contiguous and correctly shaped. That is the shape of the pointer a caller can
+    hand the stage without any dtype, shape, or contiguity check noticing.
+    """
+    flat = torch.empty(
+        source.numel() + element_offset, dtype=source.dtype, device=source.device
+    )
+    assert flat.data_ptr() % 256 == 0
+    view = flat[element_offset:].view(source.shape)
+    view.copy_(source)
+    assert view.is_contiguous()
+    assert view.storage_offset() == element_offset
+    return view
+
+
+@pytest.mark.parametrize(
+    ("field", "argument", "element_offset", "alignment"),
+    _ROUTE_AND_PROJECT_ALIGNMENT,
+)
+def test_route_and_project_rejects_misaligned_pointers(
+    device: torch.device,
+    scratch: torch.Tensor,
+    latent_down_proj: torch.Tensor,
+    field: str,
+    argument: str,
+    element_offset: int,
+    alignment: int,
+) -> None:
+    arguments = _valid_call_arguments(device, latent_down_proj, scratch)
+    misaligned = _offset_copy(arguments[argument], element_offset)
+    assert misaligned.data_ptr() % alignment != 0
+    arguments[argument] = misaligned
+
+    with pytest.raises(RuntimeError, match=rf"{field}.*{alignment}"):
+        _route_and_project(**arguments)
+
+
+@pytest.mark.parametrize(
+    ("field", "argument", "element_offset", "alignment"),
+    _ROUTE_AND_PROJECT_ALIGNMENT,
+)
+def test_c_entrypoint_rejects_misaligned_pointers(
+    device: torch.device,
+    scratch: torch.Tensor,
+    latent_down_proj: torch.Tensor,
+    field: str,
+    argument: str,
+    element_offset: int,
+    alignment: int,
+) -> None:
+    """The extension must guard itself: callers can bypass ``mok.ops`` entirely."""
+    from mok import _C
+
+    arguments = _valid_call_arguments(device, latent_down_proj, scratch)
+    arguments[argument] = _offset_copy(arguments[argument], element_offset)
+
+    with pytest.raises(RuntimeError, match=rf"{field}.*{alignment}"):
+        _C._kimi_k3_route_and_project(
+            arguments["hidden_states"],
+            arguments["router_weight"],
+            arguments["router_correction_bias"],
+            arguments["latent_down_proj"],
+            arguments["scratch"],
+            arguments["active_tokens"],
+        )
+
+
+def test_route_and_project_accepts_sufficiently_aligned_offset_views(
+    device: torch.device, latent_down_proj: torch.Tensor
+) -> None:
+    """Nonzero storage offsets are fine as long as they clear the real boundary.
+
+    The correction bias is only read as a scalar float, so a 4-byte-aligned view
+    of it must keep working; everything else is offset to the next 16- or 256-byte
+    boundary rather than rejected.
+    """
+    tokens = 8
+    hidden_states, router_weight, bias = _seeded_router_inputs(
+        device, tokens, seed=13001
+    )
+    _assert_selection_is_unambiguous(hidden_states, router_weight, bias)
+    reference_ids, _ = _router_reference(hidden_states, router_weight, bias)
+    expected_latent = hidden_states @ latent_down_proj.T
+    offset_scratch = _offset_copy(
+        torch.zeros(SCRATCH_BYTES, dtype=torch.uint8, device=device), 256
+    )
+    offset_bias = _offset_copy(bias, 1)
+    assert offset_bias.data_ptr() % 16 != 0
+
+    expert_ids, _, latent_x = _route_and_project(
+        _offset_copy(hidden_states, 8),
+        _offset_copy(router_weight, 8),
+        offset_bias,
+        _offset_copy(latent_down_proj, 8),
+        offset_scratch,
+        tokens,
+    )
+
+    assert torch.equal(
+        torch.sort(expert_ids, dim=-1).values,
+        torch.sort(reference_ids.int(), dim=-1).values,
+    )
+    torch.testing.assert_close(
+        latent_x.float(), expected_latent.float(), atol=0.5, rtol=0.01
+    )
+
+
+def _profiled_kernel_names(call: Callable[[], object]) -> list[str]:
+    """Names of every CUDA kernel the profiler attributes to ``call()``."""
+    torch.cuda.synchronize()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as profiler:
+        call()
+        torch.cuda.synchronize()
+    with tempfile.TemporaryDirectory() as directory:
+        # ``export_chrome_trace`` renames a temporary file into place, so the
+        # trace has to be reopened by path once the export has returned.
+        trace_path = os.path.join(directory, "trace.json")
+        profiler.export_chrome_trace(trace_path)
+        with open(trace_path, encoding="utf-8") as trace_file:
+            trace = json.load(trace_file)
+    return [
+        event["name"]
+        for event in trace["traceEvents"]
+        if event.get("cat") == "kernel"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("tokens", "active_tokens", "expected_kernel"),
+    [
+        (8, 8, "route_and_project_core_kernel"),
+        (64, 5, "route_and_project_core_kernel"),
+        (32, 32, "route_and_project_tensor_kernel"),
+        (128, 20, "route_and_project_tensor_kernel"),
+    ],
+)
+def test_route_and_project_is_exactly_one_kernel_launch(
+    device: torch.device,
+    scratch: torch.Tensor,
+    latent_down_proj: torch.Tensor,
+    tokens: int,
+    active_tokens: int,
+    expected_kernel: str,
+) -> None:
+    hidden_states, router_weight, bias = _seeded_router_inputs(
+        device, tokens, seed=14000 + tokens
+    )
+
+    def call() -> object:
+        return _route_and_project(
+            hidden_states,
+            router_weight,
+            bias,
+            latent_down_proj,
+            scratch,
+            active_tokens,
+        )
+
+    call()
+    names = _profiled_kernel_names(call)
+
+    assert len(names) == 1, names
+    assert expected_kernel in names[0]
+
+
+def test_launch_counter_sees_a_second_kernel_launch(
+    device: torch.device, scratch: torch.Tensor, latent_down_proj: torch.Tensor
+) -> None:
+    """Keep the one-launch assertions honest by proving the counter can say two."""
+    hidden_states, router_weight, bias = _seeded_router_inputs(
+        device, 8, seed=14999
+    )
+
+    def call_twice() -> None:
+        for _ in range(2):
+            _route_and_project(
+                hidden_states, router_weight, bias, latent_down_proj, scratch, 8
+            )
+
+    names = _profiled_kernel_names(call_twice)
+
+    assert len(names) == 2, names

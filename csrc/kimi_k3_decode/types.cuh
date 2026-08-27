@@ -19,6 +19,12 @@ inline constexpr int kMaxRoutes = kMaxTokens * kTopK;
 static constexpr int NUM_PHASE_COUNTERS = 16;
 static constexpr int SCRATCH_ALIGNMENT = 256;
 
+// Hidden states and both projection weights are read through 16-byte vector loads
+// and, on the tcgen05 path, through TMA descriptors, so their first element must
+// sit on a 16-byte boundary. Their row pitches are multiples of 16 bytes already,
+// which leaves the base pointer as the only thing a caller can get wrong.
+static constexpr int VECTOR_ALIGNMENT = 16;
+
 /// Round one region of 32-bit words up to the scratch alignment.
 inline constexpr int scratch_region_bytes(const int words) {
     return ((words * 4 + SCRATCH_ALIGNMENT - 1) / SCRATCH_ALIGNMENT) * SCRATCH_ALIGNMENT;

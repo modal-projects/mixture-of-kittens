@@ -33,6 +33,19 @@ static __host__ void check_sm103(const at::Tensor &hidden_states, const char *na
                 properties.major, properties.minor);
 }
 
+static __host__ void check_route_and_project_alignment(
+    const at::Tensor &tensor,
+    const char *field,
+    const int alignment
+) {
+    const auto address = reinterpret_cast<std::uintptr_t>(tensor.data_ptr());
+    TORCH_CHECK(address % static_cast<std::uintptr_t>(alignment) == 0,
+                "MoK: _kimi_k3_route_and_project requires ", field,
+                " aligned to ", alignment, " bytes, got a pointer ",
+                address % static_cast<std::uintptr_t>(alignment),
+                " bytes past one");
+}
+
 static __host__ std::tuple<at::Tensor, at::Tensor, at::Tensor>
 route_and_project_entrypoint(
     const at::Tensor &hidden_states,
@@ -85,6 +98,17 @@ route_and_project_entrypoint(
                     && scratch.device() == hidden_states.device(),
                 "MoK: _kimi_k3_route_and_project requires every tensor on ",
                 hidden_states.device());
+    // A contiguous view at a nonzero storage offset clears every check above and
+    // still under-aligns the pointer, which faults the vector loads and TMA
+    // descriptors or silently shifts every scratch region.
+    check_route_and_project_alignment(hidden_states, "hidden_states",
+                                      VECTOR_ALIGNMENT);
+    check_route_and_project_alignment(router_weight, "router_weight",
+                                      VECTOR_ALIGNMENT);
+    check_route_and_project_alignment(routed_expert_down_proj,
+                                      "routed_expert_down_proj",
+                                      VECTOR_ALIGNMENT);
+    check_route_and_project_alignment(scratch, "scratch", SCRATCH_ALIGNMENT);
 
     check_sm103(hidden_states, "_kimi_k3_route_and_project");
 

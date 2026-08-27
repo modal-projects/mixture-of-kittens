@@ -9,6 +9,9 @@ import torch.distributed as dist
 
 @pytest.fixture(scope="session")
 def context() -> Iterator[tuple[int, int, torch.device]]:
+    if "RANK" not in os.environ:
+        pytest.skip("distributed tests must be launched through torchrun")
+
     from mok.functional import clear_workspace_cache
 
     rank = int(os.environ["RANK"])
