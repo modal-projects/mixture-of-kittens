@@ -1,5 +1,6 @@
 """Official numerical contract for the Kimi K3 decode MoE block."""
 
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
@@ -144,7 +145,16 @@ def create_kimi_k3_decode_workspace(
             max_tokens=max_tokens,
         )
     )
-    symm_mem.enable_symm_mem_for_group(group_name)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=(
+                r"`enable_symm_mem_for_group` is deprecated\. "
+                r"There is no need to call this function anymore\."
+            ),
+            category=FutureWarning,
+        )
+        symm_mem.enable_symm_mem_for_group(group_name)
 
     def allocate_symmetric(
         *shape: int,

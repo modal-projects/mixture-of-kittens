@@ -37,8 +37,6 @@ def context() -> Iterator[tuple[int, int, torch.device]]:
 def tp8_context(
     context: tuple[int, int, torch.device],
 ) -> Iterator[tuple[int, int, torch.device]]:
-    from mok.kimi_k3 import clear_kimi_k3_decode_workspace_cache
-
     rank, world_size, device = context
     if world_size != 8:
         pytest.skip("Kimi K3 decode requires TP8")
@@ -49,4 +47,5 @@ def tp8_context(
         yield rank, world_size, device
     finally:
         dist.barrier()
+        from mok.kimi_k3 import clear_kimi_k3_decode_workspace_cache
         clear_kimi_k3_decode_workspace_cache()

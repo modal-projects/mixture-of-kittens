@@ -349,6 +349,9 @@ def test_workspace_requires_128_max_tokens(
         )
 
 
+@pytest.mark.filterwarnings(
+    "error:`enable_symm_mem_for_group` is deprecated.*:FutureWarning"
+)
 def test_workspace_create_is_caller_owned_with_canonical_layout(
     tp8_context: tuple[int, int, torch.device],
 ) -> None:
@@ -409,6 +412,9 @@ def test_workspace_create_is_caller_owned_with_canonical_layout(
         torch.cuda.synchronize(device)
 
 
+@pytest.mark.filterwarnings(
+    "error:`enable_symm_mem_for_group` is deprecated.*:FutureWarning"
+)
 def test_workspace_cache_reuses_entry_and_clear_replaces_it(
     tp8_context: tuple[int, int, torch.device],
 ) -> None:
