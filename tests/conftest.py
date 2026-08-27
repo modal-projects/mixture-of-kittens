@@ -6,11 +6,11 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from mok.functional import clear_workspace_cache
-
 
 @pytest.fixture(scope="session")
 def context() -> Iterator[tuple[int, int, torch.device]]:
+    from mok.functional import clear_workspace_cache
+
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
