@@ -36,6 +36,28 @@ def _kimi_k3_decode_fake(
     return hidden_states.new_empty(hidden_states.shape)
 
 
+@torch.library.register_fake("mok::pack_kimi_k3_mxfp4")
+def _pack_kimi_k3_mxfp4_fake(
+    weight: torch.Tensor,
+    padded_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:  # packed, scale
+    experts, rows, _ = weight.shape
+    return (
+        weight.new_empty((experts, rows, padded_k // 2), dtype=torch.uint8),
+        weight.new_empty((experts, rows, padded_k // 32), dtype=torch.uint8),
+    )
+
+
+@torch.library.register_fake("mok::dequant_kimi_k3_mxfp4")
+def _dequant_kimi_k3_mxfp4_fake(
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    logical_k: int,
+) -> torch.Tensor:  # weight
+    experts, rows, _ = packed.shape
+    return packed.new_empty((experts, rows, logical_k), dtype=torch.bfloat16)
+
+
 @torch.library.register_fake("mok::all_gather_top_experts")
 def _all_gather_top_experts_fake(
     top_experts: torch.Tensor,

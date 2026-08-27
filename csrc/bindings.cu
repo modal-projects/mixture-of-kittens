@@ -25,6 +25,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("tp_rank"), pybind11::arg("active_tokens"));
     m.def("kimi_k3_decode_workspace_bytes",
           &kimi_k3_decode::kimi_k3_decode_workspace_bytes);
+    m.def("pack_kimi_k3_mxfp4", &kimi_k3_decode::mxfp4::pack_entrypoint, "",
+          pybind11::arg("weight"), pybind11::arg("padded_k"));
+    m.def("dequant_kimi_k3_mxfp4", &kimi_k3_decode::mxfp4::dequant_entrypoint, "",
+          pybind11::arg("packed"), pybind11::arg("scale"),
+          pybind11::arg("logical_k"));
     m.def("all_gather_top_experts", &utils::all_gather_top_experts::all_gather_top_experts_entrypoint, "",
           pybind11::arg("top_experts"), pybind11::arg("all_gather_top_experts_buffer"),
           pybind11::arg("all_gather_top_experts_buffer_multicast_ptr"), pybind11::arg("rank"), pybind11::arg("chunk_bytes"));

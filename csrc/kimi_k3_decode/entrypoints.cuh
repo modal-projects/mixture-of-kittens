@@ -2,6 +2,7 @@
 
 #include "pyutils/torchutils.cuh"
 
+#include "mxfp4.cuh"
 #include "types.cuh"
 
 #include <ATen/ops/empty_like.h>

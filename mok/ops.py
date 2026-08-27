@@ -74,6 +74,43 @@ def kimi_k3_decode(
     )
 
 
+@torch.library.custom_op("mok::pack_kimi_k3_mxfp4", mutates_args=())
+def pack_kimi_k3_mxfp4(
+    weight: torch.Tensor,
+    padded_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Packs BF16 expert weights as group-32 MXFP4 with K zero-padding.
+
+    Inputs:
+        weight:   bfloat16 [E, N, K] with K divisible by 32
+        padded_k: int, a multiple of 32 that is at least K
+
+    Outputs:
+        packed: uint8 [E, N, padded_k // 2]
+        scale:  uint8 [E, N, padded_k // 32]
+    """
+    return _C.pack_kimi_k3_mxfp4(weight, padded_k)
+
+
+@torch.library.custom_op("mok::dequant_kimi_k3_mxfp4", mutates_args=())
+def dequant_kimi_k3_mxfp4(
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    logical_k: int,
+) -> torch.Tensor:
+    """Decodes group-32 MXFP4 bytes back to BF16 and truncates padded K.
+
+    Inputs:
+        packed:    uint8 [E, N, padded_k // 2]
+        scale:     uint8 [E, N, padded_k // 32]
+        logical_k: int, a multiple of 32 that is at most padded_k
+
+    Outputs:
+        weight: bfloat16 [E, N, logical_k]
+    """
+    return _C.dequant_kimi_k3_mxfp4(packed, scale, logical_k)
+
+
 @torch.library.custom_op("mok::all_gather_top_experts", mutates_args=("all_gather_top_experts_buffer",))
 def all_gather_top_experts(
     top_experts: torch.Tensor,

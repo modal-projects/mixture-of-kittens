@@ -21,6 +21,10 @@ KIMI_K3_RMS_EPS = 1e-5
 KIMI_K3_SITU_BETA = 4.0
 KIMI_K3_SITU_LINEAR_BETA = 25.0
 KIMI_K3_CAPACITY_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128)
+KIMI_K3_MXFP4_GROUP_SIZE = 32
+KIMI_K3_MXFP4_UNIT_SCALE_BYTE = 0x7F
+# Routed w1/w3 pad logical K=3584 to 3648 so SM103 K96 instructions cover it.
+KIMI_K3_W1W3_PADDED_K = 3648
 
 
 @dataclass(frozen=True, slots=True)
@@ -373,6 +377,243 @@ def validate_kimi_k3_decode_inputs(
             raise TypeError(f"{name} must have dtype torch.uint8")
 
 
+def _validate_mxfp4_tensor(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+) -> None:
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if tensor.ndim != 3:
+        raise ValueError(f"{name} must have shape [E, N, K]")
+    if tensor.dtype != dtype:
+        raise TypeError(f"{name} must have dtype {dtype}")
+    if tensor.device.type != "cuda":
+        raise ValueError(f"{name} must be on a CUDA device")
+    if not tensor.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+
+
+def _is_all_finite(tensor: torch.Tensor) -> bool:
+    """Report whether a nonempty tensor holds only finite values."""
+    extremes = torch.stack((tensor.amax(), tensor.amin()))
+    return bool(torch.isfinite(extremes).all())
+
+
+def pack_kimi_k3_mxfp4(
+    weight: torch.Tensor,
+    *,
+    padded_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack one BF16 ``[E, N, K]`` expert matrix as OCP group-32 MXFP4.
+
+    Each group of 32 contiguous K values yields one E8M0 power-of-two scale byte
+    and 16 packed E2M1 pair bytes, with the even element of a pair in the low
+    nibble. ``K`` is zero-padded to ``padded_k``; all-zero and padded groups
+    store packed zero with the unit scale byte ``0x7f``.
+
+    This is one-time preparation. The decode hot path never repacks weights.
+    """
+    _validate_mxfp4_tensor("weight", weight, dtype=torch.bfloat16)
+    if type(padded_k) is not int:
+        raise TypeError("padded_k must be an integer")
+    logical_k = weight.shape[2]
+    if logical_k <= 0 or logical_k % KIMI_K3_MXFP4_GROUP_SIZE != 0:
+        raise ValueError(
+            "weight logical K must be a positive multiple of "
+            f"{KIMI_K3_MXFP4_GROUP_SIZE}, got {logical_k}"
+        )
+    if padded_k % KIMI_K3_MXFP4_GROUP_SIZE != 0:
+        raise ValueError(
+            f"padded_k must be a multiple of {KIMI_K3_MXFP4_GROUP_SIZE}, "
+            f"got {padded_k}"
+        )
+    if padded_k < logical_k:
+        raise ValueError(
+            f"padded_k must be at least the logical K {logical_k}, got {padded_k}"
+        )
+    if not _is_all_finite(weight):
+        raise ValueError("weight must contain only finite values")
+
+    from .ops import pack_kimi_k3_mxfp4 as pack_operator
+
+    return pack_operator(weight, padded_k)
+
+
+def dequant_kimi_k3_mxfp4(
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    logical_k: int,
+) -> torch.Tensor:
+    """Decode group-32 MXFP4 bytes to BF16 and truncate to ``logical_k``.
+
+    The decoded value of each element is its E2M1 code point multiplied by the
+    E8M0 scale of its group, so this inverts :func:`pack_kimi_k3_mxfp4` exactly
+    for values that MXFP4 represents exactly.
+    """
+    _validate_mxfp4_tensor("packed", packed, dtype=torch.uint8)
+    _validate_mxfp4_tensor("scale", scale, dtype=torch.uint8)
+    if scale.device != packed.device:
+        raise ValueError(f"scale must be on {packed.device}")
+    if type(logical_k) is not int:
+        raise TypeError("logical_k must be an integer")
+
+    padded_k = packed.shape[2] * 2
+    if padded_k % KIMI_K3_MXFP4_GROUP_SIZE != 0:
+        raise ValueError(
+            "packed must cover a K extent that is a multiple of "
+            f"{KIMI_K3_MXFP4_GROUP_SIZE}, got {padded_k}"
+        )
+    expected_scale_shape = (
+        packed.shape[0],
+        packed.shape[1],
+        padded_k // KIMI_K3_MXFP4_GROUP_SIZE,
+    )
+    if tuple(scale.shape) != expected_scale_shape:
+        raise ValueError(
+            f"scale must have shape {expected_scale_shape}, got {tuple(scale.shape)}"
+        )
+    if (
+        logical_k <= 0
+        or logical_k % KIMI_K3_MXFP4_GROUP_SIZE != 0
+        or logical_k > padded_k
+    ):
+        raise ValueError(
+            f"logical_k must be a positive multiple of {KIMI_K3_MXFP4_GROUP_SIZE} "
+            f"and at most the padded K {padded_k}, got {logical_k}"
+        )
+
+    from .ops import dequant_kimi_k3_mxfp4 as dequant_operator
+
+    return dequant_operator(packed, scale, logical_k)
+
+
+def _own(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a contiguous copy that does not alias a wider allocation."""
+    return tensor.clone(memory_format=torch.contiguous_format)
+
+
+def prepare_kimi_k3_decode_weights(
+    *,
+    router_weight: torch.Tensor,
+    router_correction_bias: torch.Tensor,
+    routed_latent_down_proj: torch.Tensor,
+    routed_latent_up_proj: torch.Tensor,
+    routed_latent_norm_weight: torch.Tensor,
+    expert_w1: torch.Tensor,
+    expert_w3: torch.Tensor,
+    expert_w2: torch.Tensor,
+    shared_gate_proj: torch.Tensor,
+    shared_up_proj: torch.Tensor,
+    shared_down_proj: torch.Tensor,
+    tp_rank: int,
+) -> KimiK3DecodeWeights:
+    """Convert replicated BF16 Kimi K3 weights into one rank's prepared shard.
+
+    ``expert_w1``, ``expert_w3``, and ``expert_w2`` are the per-expert gate, up,
+    and down projections that :func:`kimi_k3_moe_reference` names
+    ``routed_expert_gate_proj``, ``routed_expert_up_proj``, and
+    ``routed_expert_down_proj``. ``routed_latent_down_proj`` and
+    ``routed_latent_up_proj`` are the replicated ``7168 -> 3584`` and
+    ``3584 -> 7168`` latent projections, which the prepared contract names
+    ``routed_expert_down_proj`` and ``routed_expert_up_proj``.
+
+    The rank keeps routed intermediate rows ``[tp_rank * 384, (tp_rank + 1) *
+    384)`` and shared intermediate rows ``[tp_rank * 768, (tp_rank + 1) * 768)``.
+    Routed ``w1``/``w3`` pack with K padded to 3648 and routed ``w2`` packs with
+    K=384. Replicated tensors are passed through without copying.
+
+    This runs once per model load. The decode operator consumes the returned
+    packed tensors directly and never repacks them.
+    """
+    if type(tp_rank) is not int or not 0 <= tp_rank < KIMI_K3_TP_SIZE:
+        raise ValueError(
+            f"tp_rank must be an integer between 0 and {KIMI_K3_TP_SIZE - 1}"
+        )
+
+    routed_width = KIMI_K3_ROUTED_INTERMEDIATE_SIZE // KIMI_K3_TP_SIZE
+    shared_width = KIMI_K3_SHARED_INTERMEDIATE_SIZE // KIMI_K3_TP_SIZE
+    layouts = (
+        ("router_weight", router_weight,
+         (KIMI_K3_NUM_EXPERTS, KIMI_K3_HIDDEN_SIZE), torch.bfloat16),
+        ("router_correction_bias", router_correction_bias,
+         (KIMI_K3_NUM_EXPERTS,), torch.float32),
+        ("routed_latent_down_proj", routed_latent_down_proj,
+         (KIMI_K3_LATENT_SIZE, KIMI_K3_HIDDEN_SIZE), torch.bfloat16),
+        ("routed_latent_up_proj", routed_latent_up_proj,
+         (KIMI_K3_HIDDEN_SIZE, KIMI_K3_LATENT_SIZE), torch.bfloat16),
+        ("routed_latent_norm_weight", routed_latent_norm_weight,
+         (KIMI_K3_LATENT_SIZE,), torch.bfloat16),
+        ("expert_w1", expert_w1,
+         (KIMI_K3_NUM_EXPERTS, KIMI_K3_ROUTED_INTERMEDIATE_SIZE,
+          KIMI_K3_LATENT_SIZE), torch.bfloat16),
+        ("expert_w3", expert_w3,
+         (KIMI_K3_NUM_EXPERTS, KIMI_K3_ROUTED_INTERMEDIATE_SIZE,
+          KIMI_K3_LATENT_SIZE), torch.bfloat16),
+        ("expert_w2", expert_w2,
+         (KIMI_K3_NUM_EXPERTS, KIMI_K3_LATENT_SIZE,
+          KIMI_K3_ROUTED_INTERMEDIATE_SIZE), torch.bfloat16),
+        ("shared_gate_proj", shared_gate_proj,
+         (KIMI_K3_SHARED_INTERMEDIATE_SIZE, KIMI_K3_HIDDEN_SIZE), torch.bfloat16),
+        ("shared_up_proj", shared_up_proj,
+         (KIMI_K3_SHARED_INTERMEDIATE_SIZE, KIMI_K3_HIDDEN_SIZE), torch.bfloat16),
+        ("shared_down_proj", shared_down_proj,
+         (KIMI_K3_HIDDEN_SIZE, KIMI_K3_SHARED_INTERMEDIATE_SIZE), torch.bfloat16),
+    )
+    for name, tensor, expected_shape, expected_dtype in layouts:
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor")
+        if tensor.dtype != expected_dtype:
+            raise TypeError(f"{name} must have dtype {expected_dtype}")
+        if tuple(tensor.shape) != expected_shape:
+            raise ValueError(
+                f"{name} must have shape {expected_shape}, got {tuple(tensor.shape)}"
+            )
+        if tensor.device.type != "cuda":
+            raise ValueError(f"{name} must be on a CUDA device")
+        if tensor.device != router_weight.device:
+            raise ValueError(f"{name} must be on {router_weight.device}")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+
+    routed_start = tp_rank * routed_width
+    shared_start = tp_rank * shared_width
+    expert_w1_packed, expert_w1_scale = pack_kimi_k3_mxfp4(
+        _own(expert_w1.narrow(1, routed_start, routed_width)),
+        padded_k=KIMI_K3_W1W3_PADDED_K,
+    )
+    expert_w3_packed, expert_w3_scale = pack_kimi_k3_mxfp4(
+        _own(expert_w3.narrow(1, routed_start, routed_width)),
+        padded_k=KIMI_K3_W1W3_PADDED_K,
+    )
+    expert_w2_packed, expert_w2_scale = pack_kimi_k3_mxfp4(
+        _own(expert_w2.narrow(2, routed_start, routed_width)),
+        padded_k=routed_width,
+    )
+
+    return KimiK3DecodeWeights(
+        router_weight=router_weight,
+        router_correction_bias=router_correction_bias,
+        routed_expert_down_proj=routed_latent_down_proj,
+        routed_expert_up_proj=routed_latent_up_proj,
+        routed_latent_rmsnorm_weight=routed_latent_norm_weight,
+        expert_w1_packed=expert_w1_packed,
+        expert_w1_scale=expert_w1_scale,
+        expert_w3_packed=expert_w3_packed,
+        expert_w3_scale=expert_w3_scale,
+        expert_w2_packed=expert_w2_packed,
+        expert_w2_scale=expert_w2_scale,
+        shared_gate_proj=_own(shared_gate_proj.narrow(0, shared_start, shared_width)),
+        shared_up_proj=_own(shared_up_proj.narrow(0, shared_start, shared_width)),
+        shared_down_proj=_own(
+            shared_down_proj.narrow(1, shared_start, shared_width)
+        ),
+        tp_rank=tp_rank,
+    )
+
+
 def kimi_k3_router_reference(
     hidden_states: torch.Tensor,
     router_weight: torch.Tensor,
@@ -553,6 +794,8 @@ __all__ = [
     "KIMI_K3_HIDDEN_SIZE",
     "KIMI_K3_LATENT_SIZE",
     "KIMI_K3_MAX_TOKENS",
+    "KIMI_K3_MXFP4_GROUP_SIZE",
+    "KIMI_K3_MXFP4_UNIT_SCALE_BYTE",
     "KIMI_K3_NUM_EXPERTS",
     "KIMI_K3_RMS_EPS",
     "KIMI_K3_ROUTED_INTERMEDIATE_SIZE",
@@ -561,16 +804,20 @@ __all__ = [
     "KIMI_K3_SITU_LINEAR_BETA",
     "KIMI_K3_TOPK",
     "KIMI_K3_TP_SIZE",
+    "KIMI_K3_W1W3_PADDED_K",
     "KimiK3DecodeConfig",
     "KimiK3DecodeWorkspace",
     "KimiK3DecodeWeights",
     "clear_kimi_k3_decode_workspace_cache",
     "create_kimi_k3_decode_workspace",
+    "dequant_kimi_k3_mxfp4",
     "get_kimi_k3_decode_workspace",
     "kimi_k3_moe_reference",
     "kimi_k3_rmsnorm_reference",
     "kimi_k3_router_reference",
     "kimi_k3_situ_reference",
+    "pack_kimi_k3_mxfp4",
+    "prepare_kimi_k3_decode_weights",
     "validate_kimi_k3_decode_hidden_states",
     "validate_kimi_k3_decode_inputs",
 ]
