@@ -13,8 +13,7 @@
 namespace kimi_k3_decode {
 
 inline std::int64_t kimi_k3_decode_workspace_bytes() noexcept {
-    // Task 2 defines the query boundary; subsequent tasks define scratch offsets.
-    return 0;
+    return SCRATCH_BYTES;
 }
 
 static __host__ at::Tensor kimi_k3_decode_entrypoint(

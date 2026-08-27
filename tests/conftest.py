@@ -31,3 +31,22 @@ def context() -> Iterator[tuple[int, int, torch.device]]:
         clear_workspace_cache()
         gc.collect()
         dist.destroy_process_group()
+
+
+@pytest.fixture(scope="session")
+def tp8_context(
+    context: tuple[int, int, torch.device],
+) -> Iterator[tuple[int, int, torch.device]]:
+    from mok.kimi_k3 import clear_kimi_k3_decode_workspace_cache
+
+    rank, world_size, device = context
+    if world_size != 8:
+        pytest.skip("Kimi K3 decode requires TP8")
+    if torch.cuda.get_device_capability(device) != (10, 3):
+        pytest.skip("Kimi K3 decode requires SM103 B300")
+
+    try:
+        yield rank, world_size, device
+    finally:
+        dist.barrier()
+        clear_kimi_k3_decode_workspace_cache()

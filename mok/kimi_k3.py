@@ -1,8 +1,11 @@
 """Official numerical contract for the Kimi K3 decode MoE block."""
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
+import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 
 
 KIMI_K3_HIDDEN_SIZE = 7168
@@ -49,6 +52,225 @@ class KimiK3DecodeWeights:
     shared_up_proj: torch.Tensor
     shared_down_proj: torch.Tensor
     tp_rank: int
+
+
+@dataclass(slots=True)
+class KimiK3DecodeWorkspace:
+    group_name: str
+    tp_rank: int
+    tp_size: int
+    device: torch.device
+    max_tokens: int
+    scratch: torch.Tensor
+    collective_buffer: torch.Tensor
+    collective_handle: Any
+    collective_ptrs: list[int]
+    collective_multicast_ptr: int
+    output_mailbox: torch.Tensor
+    output_mailbox_handle: Any
+    output_mailbox_ptrs: list[int]
+    barrier_buffer: torch.Tensor
+    barrier_handle: Any
+    barrier_ptrs: list[int]
+    barrier_multicast_ptr: int
+    barrier_target: torch.Tensor
+    error_flag: torch.Tensor
+
+
+_KIMI_K3_DECODE_WORKSPACE_CACHE: dict[
+    tuple[str, int, int],
+    KimiK3DecodeWorkspace,
+] = {}
+
+
+def _validate_kimi_k3_decode_workspace_args(
+    group: dist.ProcessGroup,
+    *,
+    device: torch.device,
+    max_tokens: int,
+) -> tuple[str, int, int, torch.device]:
+    if not dist.is_initialized():
+        raise RuntimeError("torch.distributed must be initialized")
+    if not isinstance(group, dist.ProcessGroup):
+        raise TypeError("group must be a torch.distributed.ProcessGroup")
+    if not isinstance(device, torch.device):
+        raise TypeError("device must be a torch.device")
+    if device.type != "cuda":
+        raise ValueError("device must be a CUDA device")
+    if type(max_tokens) is not int or max_tokens != KIMI_K3_MAX_TOKENS:
+        raise ValueError(f"max_tokens must equal {KIMI_K3_MAX_TOKENS}")
+
+    device_index = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    device = torch.device("cuda", device_index)
+    if device_index != torch.cuda.current_device():
+        raise ValueError(
+            "Kimi K3 decode workspace device must be the current CUDA device"
+        )
+    if torch.cuda.get_device_capability(device) != (10, 3):
+        raise NotImplementedError(
+            "Kimi K3 decode workspace requires an SM103 GPU"
+        )
+
+    group_name = group.group_name
+    if not isinstance(group_name, str) or not group_name:
+        raise RuntimeError("process group must have a nonempty group_name")
+    tp_rank = dist.get_rank(group=group)
+    tp_size = dist.get_world_size(group=group)
+    if tp_size != KIMI_K3_TP_SIZE:
+        raise ValueError(
+            f"Kimi K3 decode workspace requires TP{KIMI_K3_TP_SIZE}"
+        )
+    if not 0 <= tp_rank < tp_size:
+        raise RuntimeError("current process is not a member of the TP process group")
+
+    return group_name, tp_rank, tp_size, device
+
+
+def create_kimi_k3_decode_workspace(
+    group: dist.ProcessGroup,
+    *,
+    device: torch.device,
+    max_tokens: int = KIMI_K3_MAX_TOKENS,
+) -> KimiK3DecodeWorkspace:
+    """Create a new caller-owned TP8 Kimi K3 decode workspace."""
+    from . import _C
+
+    group_name, tp_rank, tp_size, device = (
+        _validate_kimi_k3_decode_workspace_args(
+            group,
+            device=device,
+            max_tokens=max_tokens,
+        )
+    )
+    symm_mem.enable_symm_mem_for_group(group_name)
+
+    def allocate_symmetric(
+        *shape: int,
+        dtype: torch.dtype,
+        zero: bool = False,
+    ) -> tuple[torch.Tensor, Any, list[int]]:
+        buffer = symm_mem.empty(*shape, dtype=dtype, device=device)
+        if zero:
+            buffer.zero_()
+        handle = symm_mem.rendezvous(buffer, group_name)
+        pointers = [
+            int(handle.buffer_ptrs[peer_rank])
+            for peer_rank in range(tp_size)
+        ]
+        return buffer, handle, pointers
+
+    scratch = torch.zeros(
+        _C.kimi_k3_decode_workspace_bytes(),
+        dtype=torch.uint8,
+        device=device,
+    )
+    (
+        collective_buffer,
+        collective_handle,
+        collective_ptrs,
+    ) = allocate_symmetric(
+        max_tokens,
+        KIMI_K3_LATENT_SIZE + KIMI_K3_HIDDEN_SIZE,
+        dtype=torch.bfloat16,
+    )
+    collective_multicast_ptr = int(collective_handle.multicast_ptr)
+    (
+        output_mailbox,
+        output_mailbox_handle,
+        output_mailbox_ptrs,
+    ) = allocate_symmetric(
+        tp_size,
+        max_tokens,
+        KIMI_K3_NUM_EXPERTS,
+        dtype=torch.bfloat16,
+    )
+    barrier_buffer, barrier_handle, barrier_ptrs = allocate_symmetric(
+        1,
+        dtype=torch.int32,
+        zero=True,
+    )
+    barrier_multicast_ptr = int(barrier_handle.multicast_ptr)
+    barrier_target = torch.zeros(1, dtype=torch.int32, device=device)
+    error_flag = torch.zeros(1, dtype=torch.int32, device=device)
+
+    dist.barrier(
+        group=group,
+        async_op=True,
+        device_ids=[device.index],
+    ).block_current_stream()
+
+    return KimiK3DecodeWorkspace(
+        group_name=group_name,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+        device=device,
+        max_tokens=max_tokens,
+        scratch=scratch,
+        collective_buffer=collective_buffer,
+        collective_handle=collective_handle,
+        collective_ptrs=collective_ptrs,
+        collective_multicast_ptr=collective_multicast_ptr,
+        output_mailbox=output_mailbox,
+        output_mailbox_handle=output_mailbox_handle,
+        output_mailbox_ptrs=output_mailbox_ptrs,
+        barrier_buffer=barrier_buffer,
+        barrier_handle=barrier_handle,
+        barrier_ptrs=barrier_ptrs,
+        barrier_multicast_ptr=barrier_multicast_ptr,
+        barrier_target=barrier_target,
+        error_flag=error_flag,
+    )
+
+
+def get_kimi_k3_decode_workspace(
+    group: dist.ProcessGroup,
+    *,
+    device: torch.device,
+    max_tokens: int = KIMI_K3_MAX_TOKENS,
+) -> KimiK3DecodeWorkspace:
+    """Return the cached TP8 workspace, creating it when absent."""
+    group_name, _, _, normalized_device = (
+        _validate_kimi_k3_decode_workspace_args(
+            group,
+            device=device,
+            max_tokens=max_tokens,
+        )
+    )
+    cache_key = (
+        group_name,
+        normalized_device.index,
+        KIMI_K3_MAX_TOKENS,
+    )
+    workspace = _KIMI_K3_DECODE_WORKSPACE_CACHE.get(cache_key)
+    if workspace is None:
+        workspace = create_kimi_k3_decode_workspace(
+            group,
+            device=normalized_device,
+            max_tokens=max_tokens,
+        )
+        _KIMI_K3_DECODE_WORKSPACE_CACHE[cache_key] = workspace
+    return workspace
+
+
+def clear_kimi_k3_decode_workspace_cache() -> None:
+    """Synchronize participating ranks and release all cached workspaces."""
+    workspaces = tuple(_KIMI_K3_DECODE_WORKSPACE_CACHE.values())
+    if not workspaces:
+        return
+
+    from .ops import barrier_all
+
+    for workspace in workspaces:
+        barrier_all(
+            workspace.barrier_buffer,
+            workspace.barrier_ptrs,
+            workspace.barrier_multicast_ptr,
+            workspace.barrier_target,
+        )
+    torch.cuda.synchronize(workspaces[0].device)
+    _KIMI_K3_DECODE_WORKSPACE_CACHE.clear()
 
 
 def validate_kimi_k3_decode_hidden_states(hidden_states: torch.Tensor) -> None:
@@ -330,7 +552,11 @@ __all__ = [
     "KIMI_K3_TOPK",
     "KIMI_K3_TP_SIZE",
     "KimiK3DecodeConfig",
+    "KimiK3DecodeWorkspace",
     "KimiK3DecodeWeights",
+    "clear_kimi_k3_decode_workspace_cache",
+    "create_kimi_k3_decode_workspace",
+    "get_kimi_k3_decode_workspace",
     "kimi_k3_moe_reference",
     "kimi_k3_rmsnorm_reference",
     "kimi_k3_router_reference",
