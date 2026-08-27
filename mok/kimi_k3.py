@@ -24,6 +24,112 @@ class KimiK3DecodeConfig:
     max_tokens: int = KIMI_K3_MAX_TOKENS
 
 
+@dataclass(frozen=True, slots=True)
+class KimiK3DecodeWeights:
+    router_weight: torch.Tensor
+    router_correction_bias: torch.Tensor
+    routed_expert_down_proj: torch.Tensor
+    routed_expert_up_proj: torch.Tensor
+    routed_latent_rmsnorm_weight: torch.Tensor
+    expert_w1_packed: torch.Tensor
+    expert_w1_scale: torch.Tensor
+    expert_w3_packed: torch.Tensor
+    expert_w3_scale: torch.Tensor
+    expert_w2_packed: torch.Tensor
+    expert_w2_scale: torch.Tensor
+    shared_gate_proj: torch.Tensor
+    shared_up_proj: torch.Tensor
+    shared_down_proj: torch.Tensor
+    tp_rank: int
+
+
+def validate_kimi_k3_decode_hidden_states(hidden_states: torch.Tensor) -> None:
+    """Validate the shape and storage contract for one decode invocation."""
+    if not isinstance(hidden_states, torch.Tensor):
+        raise TypeError("hidden_states must be a torch.Tensor")
+    if hidden_states.ndim != 2 or hidden_states.shape[1] != KIMI_K3_HIDDEN_SIZE:
+        raise ValueError(
+            f"hidden_states must have shape [M, {KIMI_K3_HIDDEN_SIZE}]"
+        )
+    num_tokens = hidden_states.shape[0]
+    if not 1 <= num_tokens <= KIMI_K3_MAX_TOKENS:
+        raise ValueError(
+            f"hidden_states token count must be between 1 and {KIMI_K3_MAX_TOKENS}"
+        )
+    if hidden_states.dtype != torch.bfloat16:
+        raise TypeError("hidden_states must have dtype torch.bfloat16")
+    if not hidden_states.is_contiguous():
+        raise ValueError("hidden_states must be contiguous")
+
+
+def validate_kimi_k3_decode_inputs(
+    hidden_states: torch.Tensor,
+    weights: KimiK3DecodeWeights,
+) -> None:
+    """Validate fixed Kimi K3 dimensions and prepared-weight layouts."""
+    validate_kimi_k3_decode_hidden_states(hidden_states)
+    if not isinstance(weights, KimiK3DecodeWeights):
+        raise TypeError("weights must be a KimiK3DecodeWeights instance")
+    if type(weights.tp_rank) is not int or not 0 <= weights.tp_rank < KIMI_K3_TP_SIZE:
+        raise ValueError(
+            f"weights.tp_rank must be an integer between 0 and {KIMI_K3_TP_SIZE - 1}"
+        )
+
+    bf16_layouts = (
+        ("router_weight", weights.router_weight,
+         (KIMI_K3_NUM_EXPERTS, KIMI_K3_HIDDEN_SIZE)),
+        ("routed_expert_down_proj", weights.routed_expert_down_proj,
+         (KIMI_K3_LATENT_SIZE, KIMI_K3_HIDDEN_SIZE)),
+        ("routed_expert_up_proj", weights.routed_expert_up_proj,
+         (KIMI_K3_HIDDEN_SIZE, KIMI_K3_LATENT_SIZE)),
+        ("routed_latent_rmsnorm_weight", weights.routed_latent_rmsnorm_weight,
+         (KIMI_K3_LATENT_SIZE,)),
+        ("shared_gate_proj", weights.shared_gate_proj,
+         (KIMI_K3_SHARED_INTERMEDIATE_SIZE, KIMI_K3_HIDDEN_SIZE)),
+        ("shared_up_proj", weights.shared_up_proj,
+         (KIMI_K3_SHARED_INTERMEDIATE_SIZE, KIMI_K3_HIDDEN_SIZE)),
+        ("shared_down_proj", weights.shared_down_proj,
+         (KIMI_K3_HIDDEN_SIZE, KIMI_K3_SHARED_INTERMEDIATE_SIZE)),
+    )
+    uint8_layouts = (
+        ("expert_w1_packed", weights.expert_w1_packed, (896, 384, 1824)),
+        ("expert_w1_scale", weights.expert_w1_scale, (896, 384, 114)),
+        ("expert_w3_packed", weights.expert_w3_packed, (896, 384, 1824)),
+        ("expert_w3_scale", weights.expert_w3_scale, (896, 384, 114)),
+        ("expert_w2_packed", weights.expert_w2_packed, (896, 3584, 192)),
+        ("expert_w2_scale", weights.expert_w2_scale, (896, 3584, 12)),
+    )
+    layouts = (
+        *bf16_layouts,
+        (
+            "router_correction_bias",
+            weights.router_correction_bias,
+            (KIMI_K3_NUM_EXPERTS,),
+        ),
+        *uint8_layouts,
+    )
+    for name, tensor, expected_shape in layouts:
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor")
+        if tuple(tensor.shape) != expected_shape:
+            raise ValueError(
+                f"{name} must have shape {expected_shape}, got {tuple(tensor.shape)}"
+            )
+        if tensor.device != hidden_states.device:
+            raise ValueError(f"{name} must be on {hidden_states.device}")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+
+    for name, tensor, _ in bf16_layouts:
+        if tensor.dtype != torch.bfloat16:
+            raise TypeError(f"{name} must have dtype torch.bfloat16")
+    if weights.router_correction_bias.dtype != torch.float32:
+        raise TypeError("router_correction_bias must have dtype torch.float32")
+    for name, tensor, _ in uint8_layouts:
+        if tensor.dtype != torch.uint8:
+            raise TypeError(f"{name} must have dtype torch.uint8")
+
+
 def kimi_k3_router_reference(
     hidden_states: torch.Tensor,
     router_weight: torch.Tensor,
@@ -213,8 +319,11 @@ __all__ = [
     "KIMI_K3_TOPK",
     "KIMI_K3_TP_SIZE",
     "KimiK3DecodeConfig",
+    "KimiK3DecodeWeights",
     "kimi_k3_moe_reference",
     "kimi_k3_rmsnorm_reference",
     "kimi_k3_router_reference",
     "kimi_k3_situ_reference",
+    "validate_kimi_k3_decode_hidden_states",
+    "validate_kimi_k3_decode_inputs",
 ]

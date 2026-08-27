@@ -3,6 +3,77 @@ import torch
 from . import _C
 
 
+@torch.library.custom_op(
+    "mok::kimi_k3_decode",
+    mutates_args=(
+        "scratch",
+        "collective_buffer",
+        "output_mailbox",
+        "barrier_buffer",
+        "error_flag",
+    ),
+)
+def kimi_k3_decode(
+    hidden_states: torch.Tensor,
+    router_weight: torch.Tensor,
+    router_correction_bias: torch.Tensor,
+    routed_expert_down_proj: torch.Tensor,
+    routed_expert_up_proj: torch.Tensor,
+    routed_latent_rmsnorm_weight: torch.Tensor,
+    expert_w1_packed: torch.Tensor,
+    expert_w1_scale: torch.Tensor,
+    expert_w3_packed: torch.Tensor,
+    expert_w3_scale: torch.Tensor,
+    expert_w2_packed: torch.Tensor,
+    expert_w2_scale: torch.Tensor,
+    shared_gate_proj: torch.Tensor,
+    shared_up_proj: torch.Tensor,
+    shared_down_proj: torch.Tensor,
+    scratch: torch.Tensor,
+    collective_buffer: torch.Tensor,
+    collective_buffer_ptrs: list[int],
+    collective_buffer_multicast_ptr: int,
+    output_mailbox: torch.Tensor,
+    output_mailbox_ptrs: list[int],
+    barrier_buffer: torch.Tensor,
+    barrier_buffer_ptrs: list[int],
+    barrier_buffer_multicast_ptr: int,
+    error_flag: torch.Tensor,
+    tp_rank: int,
+    active_tokens: int,
+) -> torch.Tensor:
+    """Invoke the temporary compiled boundary for Kimi K3 decode."""
+    return _C.kimi_k3_decode(
+        hidden_states,
+        router_weight,
+        router_correction_bias,
+        routed_expert_down_proj,
+        routed_expert_up_proj,
+        routed_latent_rmsnorm_weight,
+        expert_w1_packed,
+        expert_w1_scale,
+        expert_w3_packed,
+        expert_w3_scale,
+        expert_w2_packed,
+        expert_w2_scale,
+        shared_gate_proj,
+        shared_up_proj,
+        shared_down_proj,
+        scratch,
+        collective_buffer,
+        collective_buffer_ptrs,
+        collective_buffer_multicast_ptr,
+        output_mailbox,
+        output_mailbox_ptrs,
+        barrier_buffer,
+        barrier_buffer_ptrs,
+        barrier_buffer_multicast_ptr,
+        error_flag,
+        tp_rank,
+        active_tokens,
+    )
+
+
 @torch.library.custom_op("mok::all_gather_top_experts", mutates_args=("all_gather_top_experts_buffer",))
 def all_gather_top_experts(
     top_experts: torch.Tensor,

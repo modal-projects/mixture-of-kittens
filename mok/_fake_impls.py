@@ -3,6 +3,39 @@ import torch
 from . import ops as _ops  # noqa: F401
 
 
+@torch.library.register_fake("mok::kimi_k3_decode")
+def _kimi_k3_decode_fake(
+    hidden_states: torch.Tensor,
+    router_weight: torch.Tensor,
+    router_correction_bias: torch.Tensor,
+    routed_expert_down_proj: torch.Tensor,
+    routed_expert_up_proj: torch.Tensor,
+    routed_latent_rmsnorm_weight: torch.Tensor,
+    expert_w1_packed: torch.Tensor,
+    expert_w1_scale: torch.Tensor,
+    expert_w3_packed: torch.Tensor,
+    expert_w3_scale: torch.Tensor,
+    expert_w2_packed: torch.Tensor,
+    expert_w2_scale: torch.Tensor,
+    shared_gate_proj: torch.Tensor,
+    shared_up_proj: torch.Tensor,
+    shared_down_proj: torch.Tensor,
+    scratch: torch.Tensor,
+    collective_buffer: torch.Tensor,
+    collective_buffer_ptrs: list[int],
+    collective_buffer_multicast_ptr: int,
+    output_mailbox: torch.Tensor,
+    output_mailbox_ptrs: list[int],
+    barrier_buffer: torch.Tensor,
+    barrier_buffer_ptrs: list[int],
+    barrier_buffer_multicast_ptr: int,
+    error_flag: torch.Tensor,
+    tp_rank: int,
+    active_tokens: int,
+) -> torch.Tensor:
+    return hidden_states.new_empty(hidden_states.shape)
+
+
 @torch.library.register_fake("mok::all_gather_top_experts")
 def _all_gather_top_experts_fake(
     top_experts: torch.Tensor,

@@ -1,5 +1,5 @@
 SRC ?= csrc/bindings.cu
-HEADERS := $(wildcard csrc/*.cuh) $(wildcard csrc/megakernel/*.cuh)
+HEADERS := $(wildcard csrc/*.cuh) $(wildcard csrc/megakernel/*.cuh) $(wildcard csrc/kimi_k3_decode/*.cuh)
 NVCC ?= nvcc
 ARCH ?= SM103
 PYTHON ?= python3

@@ -1,9 +1,30 @@
+#include "kimi_k3_decode/entrypoints.cuh"
 #include "megakernel/entrypoints.cuh"
 #include "mxfp8.cuh"
 #include "scheduler.cuh"
 #include "utils.cuh"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("kimi_k3_decode", &kimi_k3_decode::kimi_k3_decode_entrypoint, "",
+          pybind11::arg("hidden_states"),
+          pybind11::arg("router_weight"), pybind11::arg("router_correction_bias"),
+          pybind11::arg("routed_expert_down_proj"), pybind11::arg("routed_expert_up_proj"),
+          pybind11::arg("routed_latent_rmsnorm_weight"),
+          pybind11::arg("expert_w1_packed"), pybind11::arg("expert_w1_scale"),
+          pybind11::arg("expert_w3_packed"), pybind11::arg("expert_w3_scale"),
+          pybind11::arg("expert_w2_packed"), pybind11::arg("expert_w2_scale"),
+          pybind11::arg("shared_gate_proj"), pybind11::arg("shared_up_proj"),
+          pybind11::arg("shared_down_proj"),
+          pybind11::arg("scratch"),
+          pybind11::arg("collective_buffer"), pybind11::arg("collective_buffer_ptrs"),
+          pybind11::arg("collective_buffer_multicast_ptr"),
+          pybind11::arg("output_mailbox"), pybind11::arg("output_mailbox_ptrs"),
+          pybind11::arg("barrier_buffer"), pybind11::arg("barrier_buffer_ptrs"),
+          pybind11::arg("barrier_buffer_multicast_ptr"),
+          pybind11::arg("error_flag"),
+          pybind11::arg("tp_rank"), pybind11::arg("active_tokens"));
+    m.def("kimi_k3_decode_workspace_bytes",
+          &kimi_k3_decode::kimi_k3_decode_workspace_bytes);
     m.def("all_gather_top_experts", &utils::all_gather_top_experts::all_gather_top_experts_entrypoint, "",
           pybind11::arg("top_experts"), pybind11::arg("all_gather_top_experts_buffer"),
           pybind11::arg("all_gather_top_experts_buffer_multicast_ptr"), pybind11::arg("rank"), pybind11::arg("chunk_bytes"));
