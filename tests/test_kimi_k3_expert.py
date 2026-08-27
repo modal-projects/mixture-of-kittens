@@ -335,7 +335,9 @@ def test_sm103_mixed_mxfp8_by_mxfp4_instruction_probe(
     from mok import _C
     from mok.ops import dequant_kimi_k3_mxfp4, pack_kimi_k3_mxfp4
 
-    rows = 7
+    # Cross the eight-row boundary in the scale-factor swizzle so the probe
+    # validates more than the first row atom.
+    rows = 16
     a = torch.zeros(rows, GROUP, dtype=torch.bfloat16, device=device)
     code_points = torch.tensor(
         [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
