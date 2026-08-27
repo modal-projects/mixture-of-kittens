@@ -141,8 +141,9 @@ Runtime tensors:
 - router logits, router scores, SiTU internals, and RMSNorm internals: FP32;
 - routed-expert activations at MXFP4 GEMM boundaries: MXFP8 E4M3 with
   block-32 E8M0 scales;
-- collective accumulation: FP32 where the B300 primitive supports it,
-  otherwise BF16 with the same order across baselines.
+- expert assignments accumulate locally in FP32 and cast once to BF16;
+- TP8 routed and shared collectives reduce BF16 values, matching the serving
+  baselines, before RMSNorm converts the routed latent back to FP32.
 
 Replicated weights on every TP rank:
 
@@ -155,16 +156,19 @@ Replicated weights on every TP rank:
 Rank-local TP8 shards:
 
 - routed `w1/w3`: packed MXFP4 for all 896 experts, each with local output
-  width `3072 / 8 = 384`;
+  width `3072 / 8 = 384`; the one-time preparation step zero-pads the K
+  dimension from 3584 to 3648 so SM103 K96 tensor-core instructions cover it
+  exactly;
 - routed `w2`: packed MXFP4 for all 896 experts, each consuming the matching
   local width 384 and producing a partial width-3584 result;
 - shared gate/up: BF16 local output width `6144 / 8 = 768`;
 - shared down: BF16 local input width 768 and partial output width 7168.
 
 MXFP4 values use packed E2M1 data and group-size-32 E8M0 scales. The public API
-accepts prepacked rank-local tensors. A separate preparation helper converts
-test BF16 tensors or maps framework-owned checkpoint tensors into that contract;
-the hot path never repacks weights.
+accepts prepared rank-local tensors. A separate preparation helper converts test
+BF16 tensors or maps framework-owned checkpoint tensors into the K96-padded
+contract without dequantizing checkpoint MXFP4 values; the hot path never
+repacks weights.
 
 ## TP8 Execution
 
