@@ -1,4 +1,5 @@
 #include "kimi_k3_decode/entrypoints.cuh"
+#include "kimi_k3_decode/expert_mxfp4.cuh"
 #include "megakernel/entrypoints.cuh"
 #include "mxfp8.cuh"
 #include "scheduler.cuh"
@@ -31,11 +32,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("router_weight"), pybind11::arg("router_correction_bias"),
           pybind11::arg("routed_expert_down_proj"),
           pybind11::arg("scratch"), pybind11::arg("active_tokens"));
+    m.def("_kimi_k3_routed_experts",
+          &kimi_k3_decode::routed_experts_entrypoint, "",
+          pybind11::arg("latent_x"),
+          pybind11::arg("expert_w1_packed"),
+          pybind11::arg("expert_w1_scale"),
+          pybind11::arg("expert_w3_packed"),
+          pybind11::arg("expert_w3_scale"),
+          pybind11::arg("expert_w2_packed"),
+          pybind11::arg("expert_w2_scale"),
+          pybind11::arg("routed_output"),
+          pybind11::arg("scratch"),
+          pybind11::arg("active_tokens"));
     m.def("pack_kimi_k3_mxfp4", &kimi_k3_decode::mxfp4::pack_entrypoint, "",
           pybind11::arg("weight"), pybind11::arg("padded_k"));
     m.def("dequant_kimi_k3_mxfp4", &kimi_k3_decode::mxfp4::dequant_entrypoint, "",
           pybind11::arg("packed"), pybind11::arg("scale"),
           pybind11::arg("logical_k"));
+    m.def("_kimi_k3_mixed_mma_probe",
+          &kimi_k3_decode::expert_mxfp4::mixed_mma_probe_entrypoint, "",
+          pybind11::arg("a"), pybind11::arg("b_packed"),
+          pybind11::arg("b_scale"));
     m.def("all_gather_top_experts", &utils::all_gather_top_experts::all_gather_top_experts_entrypoint, "",
           pybind11::arg("top_experts"), pybind11::arg("all_gather_top_experts_buffer"),
           pybind11::arg("all_gather_top_experts_buffer_multicast_ptr"), pybind11::arg("rank"), pybind11::arg("chunk_bytes"));

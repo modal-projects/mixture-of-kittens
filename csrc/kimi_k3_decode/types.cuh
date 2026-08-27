@@ -30,6 +30,11 @@ inline constexpr int scratch_region_bytes(const int words) {
     return ((words * 4 + SCRATCH_ALIGNMENT - 1) / SCRATCH_ALIGNMENT) * SCRATCH_ALIGNMENT;
 }
 
+/// Round an arbitrary byte region up to the scratch alignment.
+inline constexpr int scratch_byte_region_bytes(const int bytes) {
+    return ((bytes + SCRATCH_ALIGNMENT - 1) / SCRATCH_ALIGNMENT) * SCRATCH_ALIGNMENT;
+}
+
 // Scratch regions, in declaration order, each starting on a 256-byte boundary.
 inline constexpr int kPhaseBytes = 0;
 inline constexpr int kExpertIdBytes =
@@ -44,9 +49,34 @@ inline constexpr int kAssignmentTokenBytes =
     kExpertOffsetBytes + scratch_region_bytes(kNumExperts + 1);
 inline constexpr int kAssignmentSlotBytes =
     kAssignmentTokenBytes + scratch_region_bytes(kMaxRoutes);
+inline constexpr int kLatentMxfp8Bytes =
+    kAssignmentSlotBytes + scratch_region_bytes(kMaxRoutes);
+inline constexpr int kLatentScaleBytes =
+    kLatentMxfp8Bytes
+    + scratch_byte_region_bytes(kMaxTokens * kLatentSize);
+inline constexpr int kSituMxfp8Bytes =
+    kLatentScaleBytes
+    + scratch_byte_region_bytes(kMaxTokens * (kLatentSize / 32));
+inline constexpr int kSituScaleBytes =
+    kSituMxfp8Bytes
+    + scratch_byte_region_bytes(
+        kMaxRoutes * (kRoutedIntermediateSize / kTensorParallelSize));
+inline constexpr int kRoutedAccumulatorBytes =
+    kSituScaleBytes
+    + scratch_byte_region_bytes(
+        kMaxRoutes
+        * (kRoutedIntermediateSize / kTensorParallelSize / 32));
 
 static constexpr int SCRATCH_BYTES =
-    kAssignmentSlotBytes + scratch_region_bytes(kMaxRoutes);
+    kRoutedAccumulatorBytes
+    + scratch_byte_region_bytes(kMaxTokens * kLatentSize * sizeof(float));
+
+static_assert(kLatentMxfp8Bytes == 40448);
+static_assert(kLatentScaleBytes == 499200);
+static_assert(kSituMxfp8Bytes == 513536);
+static_assert(kSituScaleBytes == 1299968);
+static_assert(kRoutedAccumulatorBytes == 1324544);
+static_assert(SCRATCH_BYTES == 3159552);
 
 // Generation-tagged completion counters. Each role's last CTA clears its arrival
 // counter and bumps its generation, so a reused workspace never needs a host reset.
@@ -54,6 +84,10 @@ inline constexpr int kRouterArrivals = 0;
 inline constexpr int kRouterGeneration = 1;
 inline constexpr int kProjectionArrivals = 2;
 inline constexpr int kProjectionGeneration = 3;
+inline constexpr int kExpertQuantizationArrivals = 4;
+inline constexpr int kExpertQuantizationGeneration = 5;
+inline constexpr int kExpertCompletionArrivals = 7;
+inline constexpr int kExpertCompletionGeneration = 8;
 
 /// Typed device pointers into one decode workspace.
 struct Scratch {
@@ -64,6 +98,11 @@ struct Scratch {
     int *expert_offsets;
     int *assignment_tokens;
     int *assignment_slots;
+    std::uint8_t *latent_mxfp8;
+    std::uint8_t *latent_scale;
+    std::uint8_t *situ_mxfp8;
+    std::uint8_t *situ_scale;
+    float *routed_accumulator;
 };
 
 __host__ __device__ inline Scratch scratch_view(std::uint8_t *base) {
@@ -75,6 +114,11 @@ __host__ __device__ inline Scratch scratch_view(std::uint8_t *base) {
         reinterpret_cast<int *>(base + kExpertOffsetBytes),
         reinterpret_cast<int *>(base + kAssignmentTokenBytes),
         reinterpret_cast<int *>(base + kAssignmentSlotBytes),
+        base + kLatentMxfp8Bytes,
+        base + kLatentScaleBytes,
+        base + kSituMxfp8Bytes,
+        base + kSituScaleBytes,
+        reinterpret_cast<float *>(base + kRoutedAccumulatorBytes),
     };
 }
 

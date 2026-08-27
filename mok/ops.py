@@ -146,6 +146,70 @@ def _kimi_k3_route_and_project(
     )
 
 
+_ROUTED_EXPERT_ALIGNMENT = (
+    ("latent_x", 16),
+    ("expert_w1_packed", 16),
+    ("expert_w1_scale", 16),
+    ("expert_w3_packed", 16),
+    ("expert_w3_scale", 16),
+    ("expert_w2_packed", 16),
+    ("expert_w2_scale", 16),
+    ("routed_output", 16),
+    ("scratch", 256),
+)
+
+
+@torch.library.custom_op(
+    "mok::_kimi_k3_routed_experts",
+    mutates_args=("routed_output", "scratch"),
+    schema=(
+        "(Tensor latent_x, Tensor expert_w1_packed, Tensor expert_w1_scale, "
+        "Tensor expert_w3_packed, Tensor expert_w3_scale, "
+        "Tensor expert_w2_packed, Tensor expert_w2_scale, "
+        "Tensor(a!) routed_output, Tensor(b!) scratch, int active_tokens) "
+        "-> Tensor(a!)"
+    ),
+)
+def _kimi_k3_routed_experts(
+    latent_x: torch.Tensor,
+    expert_w1_packed: torch.Tensor,
+    expert_w1_scale: torch.Tensor,
+    expert_w3_packed: torch.Tensor,
+    expert_w3_scale: torch.Tensor,
+    expert_w2_packed: torch.Tensor,
+    expert_w2_scale: torch.Tensor,
+    routed_output: torch.Tensor,
+    scratch: torch.Tensor,
+    active_tokens: int,
+) -> torch.Tensor:
+    """Run one assignment-driven Kimi K3 routed-expert device stage.
+
+    The private operator consumes Task 5's expert-major assignment ranges,
+    evaluates mixed MXFP8-by-MXFP4 gate/up and down projections, and returns
+    the active view of the caller-owned BF16 output buffer.
+    """
+    arguments = locals()
+    for field, alignment in _ROUTED_EXPERT_ALIGNMENT:
+        past = arguments[field].data_ptr() % alignment
+        if past:
+            raise RuntimeError(
+                f"MoK: _kimi_k3_routed_experts requires {field} aligned to "
+                f"{alignment} bytes, got a pointer {past} bytes past one"
+            )
+    return _C._kimi_k3_routed_experts(
+        latent_x,
+        expert_w1_packed,
+        expert_w1_scale,
+        expert_w3_packed,
+        expert_w3_scale,
+        expert_w2_packed,
+        expert_w2_scale,
+        routed_output,
+        scratch,
+        active_tokens,
+    )
+
+
 @torch.library.custom_op("mok::pack_kimi_k3_mxfp4", mutates_args=())
 def pack_kimi_k3_mxfp4(
     weight: torch.Tensor,

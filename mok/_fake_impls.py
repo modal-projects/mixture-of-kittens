@@ -57,6 +57,22 @@ def _kimi_k3_route_and_project_fake(
     )
 
 
+@torch.library.register_fake("mok::_kimi_k3_routed_experts")
+def _kimi_k3_routed_experts_fake(
+    latent_x: torch.Tensor,
+    expert_w1_packed: torch.Tensor,
+    expert_w1_scale: torch.Tensor,
+    expert_w3_packed: torch.Tensor,
+    expert_w3_scale: torch.Tensor,
+    expert_w2_packed: torch.Tensor,
+    expert_w2_scale: torch.Tensor,
+    routed_output: torch.Tensor,
+    scratch: torch.Tensor,
+    active_tokens: int,
+) -> torch.Tensor:
+    return routed_output[:active_tokens]
+
+
 @torch.library.register_fake("mok::pack_kimi_k3_mxfp4")
 def _pack_kimi_k3_mxfp4_fake(
     weight: torch.Tensor,

@@ -2,6 +2,7 @@
 
 #include "kittens.cuh"
 
+#include "expert_mxfp4.cuh"
 #include "router.cuh"
 #include "skinny_gemm.cuh"
 #include "types.cuh"

@@ -68,6 +68,11 @@ def _scratch_layout() -> dict[str, tuple[int, int]]:
         ("offsets", KIMI_K3_NUM_EXPERTS + 1),
         ("assignment_tokens", KIMI_K3_MAX_ROUTES),
         ("assignment_slots", KIMI_K3_MAX_ROUTES),
+        ("latent_mxfp8", KIMI_K3_MAX_TOKENS * KIMI_K3_LATENT_SIZE // 4),
+        ("latent_scale", KIMI_K3_MAX_TOKENS * (KIMI_K3_LATENT_SIZE // 32) // 4),
+        ("situ_mxfp8", KIMI_K3_MAX_ROUTES * 384 // 4),
+        ("situ_scale", KIMI_K3_MAX_ROUTES * (384 // 32) // 4),
+        ("routed_accumulator", KIMI_K3_MAX_TOKENS * KIMI_K3_LATENT_SIZE),
     )
     layout: dict[str, tuple[int, int]] = {}
     cursor = 0
@@ -297,7 +302,7 @@ def test_workspace_bytes_matches_the_documented_scratch_layout(
 ) -> None:
     from mok import _C
 
-    assert SCRATCH_BYTES == 40448
+    assert SCRATCH_BYTES == 3_159_552
     assert _C.kimi_k3_decode_workspace_bytes() == SCRATCH_BYTES
     assert SCRATCH_LAYOUT["phase"][0] == 0
     assert SCRATCH_LAYOUT["expert_ids"][0] * 4 % SCRATCH_ALIGNMENT == 0
@@ -306,6 +311,11 @@ def test_workspace_bytes_matches_the_documented_scratch_layout(
     assert SCRATCH_LAYOUT["offsets"][0] * 4 % SCRATCH_ALIGNMENT == 0
     assert SCRATCH_LAYOUT["assignment_tokens"][0] * 4 % SCRATCH_ALIGNMENT == 0
     assert SCRATCH_LAYOUT["assignment_slots"][0] * 4 % SCRATCH_ALIGNMENT == 0
+    assert SCRATCH_LAYOUT["latent_mxfp8"][0] * 4 == 40_448
+    assert SCRATCH_LAYOUT["latent_scale"][0] * 4 == 499_200
+    assert SCRATCH_LAYOUT["situ_mxfp8"][0] * 4 == 513_536
+    assert SCRATCH_LAYOUT["situ_scale"][0] * 4 == 1_299_968
+    assert SCRATCH_LAYOUT["routed_accumulator"][0] * 4 == 1_324_544
 
 
 @pytest.mark.parametrize("tokens", [1, 8, 16, 128])

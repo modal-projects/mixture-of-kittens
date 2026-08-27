@@ -33,14 +33,15 @@ static __host__ void check_sm103(const at::Tensor &hidden_states, const char *na
                 properties.major, properties.minor);
 }
 
-static __host__ void check_route_and_project_alignment(
+static __host__ void check_tensor_alignment(
     const at::Tensor &tensor,
+    const char *operation,
     const char *field,
     const int alignment
 ) {
     const auto address = reinterpret_cast<std::uintptr_t>(tensor.data_ptr());
     TORCH_CHECK(address % static_cast<std::uintptr_t>(alignment) == 0,
-                "MoK: _kimi_k3_route_and_project requires ", field,
+                "MoK: ", operation, " requires ", field,
                 " aligned to ", alignment, " bytes, got a pointer ",
                 address % static_cast<std::uintptr_t>(alignment),
                 " bytes past one");
@@ -101,14 +102,15 @@ route_and_project_entrypoint(
     // A contiguous view at a nonzero storage offset clears every check above and
     // still under-aligns the pointer, which faults the vector loads and TMA
     // descriptors or silently shifts every scratch region.
-    check_route_and_project_alignment(hidden_states, "hidden_states",
-                                      VECTOR_ALIGNMENT);
-    check_route_and_project_alignment(router_weight, "router_weight",
-                                      VECTOR_ALIGNMENT);
-    check_route_and_project_alignment(routed_expert_down_proj,
-                                      "routed_expert_down_proj",
-                                      VECTOR_ALIGNMENT);
-    check_route_and_project_alignment(scratch, "scratch", SCRATCH_ALIGNMENT);
+    check_tensor_alignment(hidden_states, "_kimi_k3_route_and_project",
+                           "hidden_states", VECTOR_ALIGNMENT);
+    check_tensor_alignment(router_weight, "_kimi_k3_route_and_project",
+                           "router_weight", VECTOR_ALIGNMENT);
+    check_tensor_alignment(routed_expert_down_proj,
+                           "_kimi_k3_route_and_project",
+                           "routed_expert_down_proj", VECTOR_ALIGNMENT);
+    check_tensor_alignment(scratch, "_kimi_k3_route_and_project",
+                           "scratch", SCRATCH_ALIGNMENT);
 
     check_sm103(hidden_states, "_kimi_k3_route_and_project");
 
@@ -128,6 +130,113 @@ route_and_project_entrypoint(
                              expert_weights, latent_x,
                              static_cast<int>(active_tokens));
     return {expert_ids, expert_weights, latent_x};
+}
+
+static __host__ at::Tensor routed_experts_entrypoint(
+    const at::Tensor &latent_x,
+    const at::Tensor &expert_w1_packed,
+    const at::Tensor &expert_w1_scale,
+    const at::Tensor &expert_w3_packed,
+    const at::Tensor &expert_w3_scale,
+    const at::Tensor &expert_w2_packed,
+    const at::Tensor &expert_w2_scale,
+    const at::Tensor &routed_output,
+    const at::Tensor &scratch,
+    std::int64_t active_tokens
+) {
+    CHECK_INPUT(latent_x);
+    CHECK_INPUT(expert_w1_packed);
+    CHECK_INPUT(expert_w1_scale);
+    CHECK_INPUT(expert_w3_packed);
+    CHECK_INPUT(expert_w3_scale);
+    CHECK_INPUT(expert_w2_packed);
+    CHECK_INPUT(expert_w2_scale);
+    CHECK_INPUT(routed_output);
+    CHECK_INPUT(scratch);
+
+    TORCH_CHECK(latent_x.dim() == 2 && latent_x.size(1) == kLatentSize
+                    && latent_x.scalar_type() == at::kBFloat16,
+                "MoK: _kimi_k3_routed_experts requires BF16 latent_x [M, ",
+                kLatentSize, "]");
+    const std::int64_t tokens = latent_x.size(0);
+    TORCH_CHECK(tokens >= 1 && tokens <= kMaxTokens,
+                "MoK: _kimi_k3_routed_experts requires latent_x with 1 to ",
+                kMaxTokens, " rows");
+    TORCH_CHECK(active_tokens >= 1 && active_tokens <= tokens,
+                "MoK: _kimi_k3_routed_experts requires active_tokens in [1, ",
+                tokens, "]");
+
+    const auto check_weight = [](const at::Tensor &tensor,
+                                 const char *name,
+                                 const int rows,
+                                 const int columns) {
+        TORCH_CHECK(tensor.dim() == 3
+                        && tensor.size(0) == kNumExperts
+                        && tensor.size(1) == rows
+                        && tensor.size(2) == columns
+                        && tensor.scalar_type() == at::kByte,
+                    "MoK: _kimi_k3_routed_experts requires uint8 ", name,
+                    " [", kNumExperts, ", ", rows, ", ", columns, "]");
+    };
+    check_weight(expert_w1_packed, "expert_w1_packed",
+                 kExpertW1W3PackedRows, kExpertW1W3PackedColumns);
+    check_weight(expert_w1_scale, "expert_w1_scale",
+                 kExpertW1W3PackedRows, kExpertW1W3ScaleColumns);
+    check_weight(expert_w3_packed, "expert_w3_packed",
+                 kExpertW1W3PackedRows, kExpertW1W3PackedColumns);
+    check_weight(expert_w3_scale, "expert_w3_scale",
+                 kExpertW1W3PackedRows, kExpertW1W3ScaleColumns);
+    check_weight(expert_w2_packed, "expert_w2_packed",
+                 kExpertW2PackedRows, kExpertW2PackedColumns);
+    check_weight(expert_w2_scale, "expert_w2_scale",
+                 kExpertW2PackedRows, kExpertW2ScaleColumns);
+
+    TORCH_CHECK(routed_output.dim() == 2
+                    && routed_output.size(0) == tokens
+                    && routed_output.size(1) == kLatentSize
+                    && routed_output.scalar_type() == at::kBFloat16,
+                "MoK: _kimi_k3_routed_experts requires BF16 routed_output [M, ",
+                kLatentSize, "]");
+    TORCH_CHECK(scratch.dim() == 1 && scratch.scalar_type() == at::kByte
+                    && scratch.size(0) >= SCRATCH_BYTES,
+                "MoK: _kimi_k3_routed_experts requires a uint8 scratch of at "
+                "least ", SCRATCH_BYTES, " bytes");
+
+    const at::Device device = latent_x.device();
+    for (const auto *tensor : {
+             &expert_w1_packed, &expert_w1_scale,
+             &expert_w3_packed, &expert_w3_scale,
+             &expert_w2_packed, &expert_w2_scale,
+             &routed_output, &scratch}) {
+        TORCH_CHECK(tensor->device() == device,
+                    "MoK: _kimi_k3_routed_experts requires every tensor on ",
+                    device);
+    }
+
+    for (const auto &item : {
+             std::pair<const at::Tensor *, const char *>{
+                 &latent_x, "latent_x"},
+             {&expert_w1_packed, "expert_w1_packed"},
+             {&expert_w1_scale, "expert_w1_scale"},
+             {&expert_w3_packed, "expert_w3_packed"},
+             {&expert_w3_scale, "expert_w3_scale"},
+             {&expert_w2_packed, "expert_w2_packed"},
+             {&expert_w2_scale, "expert_w2_scale"},
+             {&routed_output, "routed_output"}}) {
+        check_tensor_alignment(*item.first, "_kimi_k3_routed_experts",
+                               item.second, VECTOR_ALIGNMENT);
+    }
+    check_tensor_alignment(scratch, "_kimi_k3_routed_experts", "scratch",
+                           SCRATCH_ALIGNMENT);
+    check_sm103(latent_x, "_kimi_k3_routed_experts");
+
+    const c10::cuda::CUDAGuard device_guard(device);
+    expert_mxfp4::launch_routed_experts(
+        latent_x, expert_w1_packed, expert_w1_scale,
+        expert_w3_packed, expert_w3_scale,
+        expert_w2_packed, expert_w2_scale,
+        routed_output, scratch, static_cast<int>(active_tokens));
+    return routed_output.narrow(0, 0, active_tokens);
 }
 
 static __host__ at::Tensor kimi_k3_decode_entrypoint(
