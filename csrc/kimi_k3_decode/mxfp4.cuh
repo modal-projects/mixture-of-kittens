@@ -5,6 +5,8 @@
 #include "types.cuh"
 
 #include <ATen/ops/empty.h>
+#include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp4.h>
@@ -164,6 +166,10 @@ static __host__ std::tuple<at::Tensor, at::Tensor> pack_entrypoint(
                 "MoK: pack_kimi_k3_mxfp4 requires a padded K that is a multiple of ",
                 kGroupSize, " and at least the logical K");
 
+    // Every launch below must target the weight's own device and that device's
+    // current stream, whatever device happens to be current on entry.
+    const c10::cuda::CUDAGuard device_guard(weight.device());
+
     at::Tensor packed = at::empty({weight.size(0), weight.size(1), padded_k / 2},
                                   weight.options().dtype(at::kByte));
     at::Tensor scale = at::empty({weight.size(0), weight.size(1), padded_k / kGroupSize},
@@ -177,6 +183,7 @@ static __host__ std::tuple<at::Tensor, at::Tensor> pack_entrypoint(
         reinterpret_cast<std::uint8_t *>(packed.data_ptr()),
         reinterpret_cast<std::uint8_t *>(scale.data_ptr()),
         num_rows, static_cast<int>(logical_k), static_cast<int>(padded_k));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     return {packed, scale};
 }
@@ -204,6 +211,8 @@ static __host__ at::Tensor dequant_entrypoint(
                 "MoK: dequant_kimi_k3_mxfp4 requires a logical K that is a multiple of ",
                 kGroupSize, " and at most the padded K");
 
+    const c10::cuda::CUDAGuard device_guard(packed.device());
+
     at::Tensor weight = at::empty({packed.size(0), packed.size(1), logical_k},
                                   packed.options().dtype(at::kBFloat16));
 
@@ -215,6 +224,7 @@ static __host__ at::Tensor dequant_entrypoint(
         reinterpret_cast<const std::uint8_t *>(scale.data_ptr()),
         reinterpret_cast<__nv_bfloat16 *>(weight.data_ptr()),
         num_rows, static_cast<int>(logical_k), static_cast<int>(padded_k));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     return weight;
 }

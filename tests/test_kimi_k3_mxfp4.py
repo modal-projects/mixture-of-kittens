@@ -97,6 +97,20 @@ def device() -> torch.device:
     return selected
 
 
+@pytest.fixture(scope="module")
+def peer_device(device: torch.device) -> Iterator[torch.device]:
+    """A second CUDA device, with the first one left current for the caller."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("cross-device Kimi K3 MXFP4 preparation needs two CUDA devices")
+    peer = torch.device("cuda", 1 if device.index == 0 else 0)
+    if torch.cuda.get_device_capability(peer) != (10, 3):
+        pytest.skip("Kimi K3 MXFP4 preparation requires an SM103 GPU")
+    try:
+        yield peer
+    finally:
+        torch.cuda.set_device(device)
+
+
 def _code_point_row(exponent: int) -> list[float]:
     """Return 32 exactly representable E2M1 values scaled by ``2 ** exponent``."""
     magnitudes = [
@@ -406,6 +420,77 @@ def test_dequant_mxfp4_rejects_wrong_dtype(device: torch.device) -> None:
                        device=device)
     with pytest.raises(TypeError, match="torch.uint8"):
         dequant_kimi_k3_mxfp4(packed, scale, logical_k=64)
+
+
+def test_pack_mxfp4_on_peer_device_ignores_the_current_device(
+    device: torch.device, peer_device: torch.device
+) -> None:
+    from mok.kimi_k3 import pack_kimi_k3_mxfp4
+
+    torch.cuda.set_device(device)
+    weight = torch.full((1, 4, 64), 3.0, dtype=torch.bfloat16, device=peer_device)
+    weight[0, 1, :KIMI_K3_GROUP_SIZE] = 0.0
+
+    packed, scale = pack_kimi_k3_mxfp4(weight, padded_k=96)
+    torch.cuda.synchronize(peer_device)
+
+    assert torch.cuda.current_device() == device.index
+    assert packed.device == peer_device
+    assert scale.device == peer_device
+    expected_packed, expected_scale = _reference_pack(weight, padded_k=96)
+    assert packed.flatten().tolist() == expected_packed
+    assert scale.flatten().tolist() == expected_scale
+
+
+def test_dequant_mxfp4_on_peer_device_ignores_the_current_device(
+    device: torch.device, peer_device: torch.device
+) -> None:
+    from mok.kimi_k3 import dequant_kimi_k3_mxfp4
+
+    torch.cuda.set_device(device)
+    packed = torch.full((1, 4, 48), 0x77, dtype=torch.uint8, device=peer_device)
+    scale = torch.full((1, 4, 3), 130, dtype=torch.uint8, device=peer_device)
+
+    restored = dequant_kimi_k3_mxfp4(packed, scale, logical_k=64)
+    torch.cuda.synchronize(peer_device)
+
+    assert torch.cuda.current_device() == device.index
+    assert restored.device == peer_device
+    expected = torch.full(
+        (1, 4, 64), 6.0 * 2.0**3, dtype=torch.bfloat16, device=peer_device
+    )
+    torch.testing.assert_close(restored, expected, rtol=0, atol=0)
+
+
+def test_pack_mxfp4_on_peer_device_uses_that_devices_current_stream(
+    device: torch.device, peer_device: torch.device
+) -> None:
+    from mok.kimi_k3 import dequant_kimi_k3_mxfp4, pack_kimi_k3_mxfp4
+
+    torch.cuda.set_device(device)
+    weight = torch.zeros(1, 4, 64, dtype=torch.bfloat16, device=peer_device)
+    side_stream = torch.cuda.Stream(device=peer_device)
+    previous_stream = torch.cuda.current_stream(peer_device)
+    # set_stream also makes the stream's device current, which is the opposite of
+    # the state under test, so put the first device back afterwards.
+    torch.cuda.set_stream(side_stream)
+    torch.cuda.set_device(device)
+    try:
+        with torch.cuda.device(peer_device):
+            # Long enough that a launch on any other stream would observe the
+            # pre-fill zeros instead of the value the pack has to see.
+            torch.cuda._sleep(1 << 28)
+        weight.fill_(3.0)
+        packed, scale = pack_kimi_k3_mxfp4(weight, padded_k=64)
+        restored = dequant_kimi_k3_mxfp4(packed, scale, logical_k=64)
+        assert torch.cuda.current_device() == device.index
+        side_stream.synchronize()
+        torch.testing.assert_close(
+            restored, torch.full_like(weight, 3.0), rtol=0, atol=0
+        )
+    finally:
+        torch.cuda.set_stream(previous_stream)
+        torch.cuda.set_device(device)
 
 
 def _replicated_inputs(device: torch.device) -> dict[str, torch.Tensor]:
