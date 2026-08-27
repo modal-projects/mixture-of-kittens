@@ -226,6 +226,7 @@ void mixed_mma_probe_kernel(
         tensor_pool.allocate<full_tt_fp8e8m0<16>>(260);
 
     if (warpid() == 0) {
+        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
         load_mxnv_scale_async(scale_a, scale_a_shared);
         load_mxnv_scale_async(scale_b, scale_b_shared);
         tensor_store_wait();
@@ -236,8 +237,8 @@ void mixed_mma_probe_kernel(
         mixed_mma<0, false>(accumulator, a_tile, b_tile, scale_a, scale_b);
         detail::tcgen05::commit<1>(compute_done);
     }
+    wait(compute_done, 0);
     if (warpgroup::groupid() == 0) {
-        wait(compute_done, 0);
         rt_fl<kMmaM / 4, kMmaN> result;
         warpgroup::load_async(result, accumulator);
         tensor_load_wait();
@@ -605,6 +606,8 @@ void kimi_k3_routed_experts_kernel(
                         output_base, k_group);
                     __syncthreads();
                     if (warpid() == 0) {
+                        asm volatile(
+                            "fence.proxy.async.shared::cta;\n" ::: "memory");
                         load_mxnv_scale_async(
                             activation_scale, activation_scale_shared);
                         load_mxnv_scale_async(
@@ -635,8 +638,8 @@ void kimi_k3_routed_experts_kernel(
                                 second_scale);
                         }
                         detail::tcgen05::commit<1>(compute_done);
-                        wait(compute_done, compute_phase);
                     }
+                    wait(compute_done, compute_phase);
                     __syncthreads();
                     compute_phase ^= 1;
                 }
@@ -664,6 +667,8 @@ void kimi_k3_routed_experts_kernel(
                         output_base, k_group);
                     __syncthreads();
                     if (warpid() == 0) {
+                        asm volatile(
+                            "fence.proxy.async.shared::cta;\n" ::: "memory");
                         load_mxnv_scale_async(
                             activation_scale, activation_scale_shared);
                         load_mxnv_scale_async(
@@ -684,8 +689,8 @@ void kimi_k3_routed_experts_kernel(
                                 first_scale);
                         }
                         detail::tcgen05::commit<1>(compute_done);
-                        wait(compute_done, compute_phase);
                     }
+                    wait(compute_done, compute_phase);
                     __syncthreads();
                     compute_phase ^= 1;
                 }
