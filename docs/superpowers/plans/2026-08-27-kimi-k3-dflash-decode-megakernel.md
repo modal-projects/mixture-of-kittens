@@ -525,10 +525,11 @@ Expected: output/debug router buffers do not match the reference.
 
 - [ ] **Step 3: Implement the router CTA**
 
-Assign one 256-thread CTA per active token. Each thread evaluates four router
-columns in FP32. Reduce to a deterministic top-16 in shared memory, using
-expert ID as the tie-breaker. Gather weights from raw sigmoid scores and divide
-by their FP32 sum plus `1e-20`.
+Assign one 256-thread CTA per active token. Each warp evaluates one expert row
+at a time with coalesced vector loads and strides across the 896 experts.
+Reduce to a deterministic top-16 in shared memory, using expert ID as the
+tie-breaker. Gather weights from raw sigmoid scores and divide by their FP32
+sum plus `1e-20`.
 
 Use a 896-bin global histogram and prefix scan to produce expert-major
 assignment offsets for at most 2048 assignments. Store token index, top-k slot,
