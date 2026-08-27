@@ -291,6 +291,8 @@ git commit -m "feat: add Kimi K3 decode operator contract"
 - Modify: `mok/kimi_k3.py`
 - Modify: `tests/test_kimi_k3_api.py`
 - Modify: `tests/conftest.py`
+- Modify: `csrc/kimi_k3_decode/types.cuh`
+- Modify: `csrc/kimi_k3_decode/entrypoints.cuh`
 
 **Interfaces:**
 - Produces: `KimiK3DecodeWorkspace`, `create_kimi_k3_decode_workspace`, `get_kimi_k3_decode_workspace`, and `clear_kimi_k3_decode_workspace_cache`.
@@ -365,6 +367,20 @@ Obtain pointer lists and multicast pointers from
 `torch.distributed._symmetric_memory.rendezvous`, following
 `mok/functional.py`.
 
+Reserve 16 int32 phase counters at the start of scratch and round the allocation
+up to 256 bytes:
+
+```cpp
+static constexpr int NUM_PHASE_COUNTERS = 16;
+static constexpr int SCRATCH_ALIGNMENT = 256;
+static constexpr int SCRATCH_BYTES =
+    ((NUM_PHASE_COUNTERS * sizeof(int) + SCRATCH_ALIGNMENT - 1)
+     / SCRATCH_ALIGNMENT) * SCRATCH_ALIGNMENT;
+```
+
+Return `SCRATCH_BYTES` from `_C.kimi_k3_decode_workspace_bytes()`. Subsequent
+kernel tasks extend this layout from the same C++ constant.
+
 Cache by `(group_name, device_index, 128)`. Cache clearing performs
 `barrier_all`, synchronizes once during teardown, and drops all references.
 
@@ -374,14 +390,16 @@ Run:
 
 ```bash
 torchrun --standalone --nproc-per-node=8 -m pytest -q tests/test_kimi_k3_api.py -k workspace
+modal run --env rahul-dev modal_app.py::gpu_info
 ```
 
-Expected: all workspace tests pass on 8x B300.
+Expected: all workspace tests pass on 8x B300 and the modified C++ layout
+compiles for SM103.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add mok/kimi_k3.py tests/conftest.py tests/test_kimi_k3_api.py
+git add csrc/kimi_k3_decode/types.cuh csrc/kimi_k3_decode/entrypoints.cuh mok/kimi_k3.py tests/conftest.py tests/test_kimi_k3_api.py
 git commit -m "feat: add TP8 Kimi K3 decode workspace"
 ```
 
