@@ -23,8 +23,9 @@ KIMI_K3_SITU_LINEAR_BETA = 25.0
 KIMI_K3_CAPACITY_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128)
 KIMI_K3_MXFP4_GROUP_SIZE = 32
 KIMI_K3_MXFP4_UNIT_SCALE_BYTE = 0x7F
-# Routed w1/w3 pad logical K=3584 to 3648 so SM103 K96 instructions cover it.
-KIMI_K3_W1W3_PADDED_K = 3648
+# Routed w1/w3 store native K: mixed W4A8 `kind::mxf8f6f4` block scaling runs at
+# K=32, so the contraction needs no padding to a wider instruction shape.
+KIMI_K3_W1W3_K = KIMI_K3_LATENT_SIZE
 
 
 @dataclass(frozen=True, slots=True)
@@ -339,10 +340,10 @@ def validate_kimi_k3_decode_inputs(
           KIMI_K3_SHARED_INTERMEDIATE_SIZE // KIMI_K3_TP_SIZE)),
     )
     uint8_layouts = (
-        ("expert_w1_packed", weights.expert_w1_packed, (896, 384, 1824)),
-        ("expert_w1_scale", weights.expert_w1_scale, (896, 384, 114)),
-        ("expert_w3_packed", weights.expert_w3_packed, (896, 384, 1824)),
-        ("expert_w3_scale", weights.expert_w3_scale, (896, 384, 114)),
+        ("expert_w1_packed", weights.expert_w1_packed, (896, 384, 1792)),
+        ("expert_w1_scale", weights.expert_w1_scale, (896, 384, 112)),
+        ("expert_w3_packed", weights.expert_w3_packed, (896, 384, 1792)),
+        ("expert_w3_scale", weights.expert_w3_scale, (896, 384, 112)),
         ("expert_w2_packed", weights.expert_w2_packed, (896, 3584, 192)),
         ("expert_w2_scale", weights.expert_w2_scale, (896, 3584, 12)),
     )
@@ -522,8 +523,9 @@ def prepare_kimi_k3_decode_weights(
 
     The rank keeps routed intermediate rows ``[tp_rank * 384, (tp_rank + 1) *
     384)`` and shared intermediate rows ``[tp_rank * 768, (tp_rank + 1) * 768)``.
-    Routed ``w1``/``w3`` pack with K padded to 3648 and routed ``w2`` packs with
-    K=384. Replicated tensors are passed through without copying.
+    Routed ``w1``/``w3`` pack at native K=3584 and routed ``w2`` packs at K=384;
+    no prepared expert matrix is padded. Replicated tensors are passed through
+    without copying.
 
     This runs once per model load. The decode operator consumes the returned
     packed tensors directly and never repacks them.
@@ -582,11 +584,11 @@ def prepare_kimi_k3_decode_weights(
     shared_start = tp_rank * shared_width
     expert_w1_packed, expert_w1_scale = pack_kimi_k3_mxfp4(
         _own(expert_w1.narrow(1, routed_start, routed_width)),
-        padded_k=KIMI_K3_W1W3_PADDED_K,
+        padded_k=KIMI_K3_W1W3_K,
     )
     expert_w3_packed, expert_w3_scale = pack_kimi_k3_mxfp4(
         _own(expert_w3.narrow(1, routed_start, routed_width)),
-        padded_k=KIMI_K3_W1W3_PADDED_K,
+        padded_k=KIMI_K3_W1W3_K,
     )
     expert_w2_packed, expert_w2_scale = pack_kimi_k3_mxfp4(
         _own(expert_w2.narrow(2, routed_start, routed_width)),
@@ -804,7 +806,7 @@ __all__ = [
     "KIMI_K3_SITU_LINEAR_BETA",
     "KIMI_K3_TOPK",
     "KIMI_K3_TP_SIZE",
-    "KIMI_K3_W1W3_PADDED_K",
+    "KIMI_K3_W1W3_K",
     "KimiK3DecodeConfig",
     "KimiK3DecodeWorkspace",
     "KimiK3DecodeWeights",

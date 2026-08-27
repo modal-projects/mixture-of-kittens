@@ -65,12 +65,20 @@ LOW_LEVEL_ARGUMENTS = (
     "active_tokens",
 )
 MXFP4_LAYOUTS = (
+    ("expert_w1_packed", (896, 384, 1792)),
+    ("expert_w1_scale", (896, 384, 112)),
+    ("expert_w3_packed", (896, 384, 1792)),
+    ("expert_w3_scale", (896, 384, 112)),
+    ("expert_w2_packed", (896, 3584, 192)),
+    ("expert_w2_scale", (896, 3584, 12)),
+)
+# The K=3648 layout the prepared contract carried before Task 4b, when W1/W3
+# were padded for the FP4-by-FP4 K96 helper instead of mixed W4A8 K32.
+STALE_PADDED_MXFP4_LAYOUTS = (
     ("expert_w1_packed", (896, 384, 1824)),
     ("expert_w1_scale", (896, 384, 114)),
     ("expert_w3_packed", (896, 384, 1824)),
     ("expert_w3_scale", (896, 384, 114)),
-    ("expert_w2_packed", (896, 3584, 192)),
-    ("expert_w2_scale", (896, 3584, 12)),
 )
 NONCONTRACT_HIDDEN_SHAPES = ((8, 7167), (8, 7168, 1))
 
@@ -129,10 +137,10 @@ def _valid_weights(kimi_k3: ModuleType):
         routed_expert_down_proj=meta_bf16((3584, 7168)),
         routed_expert_up_proj=meta_bf16((7168, 3584)),
         routed_latent_rmsnorm_weight=meta_bf16((3584,)),
-        expert_w1_packed=meta_uint8((896, 384, 1824)),
-        expert_w1_scale=meta_uint8((896, 384, 114)),
-        expert_w3_packed=meta_uint8((896, 384, 1824)),
-        expert_w3_scale=meta_uint8((896, 384, 114)),
+        expert_w1_packed=meta_uint8((896, 384, 1792)),
+        expert_w1_scale=meta_uint8((896, 384, 112)),
+        expert_w3_packed=meta_uint8((896, 384, 1792)),
+        expert_w3_scale=meta_uint8((896, 384, 112)),
         expert_w2_packed=meta_uint8((896, 3584, 192)),
         expert_w2_scale=meta_uint8((896, 3584, 12)),
         shared_gate_proj=meta_bf16((768, 7168)),
@@ -220,6 +228,31 @@ def check_decode_requires_tp8_sharded_shared_weights() -> None:
         ValueError, match=r"shared_gate_proj must have shape \(768, 7168\)"
     ):
         kimi_k3.validate_kimi_k3_decode_inputs(hidden_states, full_width_weights)
+
+
+def check_prepared_contract_uses_native_k32_layout() -> None:
+    """Mixed W4A8 `kind::mxf8f6f4` runs at K=32, so W1/W3 store native K."""
+    kimi_k3, _, _ = _load_contract_modules()
+
+    assert kimi_k3.KIMI_K3_W1W3_K == kimi_k3.KIMI_K3_LATENT_SIZE == 3584
+    assert "KIMI_K3_W1W3_K" in kimi_k3.__all__
+    assert not hasattr(kimi_k3, "KIMI_K3_W1W3_PADDED_K")
+    assert "KIMI_K3_W1W3_PADDED_K" not in kimi_k3.__all__
+
+
+def check_decode_rejects_stale_padded_mxfp4_layout() -> None:
+    """The K=3648 prepared layout must no longer validate."""
+    kimi_k3, _, _ = _load_contract_modules()
+    hidden_states = torch.empty(16, 7168, dtype=torch.bfloat16, device="meta")
+    stale = {
+        field_name: torch.empty(shape, dtype=torch.uint8, device="meta")
+        for field_name, shape in STALE_PADDED_MXFP4_LAYOUTS
+    }
+
+    with pytest.raises(ValueError, match="expert_w1_packed"):
+        kimi_k3.validate_kimi_k3_decode_inputs(
+            hidden_states, replace(_valid_weights(kimi_k3), **stale)
+        )
 
 
 def check_decode_rejects_noncanonical_mxfp4_layout(
@@ -311,6 +344,10 @@ CHECKS: dict[str, Callable[[], None]] = {
         check_decode_accepts_canonical_prepared_layouts,
     "decode_requires_tp8_sharded_shared_weights":
         check_decode_requires_tp8_sharded_shared_weights,
+    "prepared_contract_uses_native_k32_layout":
+        check_prepared_contract_uses_native_k32_layout,
+    "decode_rejects_stale_padded_mxfp4_layout":
+        check_decode_rejects_stale_padded_mxfp4_layout,
     **{
         f"decode_rejects_noncanonical_mxfp4_layout[{field_name}]": partial(
             check_decode_rejects_noncanonical_mxfp4_layout, field_name, shape
@@ -351,7 +388,9 @@ def main() -> int:
     for name, check in CHECKS.items():
         try:
             check()
-        except Exception:
+        except (Exception, pytest.fail.Exception):
+            # A missing `pytest.raises` failure is a Failed, not an Exception, so
+            # without it here one broken check would hide every later one.
             results[name] = {"outcome": "failed", "detail": traceback.format_exc()}
         else:
             results[name] = {"outcome": "passed", "detail": ""}

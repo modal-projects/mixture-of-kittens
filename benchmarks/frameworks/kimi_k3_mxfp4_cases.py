@@ -17,8 +17,6 @@ if TYPE_CHECKING:  # torch is unavailable on the machine that submits the job
 # One TP8 rank of Kimi K3's routed experts.
 LATENT_SIZE = 3584
 ROUTED_INTERMEDIATE_PER_RANK = 384
-# Zero-padded W1/W3 contraction dimension of the canonical prepared layout.
-W1W3_PADDED_K = 3648
 GROUP_SIZE = 32
 UNIT_SCALE_BYTE = 0x7F
 PAYLOAD_NAME = "mok_mxfp4_bytes.pt"
@@ -26,7 +24,12 @@ PAYLOAD_NAME = "mok_mxfp4_bytes.pt"
 
 @dataclass(frozen=True)
 class Case:
-    """One BF16 matrix to pack, compare and (for ``consumer``) execute."""
+    """One BF16 matrix to pack, compare and (for ``consumer``) execute.
+
+    The canonical prepared layout stores every expert matrix at its native
+    contraction width, so ``logical_k`` is also the storage width and the
+    packed and scale widths below are the canonical ones.
+    """
 
     name: str
     rows: int
@@ -34,26 +37,27 @@ class Case:
     seed: int
     corners: bool      # exercise MXFP4 corner cases instead of plain values
     consumer: bool     # feed this matrix through the FlashInfer MoE kernel
-    padded_k: int      # canonical prepared contraction width
 
     @property
     def logical_k(self) -> int:
         return self.columns
 
+    @property
+    def packed_columns(self) -> int:
+        return self.columns // 2
+
+    @property
+    def scale_columns(self) -> int:
+        return self.columns // GROUP_SIZE
+
 
 CASES: tuple[Case, ...] = (
-    Case("w1", ROUTED_INTERMEDIATE_PER_RANK, LATENT_SIZE, 101, True, False,
-         W1W3_PADDED_K),
-    Case("w3", ROUTED_INTERMEDIATE_PER_RANK, LATENT_SIZE, 202, True, False,
-         W1W3_PADDED_K),
-    Case("w2", LATENT_SIZE, ROUTED_INTERMEDIATE_PER_RANK, 303, True, False,
-         ROUTED_INTERMEDIATE_PER_RANK),
-    Case("moe_w1", ROUTED_INTERMEDIATE_PER_RANK, LATENT_SIZE, 401, False, True,
-         W1W3_PADDED_K),
-    Case("moe_w3", ROUTED_INTERMEDIATE_PER_RANK, LATENT_SIZE, 402, False, True,
-         W1W3_PADDED_K),
-    Case("moe_w2", LATENT_SIZE, ROUTED_INTERMEDIATE_PER_RANK, 403, False, True,
-         ROUTED_INTERMEDIATE_PER_RANK),
+    Case("w1", ROUTED_INTERMEDIATE_PER_RANK, LATENT_SIZE, 101, True, False),
+    Case("w3", ROUTED_INTERMEDIATE_PER_RANK, LATENT_SIZE, 202, True, False),
+    Case("w2", LATENT_SIZE, ROUTED_INTERMEDIATE_PER_RANK, 303, True, False),
+    Case("moe_w1", ROUTED_INTERMEDIATE_PER_RANK, LATENT_SIZE, 401, False, True),
+    Case("moe_w3", ROUTED_INTERMEDIATE_PER_RANK, LATENT_SIZE, 402, False, True),
+    Case("moe_w2", LATENT_SIZE, ROUTED_INTERMEDIATE_PER_RANK, 403, False, True),
 )
 
 E2M1_CODE_POINTS = (

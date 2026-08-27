@@ -18,7 +18,8 @@ E2M1_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 REQUIRED_PREPARE_MEMORY_BYTES = 96 * 1024**3
 PREPARE_TP_RANK = 3
 
-PreparedWeights = Callable[[], tuple[object, dict[str, torch.Tensor]]]
+PreparedResult = tuple[object, dict[str, torch.Tensor], tuple[int, ...]]
+PreparedWeights = Callable[[], PreparedResult]
 
 
 def _encode_e2m1(value: float) -> int:
@@ -120,17 +121,25 @@ def _code_point_row(exponent: int) -> list[float]:
     return [value * 2.0**exponent for value in magnitudes * 2]
 
 
-def test_pack_mxfp4_zero_pads_k_to_3648(device: torch.device) -> None:
-    from mok.kimi_k3 import dequant_kimi_k3_mxfp4, pack_kimi_k3_mxfp4
+def test_pack_mxfp4_uses_native_k32_layout_for_w1w3(device: torch.device) -> None:
+    from mok.kimi_k3 import (
+        KIMI_K3_LATENT_SIZE,
+        KIMI_K3_W1W3_K,
+        dequant_kimi_k3_mxfp4,
+        pack_kimi_k3_mxfp4,
+    )
 
-    weight = torch.zeros(1, 384, 3584, dtype=torch.bfloat16, device=device)
-    packed, scale = pack_kimi_k3_mxfp4(weight, padded_k=3648)
+    # Mixed W4A8 `kind::mxf8f6f4` runs at K=32, so W1/W3 need no padding.
+    assert KIMI_K3_W1W3_K == KIMI_K3_LATENT_SIZE == 3584
 
-    assert packed.shape == (1, 384, 1824)
-    assert scale.shape == (1, 384, 114)
+    weight = torch.zeros(1, 384, KIMI_K3_W1W3_K, dtype=torch.bfloat16, device=device)
+    packed, scale = pack_kimi_k3_mxfp4(weight, padded_k=KIMI_K3_W1W3_K)
+
+    assert packed.shape == (1, 384, 1792)
+    assert scale.shape == (1, 384, 112)
     assert packed.dtype == torch.uint8
     assert scale.dtype == torch.uint8
-    restored = dequant_kimi_k3_mxfp4(packed, scale, logical_k=3584)
+    restored = dequant_kimi_k3_mxfp4(packed, scale, logical_k=KIMI_K3_W1W3_K)
     torch.testing.assert_close(restored, weight)
 
 
@@ -324,7 +333,7 @@ def test_pack_mxfp4_rejects_logical_k_that_is_not_a_group_multiple(
 
     weight = torch.zeros(1, 2, logical_k, dtype=torch.bfloat16, device=device)
     with pytest.raises(ValueError, match="multiple of 32"):
-        pack_kimi_k3_mxfp4(weight, padded_k=3648)
+        pack_kimi_k3_mxfp4(weight, padded_k=3584)
 
 
 @pytest.mark.parametrize("padded_k", [33, 3647])
@@ -540,16 +549,19 @@ def _sparse_expert_pattern(size: int, device: torch.device) -> torch.Tensor:
 
 
 @pytest.fixture(scope="module")
-def prepared_weights(
-    device: torch.device,
-) -> Iterator[Callable[[], tuple[object, dict[str, torch.Tensor]]]]:
-    """Prepare the full-size TP8 shard once, on first use inside a test body."""
-    cache: dict[str, tuple[object, dict[str, torch.Tensor]]] = {}
+def prepared_weights(device: torch.device) -> Iterator[PreparedWeights]:
+    """Prepare the full-size TP8 shard once, on first use inside a test body.
 
-    def prepare() -> tuple[object, dict[str, torch.Tensor]]:
+    Returns the prepared weights, the replicated inputs they were built from,
+    and the storage widths preparation asked the packer for, in call order.
+    """
+    cache: dict[str, PreparedResult] = {}
+
+    def prepare() -> PreparedResult:
         if "value" in cache:
             return cache["value"]
 
+        from mok import ops
         from mok.kimi_k3 import prepare_kimi_k3_decode_weights
 
         free_bytes, _ = torch.cuda.mem_get_info(device)
@@ -568,16 +580,29 @@ def prepared_weights(
         )
         expert_w2[:, 0, :] = _sparse_expert_pattern(3072, device)
 
-        weights = prepare_kimi_k3_decode_weights(
-            **replicated,
-            expert_w1=expert_w1,
-            expert_w3=expert_w3,
-            expert_w2=expert_w2,
-            tp_rank=PREPARE_TP_RANK,
-        )
+        storage_widths: list[int] = []
+        packer = ops.pack_kimi_k3_mxfp4
+
+        def recording_packer(
+            weight: torch.Tensor, padded_k: int
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            storage_widths.append(padded_k)
+            return packer(weight, padded_k)
+
+        ops.pack_kimi_k3_mxfp4 = recording_packer
+        try:
+            weights = prepare_kimi_k3_decode_weights(
+                **replicated,
+                expert_w1=expert_w1,
+                expert_w3=expert_w3,
+                expert_w2=expert_w2,
+                tp_rank=PREPARE_TP_RANK,
+            )
+        finally:
+            ops.pack_kimi_k3_mxfp4 = packer
         del expert_w1, expert_w3, expert_w2
         torch.cuda.empty_cache()
-        cache["value"] = (weights, replicated)
+        cache["value"] = (weights, replicated, tuple(storage_widths))
         return cache["value"]
 
     try:
@@ -595,7 +620,7 @@ def test_prepare_weights_returns_canonical_prepared_layouts(
         validate_kimi_k3_decode_inputs,
     )
 
-    weights, replicated = prepared_weights()
+    weights, replicated, _ = prepared_weights()
     assert isinstance(weights, KimiK3DecodeWeights)
     assert tuple(field.name for field in fields(KimiK3DecodeWeights)) == (
         "router_weight",
@@ -615,10 +640,10 @@ def test_prepare_weights_returns_canonical_prepared_layouts(
         "tp_rank",
     )
     assert weights.tp_rank == PREPARE_TP_RANK
-    assert weights.expert_w1_packed.shape == (896, 384, 1824)
-    assert weights.expert_w1_scale.shape == (896, 384, 114)
-    assert weights.expert_w3_packed.shape == (896, 384, 1824)
-    assert weights.expert_w3_scale.shape == (896, 384, 114)
+    assert weights.expert_w1_packed.shape == (896, 384, 1792)
+    assert weights.expert_w1_scale.shape == (896, 384, 112)
+    assert weights.expert_w3_packed.shape == (896, 384, 1792)
+    assert weights.expert_w3_scale.shape == (896, 384, 112)
     assert weights.expert_w2_packed.shape == (896, 3584, 192)
     assert weights.expert_w2_scale.shape == (896, 3584, 12)
     assert weights.router_weight.data_ptr() == replicated["router_weight"].data_ptr()
@@ -627,12 +652,29 @@ def test_prepare_weights_returns_canonical_prepared_layouts(
     assert validate_kimi_k3_decode_inputs(hidden_states, weights) is None
 
 
+def test_prepare_weights_pack_at_native_storage_widths(
+    device: torch.device, prepared_weights: PreparedWeights
+) -> None:
+    from mok.kimi_k3 import (
+        KIMI_K3_ROUTED_INTERMEDIATE_SIZE,
+        KIMI_K3_TP_SIZE,
+        KIMI_K3_W1W3_K,
+    )
+
+    _, _, storage_widths = prepared_weights()
+    routed_width = KIMI_K3_ROUTED_INTERMEDIATE_SIZE // KIMI_K3_TP_SIZE
+
+    # W1, W3, then W2. None of the three may ask for padding.
+    assert storage_widths == (KIMI_K3_W1W3_K, KIMI_K3_W1W3_K, routed_width)
+    assert storage_widths == (3584, 3584, 384)
+
+
 def test_prepare_weights_slices_routed_and_shared_tp_ranges(
     device: torch.device, prepared_weights: PreparedWeights
 ) -> None:
     from mok.kimi_k3 import dequant_kimi_k3_mxfp4
 
-    weights, replicated = prepared_weights()
+    weights, replicated, _ = prepared_weights()
     routed_start = PREPARE_TP_RANK * 384
     shared_start = PREPARE_TP_RANK * 768
     expected_rows = _sparse_expert_pattern(3072, device)[
@@ -696,7 +738,7 @@ def test_prepare_weights_are_not_repacked_by_decode_calls(
 ) -> None:
     from mok import ops
 
-    weights, _ = prepared_weights()
+    weights, _, _ = prepared_weights()
     packed_fields = (
         weights.expert_w1_packed,
         weights.expert_w1_scale,
@@ -879,14 +921,20 @@ def test_mxfp4_operator_fakes_match_registered_schemas(device: torch.device) -> 
 def test_mxfp4_operator_fakes_report_prepared_shapes(device: torch.device) -> None:
     from torch._subclasses.fake_tensor import FakeTensorMode
 
+    from mok.kimi_k3 import KIMI_K3_W1W3_K
+
     with FakeTensorMode():
-        weight = torch.empty(896, 384, 3584, dtype=torch.bfloat16, device=device)
-        packed, scale = torch.ops.mok.pack_kimi_k3_mxfp4(weight, 3648)
-        assert packed.shape == (896, 384, 1824)
-        assert scale.shape == (896, 384, 114)
+        weight = torch.empty(
+            896, 384, KIMI_K3_W1W3_K, dtype=torch.bfloat16, device=device
+        )
+        packed, scale = torch.ops.mok.pack_kimi_k3_mxfp4(weight, KIMI_K3_W1W3_K)
+        assert packed.shape == (896, 384, 1792)
+        assert scale.shape == (896, 384, 112)
         assert packed.dtype == torch.uint8
         assert scale.dtype == torch.uint8
 
-        restored = torch.ops.mok.dequant_kimi_k3_mxfp4(packed, scale, 3584)
+        restored = torch.ops.mok.dequant_kimi_k3_mxfp4(
+            packed, scale, KIMI_K3_W1W3_K
+        )
         assert restored.shape == (896, 384, 3584)
         assert restored.dtype == torch.bfloat16

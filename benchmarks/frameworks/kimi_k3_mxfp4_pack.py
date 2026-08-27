@@ -77,13 +77,12 @@ def pack_reference_bytes() -> None:
         entry: dict[str, object] = {
             "bf16": weight.cpu(),
             "logical_k": case.logical_k,
-            "padded_k": case.padded_k,
             "consumer": case.consumer,
             "zero_groups": count_zero_groups(weight),
         }
 
-        # Unpadded packing is what FlashInfer's quantizer can be compared with
-        # byte for byte; the padded form is our canonical checkpoint layout.
+        # The canonical prepared layout is unpadded, so these are both the bytes
+        # FlashInfer's quantizer is compared against and the bytes it consumes.
         packed, scale = pack_kimi_k3_mxfp4(
             weight.unsqueeze(0), padded_k=case.logical_k
         )
@@ -93,20 +92,19 @@ def pack_reference_bytes() -> None:
             packed, scale, logical_k=case.logical_k
         ).squeeze(0).cpu()
 
-        if case.padded_k != case.logical_k:
-            padded_packed, padded_scale = pack_kimi_k3_mxfp4(
-                weight.unsqueeze(0), padded_k=case.padded_k
-            )
-            entry["packed_padded"] = padded_packed.squeeze(0).cpu()
-            entry["scale_padded"] = padded_scale.squeeze(0).cpu()
-
         payload["cases"][case.name] = entry
         print(
             f"{case.name:7s}: bf16 {tuple(weight.shape)} "
             f"packed {tuple(packed.shape)} scale {tuple(scale.shape)} "
-            f"padded_k={case.padded_k} zero_groups={entry['zero_groups']} "
-            f"consumer={case.consumer}"
+            f"zero_groups={entry['zero_groups']} consumer={case.consumer}"
         )
+        native = (case.rows, case.packed_columns), (case.rows, case.scale_columns)
+        observed = tuple(packed.shape[1:]), tuple(scale.shape[1:])
+        if observed != native:
+            raise SystemExit(
+                f"{case.name} packed at {observed} instead of the native K=32 "
+                f"layout {native}"
+            )
         if case.consumer and not entry["zero_groups"]:
             raise SystemExit(
                 f"{case.name} must contain a zero group: the consumer run has to "

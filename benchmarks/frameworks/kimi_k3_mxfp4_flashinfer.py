@@ -7,7 +7,8 @@ and, inside ``vllm/vllm-openai:kimi-k3``:
    linear (checkpoint) scale-factor layout,
 2. checks FlashInfer's host dequantizer reads them back to exactly the values
    MoK's dequant kernel produced,
-3. checks the canonical zero-padded W1/W3 layout against the unpadded bytes,
+3. checks the canonical prepared widths are the native K=32 ones, so that step 4
+   below needs no K-dimension transform at all,
 4. feeds the canonical bytes through the official consumer transform
    (``reorder_rows_for_gated_act_gemm`` + ``shuffle_matrix_a`` /
    ``shuffle_matrix_sf_a``) into ``trtllm_fp4_block_scale_routed_moe`` for one
@@ -75,7 +76,7 @@ def flashinfer_consume() -> None:
     failures: list[str] = []
     failures += _compare_packed_bytes(payload)
     failures += _compare_dequant(payload)
-    failures += _compare_padded_layout(payload)
+    failures += _compare_canonical_widths(payload)
     failures += _run_consumer(payload)
     failures += _negative_control(payload)
 
@@ -275,32 +276,27 @@ def _compare_dequant(payload) -> list[str]:
     return failures
 
 
-def _compare_padded_layout(payload) -> list[str]:
-    """The canonical zero-padded layout must extend the unpadded bytes."""
-    import torch
+def _compare_canonical_widths(payload) -> list[str]:
+    """The canonical prepared bytes must be stored at native K, unpadded.
 
+    Mixed W4A8 ``kind::mxf8f6f4`` block scaling runs at K=32, so the prepared
+    layout carries no padding for the consumer to strip. Any padding would show
+    up here as a storage width wider than the logical contraction.
+    """
     failures: list[str] = []
     for name, case in payload["cases"].items():
-        if "packed_padded" not in case:
-            continue
         logical_k = case["logical_k"]
-        checks = {
-            "prefix_packed": torch.equal(
-                case["packed_padded"][:, : logical_k // 2], case["packed"]
-            ),
-            "prefix_scale": torch.equal(
-                case["scale_padded"][:, : logical_k // GROUP_SIZE], case["scale"]
-            ),
-            "tail_packed_zero": bool(
-                (case["packed_padded"][:, logical_k // 2 :] == 0).all()
-            ),
-            "tail_unit_scale": bool(
-                (case["scale_padded"][:, logical_k // GROUP_SIZE :]
-                 == UNIT_SCALE_BYTE).all()
-            ),
-        }
-        print(f"[padded] {name}: {case['logical_k']} -> {case['padded_k']}: {checks}")
-        failures += [f"{name}:{key}" for key, ok in checks.items() if not ok]
+        native = (logical_k // 2, logical_k // GROUP_SIZE)
+        observed = (case["packed"].shape[1], case["scale"].shape[1])
+        native_widths = observed == native
+        stale = {"packed_padded", "scale_padded"} & set(case)
+        print(f"[widths] {name}: logical K={logical_k} stored as packed/scale "
+              f"{observed}, native {native}, native_widths={native_widths}, "
+              f"padded fields={sorted(stale) or 'none'}")
+        if not native_widths:
+            failures.append(f"{name}:not-native-width")
+        if stale:
+            failures.append(f"{name}:padded-payload-fields")
     return failures
 
 
@@ -318,18 +314,11 @@ def _situ(gate, linear):
 
 
 def _canonical_consumer_bytes(case):
-    """Take the canonical prepared bytes and drop the zero padding.
+    """Hand the canonical prepared bytes to the consumer, untouched.
 
-    This is the whole one-time adapter on the K dimension: FlashInfer's routed
-    MoE kernel takes the logical contraction width, while the prepared
-    checkpoint layout pads W1/W3 to 3648 for MoK's own SM103 kernel.
+    There is no K-dimension adapter: the prepared layout stores the native
+    contraction width that FlashInfer's routed MoE kernel already expects.
     """
-    logical_k = case["logical_k"]
-    if "packed_padded" in case:
-        return (
-            case["packed_padded"][:, : logical_k // 2].cuda(),
-            case["scale_padded"][:, : logical_k // GROUP_SIZE].cuda(),
-        )
     return case["packed"].cuda(), case["scale"].cuda()
 
 

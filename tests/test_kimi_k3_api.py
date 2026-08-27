@@ -11,7 +11,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from .kimi_k3_api_contract import CHECKS, RESULT_MARKER
+from .kimi_k3_api_contract import CHECKS, MXFP4_LAYOUTS, RESULT_MARKER
 
 
 @pytest.fixture(scope="session")
@@ -45,6 +45,22 @@ def test_api_contract(
 ) -> None:
     result = api_contract_results[check]
     assert result["outcome"] == "passed", result["detail"]
+
+
+def test_api_contract_pins_native_k32_expert_layouts() -> None:
+    """The contract data itself must stay on native K, not padded K.
+
+    Every rejection case above is derived from this table, so a silent return to
+    the K=3648 padding would make those cases test the wrong contract.
+    """
+    assert dict(MXFP4_LAYOUTS) == {
+        "expert_w1_packed": (896, 384, 1792),
+        "expert_w1_scale": (896, 384, 112),
+        "expert_w3_packed": (896, 384, 1792),
+        "expert_w3_scale": (896, 384, 112),
+        "expert_w2_packed": (896, 3584, 192),
+        "expert_w2_scale": (896, 3584, 12),
+    }
 
 
 def test_api_contract_does_not_stub_the_mok_package() -> None:

@@ -113,11 +113,15 @@ __device__ __forceinline__ float accumulate_bf16_octet(
     return total;
 }
 
-inline constexpr int kExpertW1W3PackedRows = 384;
-inline constexpr int kExpertW1W3PackedColumns = 1824;
-inline constexpr int kExpertW1W3ScaleColumns = 114;
-inline constexpr int kExpertW2PackedRows = 3584;
-inline constexpr int kExpertW2PackedColumns = 192;
-inline constexpr int kExpertW2ScaleColumns = 12;
+// Mixed W4A8 `kind::mxf8f6f4` block scaling runs at K=32, so both prepared
+// expert contractions are stored at their native width, without padding.
+inline constexpr int kRoutedIntermediateSizePerRank =
+    kRoutedIntermediateSize / kTensorParallelSize;
+inline constexpr int kExpertW1W3PackedRows = kRoutedIntermediateSizePerRank;
+inline constexpr int kExpertW1W3PackedColumns = kLatentSize / 2;
+inline constexpr int kExpertW1W3ScaleColumns = kLatentSize / 32;
+inline constexpr int kExpertW2PackedRows = kLatentSize;
+inline constexpr int kExpertW2PackedColumns = kRoutedIntermediateSizePerRank / 2;
+inline constexpr int kExpertW2ScaleColumns = kRoutedIntermediateSizePerRank / 32;
 
 }  // namespace kimi_k3_decode
