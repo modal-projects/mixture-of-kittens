@@ -23,8 +23,11 @@ MAX_TOKENS = 128
 MAX_ASSIGNMENTS = MAX_TOKENS * TOPK
 CAPACITY_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128)
 PROBE_COLUMNS = 128
-GAIN_PERIOD = 5.0
+GAIN_BINADES = 5
 ADDRESS_EXPERTS = (1, 447, 895)
+# Deliberately lopsided so reversing a token's two experts across its two slots
+# changes the result by 0.75 of the difference between the two expert outputs.
+ADDRESS_WEIGHTS = (0.125, 0.875)
 GROUP = 32
 ALIGNMENT = 256
 UNIT_SCALE = 0x7F
@@ -128,14 +131,20 @@ def _latent_column_for_row(row: int) -> int:
 def _down_row_gain(device: torch.device, phase: int = 0) -> torch.Tensor:
     """Give each of the 3584 down-projection rows a distinguishable gain.
 
-    The period is five, which divides neither the 128-wide output tile nor the
-    384-wide intermediate, so a tile written to the wrong ``output_base`` and a
-    row displaced by a whole intermediate both change the result instead of
-    landing on an identical value.  A period of three would have been blind to
-    the 384 displacement.  Each gain is exactly representable in E2M1.
+    Each exponent comes from an integer hash of the row index, so the sequence
+    is nonperiodic: a tile written to the wrong ``output_base``, a row displaced
+    by a whole intermediate, and any other displacement all change the result
+    instead of landing on an identical value.  A fixed period would have been
+    blind to a displacement of exactly that period.  ``phase`` shifts the hash
+    input, which gives one expert a shard tag no other expert repeats.  Every
+    gain is a power of two in ``[2^-4, 1]`` and so exactly representable in
+    E2M1, which keeps the dequantized reference bit-exact.
     """
-    rows = torch.arange(HIDDEN, dtype=torch.float32, device=device)
-    return torch.pow(2.0, -((rows + phase) % GAIN_PERIOD)).bfloat16()
+    rows = torch.arange(HIDDEN, dtype=torch.int64, device=device)
+    mixed = (rows + phase + 1) * 0x9E3779B1
+    mixed = mixed ^ (mixed >> 15)
+    mixed = mixed ^ (mixed >> 7)
+    return torch.pow(2.0, -(mixed % GAIN_BINADES).float()).bfloat16()
 
 
 def _make_structured_weights(device: torch.device) -> ExpertWeights:
@@ -390,10 +399,24 @@ def _mxfp8_dequant_reference(values: torch.Tensor) -> torch.Tensor:
 
     Derived from the scale byte rather than from ``log2``, so it stays exact at
     the bottom of the E8M0 range where a float ``absolute_max / 448`` becomes
-    subnormal.
+    subnormal.  Torch keeps subnormals, so this models the quantizer the kernel
+    would run if the extension were not built with ``-ftz=true``.
     """
     dequantized, _ = _mxfp8_quantize_reference(values)
     return dequantized
+
+
+def _published_latent(scratch: torch.Tensor, rows: int) -> torch.Tensor:
+    """Dequantize the MXFP8 latent the quantization stage published."""
+    codes = _region(scratch, "latent_mxfp8", torch.uint8)[
+        : rows * HIDDEN
+    ].view(rows, HIDDEN)
+    scale_bytes = _region(scratch, "latent_scale", torch.uint8)[
+        : rows * (HIDDEN // GROUP)
+    ].view(rows, HIDDEN // GROUP)
+    scale = torch.pow(2.0, (scale_bytes.int() - 127).float())
+    values = codes.view(torch.float8_e4m3fn).float().view(rows, -1, GROUP)
+    return (values * scale.unsqueeze(-1)).reshape(rows, HIDDEN)
 
 
 def test_workspace_bytes_matches_extended_expert_scratch(
@@ -411,6 +434,34 @@ def test_workspace_bytes_matches_extended_expert_scratch(
     assert SCRATCH_LAYOUT["situ_mxfp8"] == (513_536, 786_432)
     assert SCRATCH_LAYOUT["situ_scale"] == (1_299_968, 24_576)
     assert SCRATCH_LAYOUT["routed_accumulator"] == (1_324_544, 1_835_008)
+
+
+def test_down_row_gain_tag_is_nonperiodic_and_exactly_representable(
+    device: torch.device,
+) -> None:
+    """The output-tile tag must not repeat under any displacement it must catch.
+
+    A tag with period ``p`` is blind to a displacement of ``p`` rows, so the
+    fixture's discriminating power is only as good as the tag's aperiodicity.
+    """
+    gains = _down_row_gain(device).float()
+
+    exponents = torch.log2(gains)
+    assert torch.equal(exponents, exponents.round())
+    assert float(gains.max()) == 1.0
+    assert float(gains.min()) == 2.0 ** -(GAIN_BINADES - 1)
+    assert int(gains.unique().numel()) == GAIN_BINADES
+    assert torch.equal(gains, gains.bfloat16().float())
+
+    # Every displacement the kernel could plausibly make, including the 128-wide
+    # output tile and the 384-wide intermediate, must move most of the rows.
+    for shift in (1, 2, 3, 5, 7, 32, 112, 128, 384, 1792):
+        changed = int((torch.roll(gains, shift) != gains).sum())
+        assert changed > HIDDEN // 3, (shift, changed)
+    # The phase argument must give each expert a tag no other expert repeats.
+    for phase in (1, 2, 3):
+        changed = int((_down_row_gain(device, phase).float() != gains).sum())
+        assert changed > HIDDEN // 3, (phase, changed)
 
 
 def test_sm103_mixed_mxfp8_by_mxfp4_instruction_probe(
@@ -495,6 +546,75 @@ def test_mixed_mma_probe_spans_the_full_e8m0_activation_range(
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-4)
 
 
+# E2M1 code points to be scaled by 2^-126, the minimum BF16 normal.  0.5 is
+# left out because 0.5 * 2^-126 is subnormal.
+_MIN_NORMAL_POINTS = (0.0, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+# BF16 subnormals are exactly the integer multiples of 2^-133, so a subnormal
+# probe needs integer code points.
+_SUBNORMAL_POINTS = (0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0)
+
+
+def _bottom_of_range_probe(
+    device: torch.device, unit: float, points: Sequence[float]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Issue the mixed MMA with A scaled to ``unit`` and a compensating B.
+
+    B carries ``2^120``, which keeps every product an ordinary normal float even
+    though A sits at the bottom of the BF16 range, so nothing but A's own
+    magnitude is under test.  Row 0 is left as an all-zero block.
+    """
+    from mok import _C
+    from mok.ops import dequant_kimi_k3_mxfp4, pack_kimi_k3_mxfp4
+
+    rows = 8
+    lanes = torch.tensor(points, dtype=torch.bfloat16, device=device)
+    lanes = lanes.repeat(GROUP // len(points) + 1)[:GROUP]
+    a = torch.zeros(rows, GROUP, dtype=torch.bfloat16, device=device)
+    for row in range(1, rows):
+        a[row] = lanes.roll(row) * unit
+    b = torch.zeros(1, PROBE_COLUMNS, GROUP, dtype=torch.bfloat16, device=device)
+    for column in range(PROBE_COLUMNS):
+        b[0, column] = lanes.roll(column + 3) * (2.0**120)
+    b_packed, b_scale = pack_kimi_k3_mxfp4(b, GROUP)
+    exact_b = dequant_kimi_k3_mxfp4(b_packed, b_scale, GROUP)[0].float()
+
+    actual = _C._kimi_k3_mixed_mma_probe(a, b_packed[0], b_scale[0])
+    return actual, _mxfp8_dequant_reference(a) @ exact_b.T
+
+
+def test_mixed_mma_probe_reaches_the_bottom_of_the_bf16_activation_range(
+    device: torch.device,
+) -> None:
+    """Drive the mixed instruction with the smallest activations it supports.
+
+    ``2^-126``, the minimum BF16 normal, is that smallest magnitude: the
+    extension is built with ``--use_fast_math``, which implies ``-ftz=true``, so
+    a subnormal is flushed before the quantizer reads it.  At ``2^-126`` the
+    instruction path is still exact and the result is far from zero.
+
+    The subnormal case is then asserted to be exactly zero rather than left out.
+    A flush is the documented consequence of the build's own flags, so the test
+    pins it: a nonzero result there would mean the pipeline had produced
+    something the contract cannot explain.  ``unflushed`` shows the same inputs
+    are nonzero under the FTZ-free reference, so the zero is the flush and not
+    an accidentally empty fixture.
+    """
+    actual, expected = _bottom_of_range_probe(device, 2.0**-126, _MIN_NORMAL_POINTS)
+
+    assert float(expected.abs().max()) > 1.0
+    assert torch.isfinite(actual).all()
+    assert torch.equal(actual[0], torch.zeros_like(actual[0]))
+    assert float(actual[1:].abs().max()) > 1.0
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+
+    flushed, unflushed = _bottom_of_range_probe(
+        device, 2.0**-133, _SUBNORMAL_POINTS
+    )
+
+    assert float(unflushed.abs().max()) > 0.0
+    assert torch.equal(flushed, torch.zeros_like(flushed))
+
+
 def test_activation_scale_bytes_reach_the_e8m0_minimum(
     device: torch.device,
     weights: ExpertWeights,
@@ -520,6 +640,87 @@ def test_activation_scale_bytes_reach_the_e8m0_minimum(
     assert int(published[2].max()) == 0
     assert int(published[3].max()) == 0
     assert int(published[1].max()) < int(published[0].min())
+
+
+# Name, the constant fed to every latent lane, its BF16 bit pattern, the E8M0
+# byte the kernel must publish, and whether the block survives as nonzero codes.
+# For an exact power of two 2^k the byte is k + 119, clamped onto byte 0.
+_SCALE_BOUNDARY_CASES = (
+    ("zero", 0.0, 0x0000, UNIT_SCALE, False),
+    ("min bf16 subnormal 2^-133", 2.0**-133, 0x0001, UNIT_SCALE, False),
+    ("max bf16 subnormal 127*2^-133", 127 * 2.0**-133, 0x007F, UNIT_SCALE, False),
+    ("min bf16 normal 2^-126", 2.0**-126, 0x0080, 0, True),
+    ("2^-120", 2.0**-120, 0x0380, 0, True),
+    ("2^-60", 2.0**-60, 0x2180, 59, True),
+    ("2^-10", 2.0**-10, 0x3A80, 109, True),
+    ("2^0", 1.0, 0x3F80, 119, True),
+    ("2^8", 2.0**8, 0x4380, 127, True),
+)
+
+
+def test_published_latent_scale_bytes_cover_the_e8m0_boundaries(
+    device: torch.device,
+    weights: ExpertWeights,
+    scratch: torch.Tensor,
+) -> None:
+    """Walk E8M0 selection from an all-zero block to the top of the BF16 range.
+
+    An all-zero block must take the contract's unit byte, and every ordinary
+    normal the mathematically expected ``k + 119`` for ``2^k``, clamped onto the
+    minimum byte 0 at the bottom.  A BF16 subnormal cannot reach its own byte:
+    the extension is built with ``--use_fast_math``, which implies
+    ``-ftz=true``, so the magnitude is flushed before the quantizer reads it and
+    the block becomes indistinguishable from an all-zero block.  That is pinned
+    here rather than skipped, because it is what a caller actually gets.
+
+    ``2^8`` selects the same byte as an all-zero block, since a scale of 1.0
+    already keeps 256 inside E4M3's 448, so the byte alone cannot separate a
+    live block from a dead one and every case also asserts whether the block
+    survives as nonzero codes.
+    """
+    rows = len(_SCALE_BOUNDARY_CASES)
+    latent = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device=device)
+    for row, (name, value, bits, _, _) in enumerate(_SCALE_BOUNDARY_CASES):
+        latent[row] = torch.tensor(value, dtype=torch.bfloat16, device=device)
+        assert int(latent[row, 0].view(torch.uint16)) == bits, name
+    _write_assignments(scratch, [(0, token, 0, 1.0) for token in range(rows)])
+
+    _call(latent, weights, torch.empty_like(latent), scratch, rows)
+
+    published = _region(scratch, "latent_scale", torch.uint8)[
+        : rows * (HIDDEN // GROUP)
+    ].view(rows, HIDDEN // GROUP)
+    codes = _region(scratch, "latent_mxfp8", torch.uint8)[
+        : rows * HIDDEN
+    ].view(rows, HIDDEN)
+    for row, (name, _, _, byte, survives) in enumerate(_SCALE_BOUNDARY_CASES):
+        assert torch.equal(
+            published[row], torch.full_like(published[row], byte)
+        ), (name, int(published[row].min()), int(published[row].max()))
+        assert bool((codes[row] != 0).all()) == survives, name
+        assert bool((codes[row] == 0).all()) != survives, name
+
+    # The two subnormal rows must be indistinguishable from the all-zero row in
+    # every published byte, which is the whole content of the flush contract.
+    for row in (1, 2):
+        assert torch.equal(published[row], published[0])
+        assert torch.equal(codes[row], codes[0])
+
+    # Every row that survives must match the reference quantizer bit for bit,
+    # so the boundary bytes are not merely plausible but exactly right.
+    surviving = torch.tensor(
+        [row for row, case in enumerate(_SCALE_BOUNDARY_CASES) if case[4]],
+        device=device,
+    )
+    expected_latent, expected_bytes = _mxfp8_quantize_reference(latent.float())
+    assert torch.equal(
+        published.index_select(0, surviving),
+        expected_bytes.index_select(0, surviving),
+    )
+    assert torch.equal(
+        _published_latent(scratch, rows).index_select(0, surviving),
+        expected_latent.index_select(0, surviving),
+    )
 
 
 @pytest.mark.parametrize("rows", [1, 2, 8, 16])
@@ -702,8 +903,9 @@ def test_selected_expert_ids_are_addressed_exactly(
 
     Each selected expert also differs from the shared shard every other expert
     carries, so reading expert 0, aliasing the expert stride onto a neighbour,
-    swapping the two selected experts of a token, or misaddressing the final
-    expert all change the result.  Only the selected slices are dequantized.
+    reversing the two experts a token selected across its two slots, or
+    misaddressing the final expert all change the result.  Only the selected
+    slices are dequantized.
     """
     tensors = (
         weights.w1_packed,
@@ -722,14 +924,15 @@ def test_selected_expert_ids_are_addressed_exactly(
             _install_expert_pattern(weights, expert, phase, device)
 
         latent = _random_latent(device, 6, 7100)
+        first_weight, second_weight = ADDRESS_WEIGHTS
+        slot_experts = [
+            (ADDRESS_EXPERTS[token % 3], ADDRESS_EXPERTS[(token + 1) % 3])
+            for token in range(6)
+        ]
         assignments: list[Assignment] = []
-        for token in range(6):
-            assignments.append(
-                (ADDRESS_EXPERTS[token % 3], token, 0, 0.375)
-            )
-            assignments.append(
-                (ADDRESS_EXPERTS[(token + 1) % 3], token, 1, 0.625)
-            )
+        for token, (first, second) in enumerate(slot_experts):
+            assignments.append((first, token, 0, first_weight))
+            assignments.append((second, token, 1, second_weight))
         _write_assignments(scratch, assignments)
 
         actual = _call(latent, weights, torch.empty_like(latent), scratch, 6)
@@ -740,14 +943,21 @@ def test_selected_expert_ids_are_addressed_exactly(
         # to catch must move the reference well past the max-abs tolerance.
         collapsed = [(0, token, slot, weight)
                      for _, token, slot, weight in assignments]
-        swapped = [
+        rotated = [
             (ADDRESS_EXPERTS[(ADDRESS_EXPERTS.index(expert) + 1) % 3],
              token, slot, weight)
             for expert, token, slot, weight in assignments
         ]
         neighbour = [(expert - 1, token, slot, weight)
                      for expert, token, slot, weight in assignments]
-        for wrong in (collapsed, swapped, neighbour):
+        # A true swap: each token keeps its own two experts, its slot positions,
+        # and its route weights, and only the pairing between them is reversed.
+        # Nothing but reading the assignment's own expert id gets this right.
+        reversed_slots: list[Assignment] = []
+        for token, (first, second) in enumerate(slot_experts):
+            reversed_slots.append((second, token, 0, first_weight))
+            reversed_slots.append((first, token, 1, second_weight))
+        for wrong in (collapsed, rotated, neighbour, reversed_slots):
             deviation = _reference(latent, weights, wrong, 6) - expected
             assert float(deviation.abs().max()) > 1.0
     finally:
@@ -796,19 +1006,6 @@ def test_reused_scratch_resets_accumulator_and_generation_counters(
     assert int(generations[2][5] - generations[1][5]) == 1
     assert int(generations[1][8] - generations[0][8]) == 1
     assert int(generations[2][8] - generations[1][8]) == 1
-
-
-def _published_latent(scratch: torch.Tensor, rows: int) -> torch.Tensor:
-    """Dequantize the MXFP8 latent the quantization stage published."""
-    codes = _region(scratch, "latent_mxfp8", torch.uint8)[
-        : rows * HIDDEN
-    ].view(rows, HIDDEN)
-    scale_bytes = _region(scratch, "latent_scale", torch.uint8)[
-        : rows * (HIDDEN // GROUP)
-    ].view(rows, HIDDEN // GROUP)
-    scale = torch.pow(2.0, (scale_bytes.int() - 127).float())
-    values = codes.view(torch.float8_e4m3fn).float().view(rows, -1, GROUP)
-    return (values * scale.unsqueeze(-1)).reshape(rows, HIDDEN)
 
 
 def test_replayed_generations_publish_fresh_quantized_and_routed_state(
@@ -983,9 +1180,11 @@ def _offset_copy(source: torch.Tensor, element_offset: int) -> torch.Tensor:
     """Copy ``source`` into a contiguous view starting at a nonzero storage offset.
 
     The caching allocator hands out 256-byte-aligned blocks, so the returned view
-    is under-aligned by exactly ``element_offset`` elements while staying
-    contiguous and correctly shaped: the shape of pointer no dtype, shape, or
-    contiguity check would notice.
+    starts exactly ``element_offset`` elements into its storage while staying
+    contiguous and correctly shaped.  With an offset that breaks the required
+    alignment this is the one pointer no dtype, shape, or contiguity check would
+    notice; with an offset that preserves it, the same construction proves the
+    alignment check accepts offset views instead of rejecting all of them.
     """
     flat = torch.empty(
         source.numel() + element_offset, dtype=source.dtype, device=source.device
@@ -999,11 +1198,16 @@ def _offset_copy(source: torch.Tensor, element_offset: int) -> torch.Tensor:
 
 
 def _expert_call_arguments(
-    device: torch.device, weights: ExpertWeights, scratch: torch.Tensor
+    device: torch.device,
+    weights: ExpertWeights,
+    scratch: torch.Tensor,
+    latent: torch.Tensor | None = None,
 ) -> dict[str, object]:
-    latent = torch.zeros(1, HIDDEN, dtype=torch.bfloat16, device=device)
-    latent[:, 0] = 0.5
-    _write_assignments(scratch, [(0, 0, 0, 1.0)])
+    if latent is None:
+        latent = torch.zeros(1, HIDDEN, dtype=torch.bfloat16, device=device)
+        latent[:, 0] = 0.5
+    rows = latent.size(0)
+    _write_assignments(scratch, [(0, token, 0, 1.0) for token in range(rows)])
     return {
         "latent_x": latent,
         "expert_w1_packed": weights.w1_packed,
@@ -1014,28 +1218,36 @@ def _expert_call_arguments(
         "expert_w2_scale": weights.w2_scale,
         "routed_output": torch.empty_like(latent),
         "scratch": scratch,
-        "active_tokens": 1,
+        "active_tokens": rows,
     }
 
 
-# Every expert-stage tensor, with an element offset that under-aligns it.
-_EXPERT_ALIGNMENT_CASES = tuple(
-    (field, 1, 16)
-    for field in (
-        "latent_x",
-        "expert_w1_packed",
-        "expert_w1_scale",
-        "expert_w3_packed",
-        "expert_w3_scale",
-        "expert_w2_packed",
-        "expert_w2_scale",
-        "routed_output",
-    )
-) + (("scratch", 16, ALIGNMENT),)
+# Every expert-stage tensor with its required alignment, one element offset that
+# breaks that alignment, and one nonzero element offset that preserves it.
+_EXPERT_TENSOR_CASES = (
+    ("latent_x", 16, 1, 8),
+    ("expert_w1_packed", 16, 1, 16),
+    ("expert_w1_scale", 16, 1, 16),
+    ("expert_w3_packed", 16, 1, 16),
+    ("expert_w3_scale", 16, 1, 16),
+    ("expert_w2_packed", 16, 1, 16),
+    ("expert_w2_scale", 16, 1, 16),
+    ("routed_output", 16, 1, 8),
+    ("scratch", ALIGNMENT, 16, ALIGNMENT),
+)
+
+_EXPERT_MISALIGNED_CASES = tuple(
+    (field, element_offset, alignment)
+    for field, alignment, element_offset, _ in _EXPERT_TENSOR_CASES
+)
+_EXPERT_ALIGNED_CASES = tuple(
+    (field, element_offset, alignment)
+    for field, alignment, _, element_offset in _EXPERT_TENSOR_CASES
+)
 
 
 @pytest.mark.parametrize(("field", "element_offset", "alignment"),
-                         _EXPERT_ALIGNMENT_CASES)
+                         _EXPERT_MISALIGNED_CASES)
 def test_expert_stage_rejects_every_misaligned_offset_view(
     device: torch.device,
     weights: ExpertWeights,
@@ -1056,7 +1268,7 @@ def test_expert_stage_rejects_every_misaligned_offset_view(
 
 
 @pytest.mark.parametrize(("field", "element_offset", "alignment"),
-                         _EXPERT_ALIGNMENT_CASES)
+                         _EXPERT_MISALIGNED_CASES)
 def test_c_entrypoint_rejects_every_misaligned_offset_view(
     device: torch.device,
     weights: ExpertWeights,
@@ -1075,6 +1287,38 @@ def test_c_entrypoint_rejects_every_misaligned_offset_view(
         _C._kimi_k3_routed_experts(
             *(arguments[name] for name in _EXPERT_ARGUMENTS)
         )
+
+
+@pytest.mark.parametrize(("field", "element_offset", "alignment"),
+                         _EXPERT_ALIGNED_CASES)
+def test_expert_stage_accepts_every_aligned_offset_view(
+    device: torch.device,
+    weights: ExpertWeights,
+    scratch: torch.Tensor,
+    field: str,
+    element_offset: int,
+    alignment: int,
+) -> None:
+    """Validation must reject under-alignment, not every nonzero storage offset.
+
+    Without this control the alignment checks could reject every offset view and
+    the rejection tests would still pass.
+    """
+    from mok import ops
+
+    rows = 4
+    latent = _random_latent(device, rows, 7200)
+    arguments = _expert_call_arguments(device, weights, scratch, latent)
+    aligned = _offset_copy(arguments[field], element_offset)
+    assert aligned.storage_offset() != 0
+    assert aligned.data_ptr() % alignment == 0
+    arguments[field] = aligned
+
+    actual = ops._kimi_k3_routed_experts(**arguments)
+
+    assert actual.data_ptr() == arguments["routed_output"].data_ptr()
+    assignments = [(0, token, 0, 1.0) for token in range(rows)]
+    _assert_expert_close(actual, _reference(latent, weights, assignments, rows))
 
 
 def _profiled_kernel_names(call: Callable[[], object]) -> list[str]:
