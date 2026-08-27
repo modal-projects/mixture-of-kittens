@@ -673,6 +673,12 @@ git commit -m "feat: add Kimi K3 MXFP4 routed experts"
 **Files:**
 - Create: `csrc/kimi_k3_decode/shared.cuh`
 - Modify: `csrc/kimi_k3_decode/kernel.cuh`
+- Modify: `csrc/kimi_k3_decode/types.cuh`
+- Modify: `csrc/kimi_k3_decode/entrypoints.cuh`
+- Modify: `csrc/bindings.cu`
+- Modify: `mok/ops.py`
+- Modify: `mok/_fake_impls.py`
+- Modify: `tests/test_kimi_k3_api.py`
 - Create: `tests/test_kimi_k3_shared.py`
 
 **Interfaces:**
@@ -698,7 +704,8 @@ expected = activated.float() @ shared_down.float().T
 Run:
 
 ```bash
-torchrun --standalone --nproc-per-node=1 -m pytest -q tests/test_kimi_k3_shared.py
+source .venv/bin/activate
+script -qec "modal shell --env rahul-dev modal_app.py::gpu_info --cmd 'cd /root/mok && torchrun --standalone --nproc-per-node=1 -m pytest -q tests/test_kimi_k3_shared.py'" /dev/null
 ```
 
 Expected: shared partial does not match.
@@ -710,12 +717,23 @@ shared branch independent persistent CTA roles so it overlaps expert work.
 Write its full-width partial into the shared region of
 `collective_buffer[M,3584:10752]`.
 
+Extend aligned scratch with shared gate, up, and activated intermediates plus
+generation-tagged shared-phase counters. Update the workspace-byte assertions
+from the C++ source of truth.
+
+Add a private `mok::_kimi_k3_shared_experts` operator across Python, fake,
+C++, and pybind. It consumes hidden states, the three rank-local shared
+weights, scratch, the mutable collective buffer, and active token count. It
+returns the active shared partial for tests. The production decode ABI remains
+unchanged; Task 9 invokes the same device functions from the final grid.
+
 - [ ] **Step 4: Run shared tests**
 
 Run:
 
 ```bash
-torchrun --standalone --nproc-per-node=1 -m pytest -q tests/test_kimi_k3_shared.py
+source .venv/bin/activate
+script -qec "modal shell --env rahul-dev modal_app.py::gpu_info --cmd 'cd /root/mok && torchrun --standalone --nproc-per-node=1 -m pytest -q tests/test_kimi_k3_shared.py'" /dev/null
 ```
 
 Expected: BF16 tolerances pass for all capacities and active-row masks.
@@ -723,7 +741,7 @@ Expected: BF16 tolerances pass for all capacities and active-row masks.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add csrc/kimi_k3_decode/shared.cuh csrc/kimi_k3_decode/kernel.cuh tests/test_kimi_k3_shared.py
+git add csrc/kimi_k3_decode csrc/bindings.cu mok/ops.py mok/_fake_impls.py tests/test_kimi_k3_api.py tests/test_kimi_k3_shared.py
 git commit -m "feat: add Kimi K3 shared expert branch"
 ```
 
