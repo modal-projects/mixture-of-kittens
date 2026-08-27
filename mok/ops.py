@@ -158,18 +158,45 @@ _ROUTED_EXPERT_ALIGNMENT = (
     ("scratch", 256),
 )
 
-
-@torch.library.custom_op(
-    "mok::_kimi_k3_routed_experts",
-    mutates_args=("routed_output", "scratch"),
-    schema=(
-        "(Tensor latent_x, Tensor expert_w1_packed, Tensor expert_w1_scale, "
-        "Tensor expert_w3_packed, Tensor expert_w3_scale, "
-        "Tensor expert_w2_packed, Tensor expert_w2_scale, "
-        "Tensor(a!) routed_output, Tensor(b!) scratch, int active_tokens) "
-        "-> Tensor(a!)"
-    ),
+_ROUTED_EXPERT_SCHEMA = (
+    "_kimi_k3_routed_experts("
+    "Tensor latent_x, Tensor expert_w1_packed, Tensor expert_w1_scale, "
+    "Tensor expert_w3_packed, Tensor expert_w3_scale, "
+    "Tensor expert_w2_packed, Tensor expert_w2_scale, "
+    "Tensor(a!) routed_output, Tensor(b!) scratch, int active_tokens"
+    ") -> Tensor(a!)"
 )
+_ROUTED_EXPERT_LIBRARY = torch.library.Library("mok", "FRAGMENT")
+_ROUTED_EXPERT_LIBRARY.define(_ROUTED_EXPERT_SCHEMA)
+
+
+@torch.library.impl("mok::_kimi_k3_routed_experts", "cuda")
+def _kimi_k3_routed_experts_cuda(
+    latent_x: torch.Tensor,
+    expert_w1_packed: torch.Tensor,
+    expert_w1_scale: torch.Tensor,
+    expert_w3_packed: torch.Tensor,
+    expert_w3_scale: torch.Tensor,
+    expert_w2_packed: torch.Tensor,
+    expert_w2_scale: torch.Tensor,
+    routed_output: torch.Tensor,
+    scratch: torch.Tensor,
+    active_tokens: int,
+) -> torch.Tensor:
+    return _C._kimi_k3_routed_experts(
+        latent_x,
+        expert_w1_packed,
+        expert_w1_scale,
+        expert_w3_packed,
+        expert_w3_scale,
+        expert_w2_packed,
+        expert_w2_scale,
+        routed_output,
+        scratch,
+        active_tokens,
+    )
+
+
 def _kimi_k3_routed_experts(
     latent_x: torch.Tensor,
     expert_w1_packed: torch.Tensor,
@@ -196,7 +223,7 @@ def _kimi_k3_routed_experts(
                 f"MoK: _kimi_k3_routed_experts requires {field} aligned to "
                 f"{alignment} bytes, got a pointer {past} bytes past one"
             )
-    return _C._kimi_k3_routed_experts(
+    return torch.ops.mok._kimi_k3_routed_experts(
         latent_x,
         expert_w1_packed,
         expert_w1_scale,
