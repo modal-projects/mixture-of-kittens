@@ -496,6 +496,9 @@ git commit -m "feat: prepare Kimi K3 MXFP4 expert weights"
 - Create: `csrc/kimi_k3_decode/kernel.cuh`
 - Modify: `csrc/kimi_k3_decode/types.cuh`
 - Modify: `csrc/kimi_k3_decode/entrypoints.cuh`
+- Modify: `csrc/bindings.cu`
+- Modify: `mok/ops.py`
+- Modify: `mok/_fake_impls.py`
 - Create: `tests/test_kimi_k3_router.py`
 
 **Interfaces:**
@@ -514,7 +517,8 @@ router fixtures by constructing correction biases with separated FP32 values.
 Run on B300:
 
 ```bash
-torchrun --standalone --nproc-per-node=1 -m pytest -q tests/test_kimi_k3_router.py
+source .venv/bin/activate
+script -qec "modal shell --env rahul-dev modal_app.py::gpu_info --cmd 'cd /root/mok && torchrun --standalone --nproc-per-node=1 -m pytest -q tests/test_kimi_k3_router.py'" /dev/null
 ```
 
 Expected: output/debug router buffers do not match the reference.
@@ -530,6 +534,11 @@ Use a 896-bin global histogram and prefix scan to produce expert-major
 assignment offsets for at most 2048 assignments. Store token index, top-k slot,
 and normalized weight; keep the count entirely on device.
 
+Extend the C++ scratch layout with aligned arrays for 2048 expert IDs, 2048
+FP32 weights, 896 histogram counts, 897 offsets, 2048 assignment token IDs,
+and 2048 assignment slots. Continue to expose its total byte size only through
+`kimi_k3_decode_workspace_bytes()`.
+
 - [ ] **Step 4: Implement token-capacity BF16 projection paths**
 
 Add direct-register CUDA-core GEMM for capacities 1, 2, 4, and 8. Add tcgen05
@@ -539,12 +548,20 @@ BF16 paths for capacities 16, 32, 64, and 128. Both compute
 Router and latent projection receive separate persistent CTA roles and publish
 completion through generation-tagged counters in `scratch`.
 
+Add a private test/fallback operator named `mok::_kimi_k3_route_and_project`
+that invokes the same one-launch device implementation and returns
+`(expert_ids, expert_weights, latent_x)`. Its C++ and fake signatures must
+match. The production `kimi_k3_decode` API remains unchanged and Task 9 calls
+the same device functions directly inside the final persistent kernel; no
+intermediate tensor is returned by the production path.
+
 - [ ] **Step 5: Run router and latent projection tests**
 
 Run:
 
 ```bash
-torchrun --standalone --nproc-per-node=1 -m pytest -q tests/test_kimi_k3_router.py
+source .venv/bin/activate
+script -qec "modal shell --env rahul-dev modal_app.py::gpu_info --cmd 'cd /root/mok && torchrun --standalone --nproc-per-node=1 -m pytest -q tests/test_kimi_k3_router.py'" /dev/null
 ```
 
 Expected: IDs exact; normalized weights within `1e-5`; BF16 latent projection
@@ -553,7 +570,7 @@ matches PyTorch within `atol=0.5, rtol=0.01`.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add csrc/kimi_k3_decode tests/test_kimi_k3_router.py
+git add csrc/kimi_k3_decode csrc/bindings.cu mok/ops.py mok/_fake_impls.py tests/test_kimi_k3_router.py
 git commit -m "feat: fuse Kimi K3 routing and latent projection"
 ```
 
