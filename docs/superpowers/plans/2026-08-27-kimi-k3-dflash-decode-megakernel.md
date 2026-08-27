@@ -20,6 +20,9 @@
 - Routed experts use group-32 MXFP4 E2M1 weights and dynamically quantized MXFP8 E4M3 activations; latent and shared projections remain BF16.
 - Training APIs and files under `csrc/megakernel/` retain their existing behavior.
 - Every logical task ends with focused verification and a separate commit.
+- Red tests import an existing module and access the new symbol inside the test
+  body, so pytest records an expected failing test rather than a collection
+  error.
 
 ## File Structure
 
@@ -104,7 +107,8 @@ Run:
 python -m pytest -q tests/test_kimi_k3_reference.py
 ```
 
-Expected: collection fails because `mok.kimi_k3` and `tests.kimi_k3_reference` do not exist.
+Expected: tests fail inside their bodies with `ModuleNotFoundError` for the
+new reference modules.
 
 - [ ] **Step 3: Add fixed constants and the reference implementation**
 
@@ -199,7 +203,8 @@ Run:
 python -m pytest -q tests/test_kimi_k3_api.py
 ```
 
-Expected: failure because the weight dataclass and contract helpers are absent.
+Expected: tests fail inside their bodies with `AttributeError` because the
+weight dataclass and contract helpers are absent.
 
 - [ ] **Step 3: Define the prepared-weight contract**
 
@@ -417,7 +422,8 @@ Run:
 torchrun --standalone --nproc-per-node=1 -m pytest -q tests/test_kimi_k3_mxfp4.py
 ```
 
-Expected: failure because pack/dequant operators are unregistered.
+Expected: tests fail inside their bodies because pack/dequant operators are
+unregistered.
 
 - [ ] **Step 3: Implement raw group-32 packing**
 
