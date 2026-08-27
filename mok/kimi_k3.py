@@ -26,6 +26,14 @@ class KimiK3DecodeConfig:
 
 @dataclass(frozen=True, slots=True)
 class KimiK3DecodeWeights:
+    """Prepared TP8 weights for Kimi K3 decode.
+
+    ``routed_expert_down_proj`` and ``routed_expert_up_proj`` are the replicated
+    latent projections from 7168 to 3584 and from 3584 to 7168, respectively.
+    They are distinct from the per-expert gate, up, and down projection tensors
+    accepted by ``kimi_k3_moe_reference``.
+    """
+
     router_weight: torch.Tensor
     router_correction_bias: torch.Tensor
     routed_expert_down_proj: torch.Tensor
@@ -85,11 +93,14 @@ def validate_kimi_k3_decode_inputs(
         ("routed_latent_rmsnorm_weight", weights.routed_latent_rmsnorm_weight,
          (KIMI_K3_LATENT_SIZE,)),
         ("shared_gate_proj", weights.shared_gate_proj,
-         (KIMI_K3_SHARED_INTERMEDIATE_SIZE, KIMI_K3_HIDDEN_SIZE)),
+         (KIMI_K3_SHARED_INTERMEDIATE_SIZE // KIMI_K3_TP_SIZE,
+          KIMI_K3_HIDDEN_SIZE)),
         ("shared_up_proj", weights.shared_up_proj,
-         (KIMI_K3_SHARED_INTERMEDIATE_SIZE, KIMI_K3_HIDDEN_SIZE)),
+         (KIMI_K3_SHARED_INTERMEDIATE_SIZE // KIMI_K3_TP_SIZE,
+          KIMI_K3_HIDDEN_SIZE)),
         ("shared_down_proj", weights.shared_down_proj,
-         (KIMI_K3_HIDDEN_SIZE, KIMI_K3_SHARED_INTERMEDIATE_SIZE)),
+         (KIMI_K3_HIDDEN_SIZE,
+          KIMI_K3_SHARED_INTERMEDIATE_SIZE // KIMI_K3_TP_SIZE)),
     )
     uint8_layouts = (
         ("expert_w1_packed", weights.expert_w1_packed, (896, 384, 1824)),

@@ -108,9 +108,9 @@ def _valid_weights(kimi_k3: ModuleType):
         expert_w3_scale=meta_uint8((896, 384, 114)),
         expert_w2_packed=meta_uint8((896, 3584, 192)),
         expert_w2_scale=meta_uint8((896, 3584, 12)),
-        shared_gate_proj=meta_bf16((6144, 7168)),
-        shared_up_proj=meta_bf16((6144, 7168)),
-        shared_down_proj=meta_bf16((7168, 6144)),
+        shared_gate_proj=meta_bf16((768, 7168)),
+        shared_up_proj=meta_bf16((768, 7168)),
+        shared_down_proj=meta_bf16((7168, 768)),
         tp_rank=0,
     )
 
@@ -135,6 +135,39 @@ def test_decode_accepts_canonical_prepared_layouts() -> None:
         )
         is None
     )
+
+
+def test_decode_requires_tp8_sharded_shared_weights() -> None:
+    kimi_k3, _, _ = _load_contract_modules()
+    hidden_states = torch.empty(16, 7168, dtype=torch.bfloat16, device="meta")
+    weights = _valid_weights(kimi_k3)
+    sharded_weights = replace(
+        weights,
+        shared_gate_proj=torch.empty(
+            768, 7168, dtype=torch.bfloat16, device="meta"
+        ),
+        shared_up_proj=torch.empty(
+            768, 7168, dtype=torch.bfloat16, device="meta"
+        ),
+        shared_down_proj=torch.empty(
+            7168, 768, dtype=torch.bfloat16, device="meta"
+        ),
+    )
+
+    assert (
+        kimi_k3.validate_kimi_k3_decode_inputs(hidden_states, sharded_weights)
+        is None
+    )
+    full_width_weights = replace(
+        sharded_weights,
+        shared_gate_proj=torch.empty(
+            6144, 7168, dtype=torch.bfloat16, device="meta"
+        ),
+    )
+    with pytest.raises(
+        ValueError, match=r"shared_gate_proj must have shape \(768, 7168\)"
+    ):
+        kimi_k3.validate_kimi_k3_decode_inputs(hidden_states, full_width_weights)
 
 
 @pytest.mark.parametrize(
