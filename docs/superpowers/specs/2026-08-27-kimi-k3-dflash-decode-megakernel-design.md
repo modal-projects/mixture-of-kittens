@@ -156,9 +156,7 @@ Replicated weights on every TP rank:
 Rank-local TP8 shards:
 
 - routed `w1/w3`: packed MXFP4 for all 896 experts, each with local output
-  width `3072 / 8 = 384`; the one-time preparation step zero-pads the K
-  dimension from 3584 to 3648 so SM103 K96 tensor-core instructions cover it
-  exactly;
+  width `3072 / 8 = 384` and logical K 3584;
 - routed `w2`: packed MXFP4 for all 896 experts, each consuming the matching
   local width 384 and producing a partial width-3584 result;
 - shared gate/up: BF16 local output width `6144 / 8 = 768`;
@@ -166,9 +164,9 @@ Rank-local TP8 shards:
 
 MXFP4 values use packed E2M1 data and group-size-32 E8M0 scales. The public API
 accepts prepared rank-local tensors. A separate preparation helper converts test
-BF16 tensors or maps framework-owned checkpoint tensors into the K96-padded
-contract without dequantizing checkpoint MXFP4 values; the hot path never
-repacks weights.
+BF16 tensors or maps framework-owned checkpoint tensors into this native
+group-32 layout without dequantizing checkpoint MXFP4 values; the hot path
+never repacks weights.
 
 ## TP8 Execution
 
@@ -224,6 +222,9 @@ host.
 - Expert work is assignment-driven rather than dense over 896 experts.
 - The kernel consumes checkpoint-native MXFP4 instead of dequantizing expert
   weights to BF16.
+- Routed GEMMs use SM103 `mxf8f6f4` block-scaled MMA with MXFP8 E4M3
+  activations, MXFP4 E2M1 weights, E8M0 scales, and K=32. K96
+  `mxf4nvf4` is not used because it is an FP4-by-FP4 path.
 - All supported shapes are CUDA Graph safe.
 
 ## Python API

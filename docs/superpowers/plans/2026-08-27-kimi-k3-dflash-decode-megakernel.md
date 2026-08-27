@@ -233,13 +233,15 @@ class KimiK3DecodeWeights:
 The canonical prepared layouts are:
 
 ```text
-expert_w1_packed, expert_w3_packed: uint8 [896, 384, 1824]
-expert_w1_scale,  expert_w3_scale:  uint8 [896, 384, 114]
+expert_w1_packed, expert_w3_packed: uint8 [896, 384, 1792]
+expert_w1_scale,  expert_w3_scale:  uint8 [896, 384, 112]
 expert_w2_packed:                    uint8 [896, 3584, 192]
 expert_w2_scale:                     uint8 [896, 3584, 12]
 ```
 
-The 1824 packed columns represent K=3648 after zero-padding logical K=3584.
+The W1/W3 layouts preserve the checkpoint's logical K=3584 exactly. Kimi K3's
+W4A8 path uses mixed `mxf8f6f4` block-scaled MMA with K=32, so no K96 padding
+is required.
 
 - [ ] **Step 4: Add the low-level custom-op schema and fake**
 
@@ -420,14 +422,15 @@ git commit -m "feat: add TP8 Kimi K3 decode workspace"
 
 - [ ] **Step 1: Write failing pack/dequant tests**
 
-Test exact zero handling, group scaling, K padding, and round-trip behavior:
+Test exact zero handling, group scaling, native K preservation, and round-trip
+behavior:
 
 ```python
-def test_pack_mxfp4_zero_pads_k_to_3648(device: torch.device) -> None:
+def test_pack_mxfp4_preserves_native_k_3584(device: torch.device) -> None:
     weight = torch.zeros(1, 384, 3584, dtype=torch.bfloat16, device=device)
-    packed, scale = pack_kimi_k3_mxfp4(weight, padded_k=3648)
-    assert packed.shape == (1, 384, 1824)
-    assert scale.shape == (1, 384, 114)
+    packed, scale = pack_kimi_k3_mxfp4(weight, padded_k=3584)
+    assert packed.shape == (1, 384, 1792)
+    assert scale.shape == (1, 384, 112)
     restored = dequant_kimi_k3_mxfp4(packed, scale, logical_k=3584)
     torch.testing.assert_close(restored, weight)
 ```
@@ -463,7 +466,7 @@ E8M0 scale and truncates to `logical_k`.
 `prepare_kimi_k3_decode_weights` validates replicated BF16 tensors, slices the
 rank's routed intermediate range `[tp_rank*384:(tp_rank+1)*384]`, slices the
 shared intermediate range `[tp_rank*768:(tp_rank+1)*768]`, packs routed
-`w1/w3` with K=3648, packs routed `w2` with K=384, and returns
+`w1/w3` with native K=3584, packs routed `w2` with K=384, and returns
 `KimiK3DecodeWeights`.
 
 - [ ] **Step 5: Cross-check values against FlashInfer's MXFP4 path**
@@ -575,7 +578,7 @@ git add csrc/kimi_k3_decode csrc/bindings.cu mok/ops.py mok/_fake_impls.py tests
 git commit -m "feat: fuse Kimi K3 routing and latent projection"
 ```
 
-### Task 6: Implement assignment-driven MXFP4 routed experts
+### Task 6: Implement assignment-driven mixed MXFP8-by-MXFP4 routed experts
 
 **Files:**
 - Create: `csrc/kimi_k3_decode/expert_mxfp4.cuh`
@@ -604,12 +607,13 @@ torchrun --standalone --nproc-per-node=1 -m pytest -q tests/test_kimi_k3_expert.
 
 Expected: routed partials remain empty or zero.
 
-- [ ] **Step 3: Implement activation quantization and K96 gate/up**
+- [ ] **Step 3: Implement activation quantization and mixed K32 gate/up**
 
-Zero-pad each active latent row from 3584 to 3648. Quantize each block of 32
-values to MXFP8 E4M3 with E8M0 scale. Adapt the SM103 K96 scaled MMA pattern
-from `third_party/ThunderKittens/kernels/gemm/nvfp4_b300/` for a 384-wide local
-gate/up output.
+Quantize each 32-value block of the 3584-wide latent row to MXFP8 E4M3 with an
+E8M0 scale. Add a first-party SM103 `mxf8f6f4` wrapper whose A type is E4M3,
+B type is E2M1, scale type is E8M0, scale vector is `1X`, and K is 32. Use it
+for the 384-wide local gate/up output. Do not use ThunderKittens' K96
+`mxf4nvf4` helper, which is an FP4-by-FP4 instruction.
 
 Use expert-major assignment ranges so one CTA cluster reuses an expert's
 weights across all selected rows. Do not launch work for zero-token experts.
@@ -622,10 +626,10 @@ Compute:
 4*tanh(gate/4)*sigmoid(gate) * 25*tanh(up/25)
 ```
 
-in FP32, requantize the 384 values to MXFP8, run K96 MXFP4 down projection to
-3584, multiply by the normalized router weight, and atomically accumulate the
-rank-local FP32 partial. Cast the completed per-token partial to BF16 before
-the TP8 collective.
+in FP32, quantize the 384 values to MXFP8 block-32, run the same mixed K32
+MXFP8-by-MXFP4 down projection to 3584, multiply by the normalized router
+weight, and atomically accumulate the rank-local FP32 partial. Cast the
+completed per-token partial to BF16 before the TP8 collective.
 
 - [ ] **Step 5: Run expert tests**
 
