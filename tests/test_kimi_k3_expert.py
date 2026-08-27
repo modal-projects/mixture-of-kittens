@@ -21,6 +21,7 @@ EXPERTS = 896
 TOPK = 16
 MAX_TOKENS = 128
 MAX_ASSIGNMENTS = MAX_TOKENS * TOPK
+CAPACITY_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128)
 GROUP = 32
 ALIGNMENT = 256
 UNIT_SCALE = 0x7F
@@ -116,46 +117,101 @@ def peer_device(device: torch.device) -> Iterator[torch.device]:
         torch.cuda.set_device(device)
 
 
-def _make_structured_weights(device: torch.device) -> ExpertWeights:
-    """Make full native-layout weights with a cheap, nonzero exact FP4 path.
+def _latent_column_for_row(row: int) -> int:
+    """Spread the 384 gate/up rows across all 112 latent scale groups."""
+    return row * HIDDEN // INTERMEDIATE
 
-    Every W1/W3 row sums latent columns 0 and 1, and every W2 row selects SiTU
-    column 0.  The two-input path exercises both nibbles of the packed FP4 byte
-    and avoids making the end-to-end error metric hinge on one scalar through
-    two required MXFP8 quantizations.  The same path is installed for all 896
-    experts so the exhaustive assignment distribution has an analytical
-    reference while still exercising every expert range and every output tile.
+
+def _down_row_gain(device: torch.device) -> torch.Tensor:
+    """Give each of the 3584 down-projection rows a distinguishable gain.
+
+    The period is three, which is coprime with the 128-wide output tile, so a
+    tile written to the wrong ``output_base`` changes the result instead of
+    landing on an identical value.  Each gain is exactly representable in E2M1.
     """
+    rows = torch.arange(HIDDEN, dtype=torch.float32, device=device)
+    return torch.pow(2.0, -(rows % 3.0)).bfloat16()
+
+
+def _make_structured_weights(device: torch.device) -> ExpertWeights:
+    """Make full native-layout weights with an exactly representable FP4 path.
+
+    Gate row ``r`` selects latent column ``_latent_column_for_row(r)`` with
+    ``+1.0`` and the matching up row selects the same column with ``+0.5``, so
+    the two projections stay distinguishable through the asymmetric SiTU while
+    every SiTU value keeps the sign of ``gate * up`` and therefore stays
+    positive.  Every W2 row then sums all 384 SiTU columns at the row's own
+    ``_down_row_gain``, so the 3584-wide result varies across output tiles
+    instead of repeating one value.  Summing 384
+    positive terms is what makes the end-to-end error metric average the
+    mandatory MXFP8 activation and SiTU roundings instead of exposing one
+    E4M3 rounding, whose worst case alone is 6.25%.
+
+    The selected columns walk the whole 3584-wide latent, so both nibbles of
+    the packed FP4 byte, all 112 W1/W3 scale groups, all 12 W2 scale groups,
+    and all-zero groups are exercised.  Every value is a power of two that
+    survives MXFP4 exactly, so the dequantized prepared weights the reference
+    consumes are bit-exact.  The same shard is installed for all 896 experts so
+    the exhaustive assignment distribution keeps an analytical reference.
+    """
+    from mok.ops import pack_kimi_k3_mxfp4
+
     free_bytes, _ = torch.cuda.mem_get_info(device)
     if free_bytes < 4 * 1024**3:
         pytest.skip("full Kimi K3 prepared expert tensors need 4 GiB free")
-    w1_packed = torch.zeros(
-        EXPERTS, INTERMEDIATE, HIDDEN // 2, dtype=torch.uint8, device=device
-    )
-    w1_scale = torch.full(
-        (EXPERTS, INTERMEDIATE, HIDDEN // GROUP),
-        UNIT_SCALE,
-        dtype=torch.uint8,
+    rows = torch.arange(INTERMEDIATE, device=device)
+    columns = torch.tensor(
+        [_latent_column_for_row(row) for row in range(INTERMEDIATE)],
         device=device,
     )
-    w3_packed = torch.zeros_like(w1_packed)
-    w3_scale = torch.full_like(w1_scale, UNIT_SCALE)
-    w2_packed = torch.zeros(
-        EXPERTS, HIDDEN, INTERMEDIATE // 2, dtype=torch.uint8, device=device
+    gate_dense = torch.zeros(
+        1, INTERMEDIATE, HIDDEN, dtype=torch.bfloat16, device=device
     )
-    w2_scale = torch.full(
-        (EXPERTS, HIDDEN, INTERMEDIATE // GROUP),
-        UNIT_SCALE,
-        dtype=torch.uint8,
-        device=device,
-    )
-    # E2M1 code 0x2 is +1.0. Populate both nibbles to select columns 0 and 1.
-    w1_packed[:, :, 0] = 0x22
-    w3_packed[:, :, 0] = 0x22
-    w2_packed[:, :, 0] = 0x02
+    gate_dense[0, rows, columns] = 1.0
+    up_dense = torch.zeros_like(gate_dense)
+    up_dense[0, rows, columns] = 0.5
+    down_dense = _down_row_gain(device).view(1, HIDDEN, 1).expand(
+        1, HIDDEN, INTERMEDIATE
+    ).contiguous()
+
+    def _broadcast(dense: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        packed, scale = pack_kimi_k3_mxfp4(dense, dense.size(-1))
+        return (
+            packed.expand(EXPERTS, -1, -1).contiguous(),
+            scale.expand(EXPERTS, -1, -1).contiguous(),
+        )
+
+    w1_packed, w1_scale = _broadcast(gate_dense)
+    w3_packed, w3_scale = _broadcast(up_dense)
+    w2_packed, w2_scale = _broadcast(down_dense)
+    del gate_dense, up_dense, down_dense
     return ExpertWeights(
         w1_packed, w1_scale, w3_packed, w3_scale, w2_packed, w2_scale
     )
+
+
+def _situ(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    """Evaluate the exact FP32 Kimi K3 SiTU contract."""
+    return (
+        4.0
+        * torch.tanh(gate / 4.0)
+        * torch.sigmoid(gate)
+        * 25.0
+        * torch.tanh(up / 25.0)
+    )
+
+
+def _random_latent(
+    device: torch.device, rows: int, seed: int
+) -> torch.Tensor:
+    """Draw a dense latent so every gate/up row and scale group is active."""
+    generator = torch.Generator(device=device).manual_seed(seed)
+    return (
+        torch.randn(
+            rows, HIDDEN, generator=generator, dtype=torch.float32, device=device
+        )
+        * 0.25
+    ).bfloat16()
 
 
 @pytest.fixture(scope="module")
@@ -272,15 +328,7 @@ def _reference(
         w3 = _dequant_one(weights.w3_packed, weights.w3_scale, HIDDEN, expert)
         w2 = _dequant_one(weights.w2_packed, weights.w2_scale, INTERMEDIATE, expert)
         selected_x = latent_x.index_select(0, tokens).float()
-        gate = selected_x @ w1.T
-        up = selected_x @ w3.T
-        situ = (
-            4.0
-            * torch.tanh(gate / 4.0)
-            * torch.sigmoid(gate)
-            * 25.0
-            * torch.tanh(up / 25.0)
-        )
+        situ = _situ(selected_x @ w1.T, selected_x @ w3.T)
         contribution = (situ @ w2.T) * route_weights[:, None]
         result.index_add_(0, tokens, contribution)
     return result.bfloat16().float()
@@ -373,13 +421,7 @@ def test_single_expert_matches_exact_prepared_weight_reference(
     scratch: torch.Tensor,
     rows: int,
 ) -> None:
-    generator = torch.Generator(device=device).manual_seed(6100 + rows)
-    latent = (
-        torch.randn(
-            rows, HIDDEN, generator=generator, dtype=torch.float32, device=device
-        )
-        * 0.25
-    ).bfloat16()
+    latent = _random_latent(device, rows, 6100 + rows)
     assignments = [(0, token, 0, 1.0) for token in range(rows)]
     _write_assignments(scratch, assignments)
     routed = torch.full_like(latent, float("nan"))
@@ -393,13 +435,32 @@ def test_single_expert_matches_exact_prepared_weight_reference(
     _assert_expert_close(actual, expected)
 
 
+@pytest.mark.parametrize("active", CAPACITY_BUCKETS)
+def test_every_active_capacity_bucket_matches_the_reference(
+    device: torch.device,
+    weights: ExpertWeights,
+    scratch: torch.Tensor,
+    active: int,
+) -> None:
+    """Cover every decode capacity bucket, including a full 128-row MMA tile."""
+    latent = _random_latent(device, active, 6700 + active)
+    assignments = [(0, token, 0, 1.0) for token in range(active)]
+    _write_assignments(scratch, assignments)
+    routed = torch.full_like(latent, float("nan"))
+
+    actual = _call(latent, weights, routed, scratch, active)
+    expected = _reference(latent, weights, assignments, active)
+
+    assert actual.shape == (active, HIDDEN)
+    _assert_expert_close(actual, expected)
+
+
 def test_grouped_experts_apply_exact_situ_and_normalized_router_weights(
     device: torch.device,
     weights: ExpertWeights,
     scratch: torch.Tensor,
 ) -> None:
-    latent = torch.zeros(4, HIDDEN, dtype=torch.bfloat16, device=device)
-    latent[:, 0] = torch.tensor([0.25, -0.5, 1.0, -2.0], device=device)
+    latent = _random_latent(device, 4, 6200)
     # Two experts per token, deliberately interleaved before expert-major sorting.
     assignments = [
         (token % 3, token, 0, 0.25)
@@ -422,8 +483,11 @@ def test_2048_assignments_cover_all_896_experts_and_stay_finite(
     weights: ExpertWeights,
     scratch: torch.Tensor,
 ) -> None:
-    latent = torch.zeros(MAX_TOKENS, HIDDEN, dtype=torch.bfloat16, device=device)
-    latent[:, 0] = 0.5
+    # A constant latent keeps an analytical reference for all 896 experts, which
+    # a per-expert dequantized reference could not afford at this size.
+    latent = torch.full(
+        (MAX_TOKENS, HIDDEN), 0.25, dtype=torch.bfloat16, device=device
+    )
     assignments = [
         ((token * TOPK + slot) % EXPERTS, token, slot, 1.0 / TOPK)
         for token in range(MAX_TOKENS)
@@ -437,15 +501,14 @@ def test_2048_assignments_cover_all_896_experts_and_stay_finite(
     routed = torch.empty_like(latent)
 
     actual = _call(latent, weights, routed, scratch, MAX_TOKENS)
-    gate = torch.tensor(0.5, dtype=torch.float32, device=device)
-    expected_value = (
-        4.0
-        * torch.tanh(gate / 4.0)
-        * torch.sigmoid(gate)
-        * 25.0
-        * torch.tanh(gate / 25.0)
-    )
-    expected = expected_value.expand_as(actual).bfloat16().float()
+    # Every gate row sees 0.25 and every up row 0.125, W2 row j sums all 384
+    # SiTU columns at its own gain, and the sixteen normalized route weights
+    # sum to one.
+    gate = torch.tensor(0.25, dtype=torch.float32, device=device)
+    expected_value = INTERMEDIATE * _situ(gate, gate * 0.5)
+    expected = (
+        expected_value * _down_row_gain(device).float()
+    ).expand_as(actual).bfloat16().float()
 
     _assert_expert_close(actual, expected)
 
@@ -455,23 +518,32 @@ def test_empty_experts_are_skipped_and_cannot_change_output(
     weights: ExpertWeights,
     scratch: torch.Tensor,
 ) -> None:
-    latent = torch.zeros(8, HIDDEN, dtype=torch.bfloat16, device=device)
-    latent[:, 0] = 0.75
+    latent = _random_latent(device, 8, 6300)
     assignments = [(0, token, 0, 1.0) for token in range(8)]
     _write_assignments(scratch, assignments)
     first = _call(latent, weights, torch.empty_like(latent), scratch, 8).clone()
+    assert float(first.float().abs().sum()) > 0.0
 
     # Expert 895 has count zero.  Poison every prepared byte without touching
-    # the selected expert, then require bitwise-identical output.
-    weights.w1_packed[895].fill_(0xFF)
-    weights.w1_scale[895].fill_(0xFE)
-    weights.w3_packed[895].fill_(0x77)
-    weights.w3_scale[895].fill_(0x01)
-    weights.w2_packed[895].fill_(0xAA)
-    weights.w2_scale[895].fill_(0xFE)
-    second = _call(latent, weights, torch.empty_like(latent), scratch, 8)
-
-    assert torch.equal(first, second)
+    # the selected expert, then require bitwise-identical output.  The poison is
+    # reverted so later tests still see the shared module-scoped shard.
+    poisoned = (
+        (weights.w1_packed, 0xFF),
+        (weights.w1_scale, 0xFE),
+        (weights.w3_packed, 0x77),
+        (weights.w3_scale, 0x01),
+        (weights.w2_packed, 0xAA),
+        (weights.w2_scale, 0xFE),
+    )
+    saved = [tensor[895].clone() for tensor, _ in poisoned]
+    try:
+        for tensor, value in poisoned:
+            tensor[895].fill_(value)
+        second = _call(latent, weights, torch.empty_like(latent), scratch, 8)
+        assert torch.equal(first, second)
+    finally:
+        for (tensor, _), original in zip(poisoned, saved):
+            tensor[895].copy_(original)
 
 
 def test_active_token_mask_zeros_inactive_output_rows(
@@ -497,8 +569,7 @@ def test_reused_scratch_resets_accumulator_and_generation_counters(
     weights: ExpertWeights,
     scratch: torch.Tensor,
 ) -> None:
-    latent = torch.zeros(8, HIDDEN, dtype=torch.bfloat16, device=device)
-    latent[:, 0] = 0.5
+    latent = _random_latent(device, 8, 6400)
     generations: list[torch.Tensor] = []
     for rows in (8, 2, 8):
         assignments = [(0, token, 0, 1.0) for token in range(rows)]
@@ -522,8 +593,7 @@ def test_expert_stage_uses_the_tensor_devices_current_stream(
     weights: ExpertWeights,
     scratch: torch.Tensor,
 ) -> None:
-    source = torch.zeros(8, HIDDEN, dtype=torch.bfloat16, device=device)
-    source[:, 0] = 1.0
+    source = _random_latent(device, 8, 6500)
     assignments = [(0, token, 0, 1.0) for token in range(8)]
     _write_assignments(scratch, assignments)
     side_stream = torch.cuda.Stream(device=device)
@@ -548,8 +618,7 @@ def test_expert_stage_on_peer_device_ignores_current_device(
     peer_scratch = torch.zeros(
         SCRATCH_BYTES, dtype=torch.uint8, device=peer_device
     )
-    latent = torch.zeros(2, HIDDEN, dtype=torch.bfloat16, device=peer_device)
-    latent[:, 0] = 1.0
+    latent = _random_latent(peer_device, 2, 6600)
     assignments = [(0, token, 0, 1.0) for token in range(2)]
     _write_assignments(peer_scratch, assignments)
     torch.cuda.set_device(device)
