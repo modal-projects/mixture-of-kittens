@@ -150,7 +150,7 @@ class VllmKimiK3Adapter:
         mapped = native_weights(weights)
         check_native_shapes(mapped)
         layer = self._layer
-        experts = layer.experts
+        experts = _routed_experts(layer)
 
         copy_into(experts.w13_weight, mapped.w13_weight)
         copy_into(experts.w13_weight_scale, mapped.w13_weight_scale)
@@ -226,7 +226,7 @@ class VllmKimiK3Adapter:
             topk_weights, topk_ids = fused_grouped_topk(
                 hidden_states=hidden,
                 gating_output=logits,
-                topk=layer.experts.top_k,
+                topk=layer.experts.moe_config.experts_per_token,
                 renormalize=layer.moe_renormalize,
                 e_score_correction_bias=layer.gate.e_score_correction_bias.data,
                 num_expert_group=layer.num_expert_group,
@@ -305,15 +305,25 @@ class VllmKimiK3Adapter:
             ),
             "torch_cuda": torch.version.cuda,
             "layer_class": type(self._layer).__name__,
-            "expert_quant_method": type(self._layer.experts.quant_method).__name__,
-            "runner_class": type(
-                getattr(self._layer.experts, "runner", self._layer.experts)
+            "expert_quant_method": type(
+                _routed_experts(self._layer).quant_method
             ).__name__,
+            "runner_class": type(self._layer.experts).__name__,
         }
 
     def close(self) -> None:
         self.release()
         self._exit_stack.close()
+
+
+def _routed_experts(layer: Any) -> Any:
+    """The module that owns the MXFP4 expert parameters.
+
+    ``FusedMoE`` is a factory that returns a ``MoERunner`` (here a
+    ``LatentMoERunner``); the parameters and their quant method live one level
+    down on its ``routed_experts``.
+    """
+    return layer.experts.routed_experts
 
 
 def _ignored_layers() -> tuple[str, ...]:
