@@ -16,7 +16,7 @@ inline constexpr int kTensorParallelSize = 8;
 inline constexpr int kMaxTokens = 128;
 inline constexpr int kMaxRoutes = kMaxTokens * kTopK;
 
-static constexpr int NUM_PHASE_COUNTERS = 16;
+static constexpr int NUM_PHASE_COUNTERS = 20;
 static constexpr int SCRATCH_ALIGNMENT = 256;
 
 // Hidden states and both projection weights are read through 16-byte vector loads
@@ -106,10 +106,14 @@ inline constexpr int kExpertQuantizationArrivals = 4;
 inline constexpr int kExpertQuantizationGeneration = 5;
 inline constexpr int kExpertCompletionArrivals = 7;
 inline constexpr int kExpertCompletionGeneration = 8;
-inline constexpr int kSharedGateUpArrivals = 9;
-inline constexpr int kSharedGateUpGeneration = 10;
-inline constexpr int kSharedDownArrivals = 11;
-inline constexpr int kSharedDownGeneration = 12;
+inline constexpr int kSharedGateArrivals = 9;
+inline constexpr int kSharedGateGeneration = 10;
+inline constexpr int kSharedUpArrivals = 11;
+inline constexpr int kSharedUpGeneration = 12;
+inline constexpr int kSharedActivationArrivals = 13;
+inline constexpr int kSharedActivationGeneration = 14;
+inline constexpr int kSharedDownArrivals = 15;
+inline constexpr int kSharedDownGeneration = 16;
 
 /// Typed device pointers into one decode workspace.
 struct Scratch {

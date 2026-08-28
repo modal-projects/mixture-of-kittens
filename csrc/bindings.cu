@@ -53,6 +53,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("scratch"),
           pybind11::arg("collective_buffer"),
           pybind11::arg("active_tokens"));
+    m.def("_kimi_k3_shared_experts_role_plan",
+          &kimi_k3_decode::shared_experts::role_plan_for_testing, "",
+          pybind11::arg("active_tokens"));
+    m.def("_kimi_k3_shared_experts_validate_residency",
+          &kimi_k3_decode::shared_experts::validate_residency, "",
+          pybind11::arg("active_tokens"),
+          pybind11::arg("available_sms"));
+    m.def("_kimi_k3_shared_experts_generation_advanced",
+          &kimi_k3_decode::shared_experts::generation_advanced, "",
+          pybind11::arg("observed"),
+          pybind11::arg("consumed"));
+    m.def("_kimi_k3_shared_experts_wait_timeout_clocks", []() {
+        return kimi_k3_decode::shared_experts::kGenerationWaitTimeoutClocks;
+    });
+    m.def("_kimi_k3_shared_experts_wait_timed_out",
+          &kimi_k3_decode::shared_experts::wait_timed_out, "",
+          pybind11::arg("started"),
+          pybind11::arg("current"));
     m.def("pack_kimi_k3_mxfp4", &kimi_k3_decode::mxfp4::pack_entrypoint, "",
           pybind11::arg("weight"), pybind11::arg("padded_k"));
     m.def("dequant_kimi_k3_mxfp4", &kimi_k3_decode::mxfp4::dequant_entrypoint, "",

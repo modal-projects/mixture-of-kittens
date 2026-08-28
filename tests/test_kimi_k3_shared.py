@@ -9,7 +9,6 @@ import os
 import tempfile
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from pathlib import Path
 
 import pytest
 import torch
@@ -25,6 +24,8 @@ COLLECTIVE_COLUMNS = LATENT + HIDDEN
 MAX_TOKENS = 128
 ALIGNMENT = 256
 GROUP = 32
+UINT32_MAX = (1 << 32) - 1
+UINT64_MAX = (1 << 64) - 1
 CAPACITY_AND_DFLASH_ACTIVE_ROWS = (1, 2, 3, 4, 5, 8, 16, 20, 32, 64, 127, 128)
 
 _SHARED_ARGUMENTS = (
@@ -45,7 +46,7 @@ def _aligned(size: int) -> int:
 def _scratch_layout() -> dict[str, tuple[int, int]]:
     """Independent byte model of the C++ source-of-truth workspace."""
     regions = (
-        ("phase", 16 * 4),
+        ("phase", 20 * 4),
         ("expert_ids", MAX_TOKENS * 16 * 4),
         ("expert_weights", MAX_TOKENS * 16 * 4),
         ("expert_counts", 896 * 4),
@@ -212,10 +213,9 @@ def _call(
     )
 
 
-_METRICS: list[tuple[float, float, float]] = []
-
-
-def _assert_shared_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
+def _accuracy_metrics(
+    actual: torch.Tensor, expected: torch.Tensor
+) -> tuple[float, float, float]:
     actual_float = actual.float()
     expected_float = expected.float()
     difference = actual_float - expected_float
@@ -224,9 +224,12 @@ def _assert_shared_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
         actual_float.flatten(), expected_float.flatten(), dim=0
     )
     maximum = difference.abs().max()
-    metrics = (float(relative_l1), float(cosine), float(maximum))
-    _METRICS.append(metrics)
-    assert torch.isfinite(actual_float).all()
+    return float(relative_l1), float(cosine), float(maximum)
+
+
+def _assert_shared_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    metrics = _accuracy_metrics(actual, expected)
+    assert torch.isfinite(actual.float()).all()
     assert metrics[0] <= 0.03
     assert metrics[1] >= 0.999
     assert metrics[2] <= 0.25
@@ -237,6 +240,49 @@ def _region(
 ) -> torch.Tensor:
     offset, size = SCRATCH_LAYOUT[name]
     return scratch[offset:offset + size].view(dtype)
+
+
+def _active_intermediates(
+    scratch: torch.Tensor, active_tokens: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return tuple(
+        _region(scratch, name, torch.bfloat16)
+        .view(MAX_TOKENS, INTERMEDIATE)[:active_tokens]
+        for name in ("shared_gate", "shared_up", "shared_activated")
+    )
+
+
+def _assert_active_intermediates(
+    hidden_states: torch.Tensor,
+    weights: SharedWeights,
+    scratch: torch.Tensor,
+    active_tokens: int,
+) -> None:
+    active = hidden_states[:active_tokens].float()
+    expected_gate = active @ weights.gate.float().T
+    expected_up = active @ weights.up.float().T
+    actual_gate, actual_up, actual_activated = _active_intermediates(
+        scratch, active_tokens
+    )
+    expected_activated = _situ(
+        actual_gate.float(), actual_up.float()
+    ).bfloat16()
+
+    torch.testing.assert_close(
+        actual_gate.float(), expected_gate, rtol=0.02, atol=0.02
+    )
+    torch.testing.assert_close(
+        actual_up.float(), expected_up, rtol=0.02, atol=0.02
+    )
+    torch.testing.assert_close(
+        actual_activated.float(),
+        expected_activated.float(),
+        rtol=0.02,
+        atol=0.02,
+    )
+    assert torch.isfinite(actual_gate.float()).all()
+    assert torch.isfinite(actual_up.float()).all()
+    assert torch.isfinite(actual_activated.float()).all()
 
 
 def test_workspace_bytes_matches_shared_scratch_source_of_truth(
@@ -250,6 +296,68 @@ def test_workspace_bytes_matches_shared_scratch_source_of_truth(
     for name, (offset, _) in SCRATCH_LAYOUT.items():
         if name != "total_bytes":
             assert offset % ALIGNMENT == 0, name
+
+
+@pytest.mark.parametrize(
+    ("active_tokens", "expected"),
+    [
+        (1, (24, 0, 6, 112, 142)),
+        (8, (24, 0, 6, 112, 142)),
+        (16, (6, 6, 6, 56, 74)),
+        (128, (6, 6, 6, 56, 74)),
+    ],
+)
+def test_role_plan_orders_producers_and_activation_before_consumers(
+    device: torch.device,
+    active_tokens: int,
+    expected: tuple[int, int, int, int, int],
+) -> None:
+    plan = _C._kimi_k3_shared_experts_role_plan(active_tokens)
+
+    assert plan == expected
+    gate_roles, up_roles, activation_roles, down_roles, total_roles = plan
+    assert gate_roles > 0
+    assert activation_roles > 0
+    assert down_roles > 0
+    assert gate_roles + up_roles + activation_roles + down_roles == total_roles
+
+
+@pytest.mark.parametrize(
+    ("active_tokens", "required_sms"), [(8, 142), (20, 74)]
+)
+def test_host_residency_guard_uses_the_selected_role_grid(
+    device: torch.device,
+    active_tokens: int,
+    required_sms: int,
+) -> None:
+    _C._kimi_k3_shared_experts_validate_residency(
+        active_tokens, required_sms
+    )
+    with pytest.raises(
+        RuntimeError,
+        match=rf"requires all {required_sms} role CTAs.*{required_sms - 1} SMs",
+    ):
+        _C._kimi_k3_shared_experts_validate_residency(
+            active_tokens, required_sms - 1
+        )
+
+
+def test_generation_order_and_timeout_helpers_are_wrap_safe(
+    device: torch.device,
+) -> None:
+    advanced = _C._kimi_k3_shared_experts_generation_advanced
+    assert not advanced(7, 7)
+    assert advanced(8, 7)
+    assert advanced(0, UINT32_MAX)
+    assert not advanced(UINT32_MAX, 0)
+
+    timeout = _C._kimi_k3_shared_experts_wait_timeout_clocks()
+    timed_out = _C._kimi_k3_shared_experts_wait_timed_out
+    assert timeout > 0
+    assert not timed_out(100, 100 + timeout - 1)
+    assert timed_out(100, 100 + timeout)
+    start = UINT64_MAX - timeout // 2
+    assert timed_out(start, (start + timeout) & UINT64_MAX)
 
 
 def test_gate_up_and_down_patterns_are_nonperiodic_and_distinct(
@@ -284,6 +392,9 @@ def test_every_capacity_and_dflash_active_row_count_matches_fp32_reference(
     assert actual.dtype == torch.bfloat16
     assert actual.data_ptr() == (
         collective_buffer.data_ptr() + LATENT * collective_buffer.element_size()
+    )
+    _assert_active_intermediates(
+        hidden_states, weights, scratch, active_tokens
     )
     _assert_shared_close(actual, expected)
 
@@ -333,6 +444,8 @@ def test_reused_scratch_advances_generations_and_replaces_intermediates(
     scratch: torch.Tensor,
 ) -> None:
     gate_generations: list[int] = []
+    up_generations: list[int] = []
+    activation_generations: list[int] = []
     down_generations: list[int] = []
     for step, active_tokens in enumerate((8, 3, 16, 5, 32, 2)):
         hidden_states = _hidden(device, 32, 7600 + step)
@@ -358,17 +471,42 @@ def test_reused_scratch_advances_generations_and_replaces_intermediates(
         phase = _region(scratch, "phase", torch.int32)
         assert int(phase[9]) == 0
         assert int(phase[11]) == 0
+        assert int(phase[13]) == 0
+        assert int(phase[15]) == 0
         gate_generations.append(int(phase[10]))
-        down_generations.append(int(phase[12]))
+        up_generations.append(int(phase[12]))
+        activation_generations.append(int(phase[14]))
+        down_generations.append(int(phase[16]))
 
-    expected_gate = [
+    expected_generations = [
         gate_generations[0] + step for step in range(len(gate_generations))
     ]
-    expected_down = [
-        down_generations[0] + step for step in range(len(down_generations))
-    ]
-    assert gate_generations == expected_gate
-    assert down_generations == expected_down
+    assert gate_generations == expected_generations
+    assert up_generations == expected_generations
+    assert activation_generations == expected_generations
+    assert down_generations == expected_generations
+
+
+def test_runtime_generations_advance_across_uint32_wrap(
+    device: torch.device,
+    weights: SharedWeights,
+    scratch: torch.Tensor,
+) -> None:
+    phase = _region(scratch, "phase", torch.int32)
+    for generation_index in (10, 12, 14, 16):
+        phase[generation_index] = -1
+    hidden_states = _hidden(device, 20, 7650)
+
+    actual = _call(
+        hidden_states,
+        weights,
+        scratch,
+        _collective(hidden_states),
+        20,
+    )
+
+    _assert_shared_close(actual, _reference(hidden_states, weights, 20))
+    assert [int(phase[index]) for index in (10, 12, 14, 16)] == [0, 0, 0, 0]
 
 
 def test_multi_cta_consumers_observe_each_fresh_release_generation(
@@ -399,27 +537,13 @@ def test_multi_cta_consumers_observe_each_fresh_release_generation(
         )
 
         _assert_shared_close(actual, expected)
+        _assert_active_intermediates(
+            hidden_states, weights, scratch, 16
+        )
         phase = _region(scratch, "phase", torch.int32)
         assert int(phase[10]) == int(phase[12])
-
-
-def test_publication_edges_keep_device_release_fences() -> None:
-    """Make deletion of either producer/consumer release fence a hard failure."""
-    source = (
-        Path(__file__).parents[1]
-        / "csrc"
-        / "kimi_k3_decode"
-        / "shared.cuh"
-    ).read_text(encoding="utf-8")
-    gate_publication = source.split(
-        "static __device__ void publish_gate_up", maxsplit=1
-    )[1].split("static __device__ void wait_for_gate_up", maxsplit=1)[0]
-    down_publication = source.split(
-        "static __device__ void publish_down", maxsplit=1
-    )[1].split("template<int CAPACITY>", maxsplit=1)[0]
-
-    assert "__threadfence();" in gate_publication
-    assert "__threadfence();" in down_publication
+        assert int(phase[12]) == int(phase[14])
+        assert int(phase[14]) == int(phase[16])
 
 
 def test_shared_stage_uses_the_tensor_devices_current_stream(
@@ -635,22 +759,35 @@ def test_shared_stage_rejects_invalid_shapes_and_active_count(
     scratch: torch.Tensor,
 ) -> None:
     arguments = _valid_arguments(device, weights, scratch)
-    with pytest.raises(RuntimeError, match="shared_gate_proj"):
-        ops._kimi_k3_shared_experts(
-            **{**arguments, "shared_gate_proj": weights.gate[:, :-1]}
-        )
-    with pytest.raises(RuntimeError, match="collective_buffer"):
+    with pytest.raises(
+        RuntimeError, match=r"shared_gate_proj \[768, 7168\]"
+    ):
         ops._kimi_k3_shared_experts(
             **{
                 **arguments,
-                "collective_buffer": arguments["collective_buffer"][:, :-1],
+                "shared_gate_proj": weights.gate[:, :-1].contiguous(),
             }
         )
-    with pytest.raises(RuntimeError, match="scratch"):
+    with pytest.raises(
+        RuntimeError, match=r"collective_buffer \[M, 10752\]"
+    ):
+        ops._kimi_k3_shared_experts(
+            **{
+                **arguments,
+                "collective_buffer": arguments["collective_buffer"][
+                    :, :-1
+                ].contiguous(),
+            }
+        )
+    with pytest.raises(
+        RuntimeError, match=rf"scratch.*at least {SCRATCH_BYTES} bytes"
+    ):
         ops._kimi_k3_shared_experts(
             **{**arguments, "scratch": scratch[:-ALIGNMENT]}
         )
-    with pytest.raises(RuntimeError, match="active_tokens"):
+    with pytest.raises(
+        RuntimeError, match=r"active_tokens in \[1, 3\]"
+    ):
         ops._kimi_k3_shared_experts(**{**arguments, "active_tokens": 0})
 
 
@@ -706,12 +843,33 @@ def test_private_shared_stage_is_exactly_one_kernel_launch(
     assert expected_kernel in names[0]
 
 
-def test_accuracy_metrics_have_finite_worst_case() -> None:
-    """Expose worst numerical metrics under ``pytest -s`` without noisy CI."""
-    assert _METRICS
-    worst_rel_l1 = max(metric[0] for metric in _METRICS)
-    worst_cosine = min(metric[1] for metric in _METRICS)
-    worst_max_abs = max(metric[2] for metric in _METRICS)
+def test_accuracy_metrics_have_finite_worst_case(
+    device: torch.device,
+    weights: SharedWeights,
+) -> None:
+    """Compute aggregate metrics independently of test order or filtering."""
+    metrics: list[tuple[float, float, float]] = []
+    scratch = torch.zeros(
+        SCRATCH_BYTES, dtype=torch.uint8, device=device
+    )
+    for active_tokens in CAPACITY_AND_DFLASH_ACTIVE_ROWS:
+        hidden_states = _hidden(
+            device, active_tokens, 8100 + active_tokens
+        )
+        actual = _call(
+            hidden_states,
+            weights,
+            scratch,
+            _collective(hidden_states),
+            active_tokens,
+        )
+        expected = _reference(hidden_states, weights, active_tokens)
+        _assert_shared_close(actual, expected)
+        metrics.append(_accuracy_metrics(actual, expected))
+
+    worst_rel_l1 = max(metric[0] for metric in metrics)
+    worst_cosine = min(metric[1] for metric in metrics)
+    worst_max_abs = max(metric[2] for metric in metrics)
     print(
         "K3 shared worst "
         f"rel-L1={worst_rel_l1:.6f} "

@@ -53,7 +53,7 @@ def _aligned(size: int) -> int:
 def _scratch_layout() -> dict[str, tuple[int, int]]:
     """Independent byte-level model of ``kimi_k3_decode::Scratch``."""
     regions = (
-        ("phase", 16 * 4),
+        ("phase", 20 * 4),
         ("expert_ids", MAX_ASSIGNMENTS * 4),
         ("expert_weights", MAX_ASSIGNMENTS * 4),
         ("expert_counts", EXPERTS * 4),
