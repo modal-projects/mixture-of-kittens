@@ -86,6 +86,27 @@ def _kimi_k3_shared_experts_fake(
     return collective_buffer[:active_tokens, 3584:10752]
 
 
+@torch.library.register_fake("mok::_kimi_k3_tail")
+def _kimi_k3_tail_fake(
+    routed_latent_rmsnorm_weight: torch.Tensor,
+    latent_up_proj: torch.Tensor,
+    collective_buffer: torch.Tensor,
+    collective_buffer_ptrs: list[int],
+    collective_buffer_multicast_ptr: int,
+    output_mailbox: torch.Tensor,
+    output_mailbox_ptrs: list[int],
+    output_mailbox_multicast_ptr: int,
+    barrier_buffer: torch.Tensor,
+    barrier_buffer_ptrs: list[int],
+    barrier_buffer_multicast_ptr: int,
+    barrier_target: torch.Tensor,
+    scratch: torch.Tensor,
+    tp_rank: int,
+    active_tokens: int,
+) -> None:
+    return None
+
+
 @torch.library.register_fake("mok::pack_kimi_k3_mxfp4")
 def _pack_kimi_k3_mxfp4_fake(
     weight: torch.Tensor,

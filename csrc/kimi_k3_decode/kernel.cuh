@@ -2,6 +2,7 @@
 
 #include "kittens.cuh"
 
+#include "collectives.cuh"
 #include "expert_mxfp4.cuh"
 #include "router.cuh"
 #include "shared.cuh"

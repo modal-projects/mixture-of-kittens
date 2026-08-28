@@ -75,6 +75,7 @@ class KimiK3DecodeWorkspace:
     output_mailbox: torch.Tensor
     output_mailbox_handle: Any
     output_mailbox_ptrs: list[int]
+    output_mailbox_multicast_ptr: int
     barrier_buffer: torch.Tensor
     barrier_handle: Any
     barrier_ptrs: list[int]
@@ -196,11 +197,12 @@ def create_kimi_k3_decode_workspace(
         output_mailbox_handle,
         output_mailbox_ptrs,
     ) = allocate_symmetric(
-        tp_size,
         max_tokens,
-        KIMI_K3_NUM_EXPERTS,
+        tp_size,
+        KIMI_K3_HIDDEN_SIZE // tp_size,
         dtype=torch.bfloat16,
     )
+    output_mailbox_multicast_ptr = int(output_mailbox_handle.multicast_ptr)
     barrier_buffer, barrier_handle, barrier_ptrs = allocate_symmetric(
         1,
         dtype=torch.int32,
@@ -230,6 +232,7 @@ def create_kimi_k3_decode_workspace(
         output_mailbox=output_mailbox,
         output_mailbox_handle=output_mailbox_handle,
         output_mailbox_ptrs=output_mailbox_ptrs,
+        output_mailbox_multicast_ptr=output_mailbox_multicast_ptr,
         barrier_buffer=barrier_buffer,
         barrier_handle=barrier_handle,
         barrier_ptrs=barrier_ptrs,

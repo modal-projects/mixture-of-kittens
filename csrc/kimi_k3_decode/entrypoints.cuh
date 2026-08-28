@@ -334,6 +334,155 @@ static __host__ at::Tensor shared_experts_entrypoint(
         .narrow(1, kLatentSize, kHiddenSize);
 }
 
+/// Reject a peer-pointer list that is not exactly one positive pointer per rank.
+static __host__ void check_peer_pointers(
+    const std::vector<std::int64_t> &pointers,
+    const char *field
+) {
+    TORCH_CHECK(pointers.size() == static_cast<std::size_t>(kTensorParallelSize),
+                "MoK: _kimi_k3_tail requires ", field, " with exactly ",
+                kTensorParallelSize, " pointers, got ", pointers.size());
+    for (int rank = 0; rank < kTensorParallelSize; ++rank) {
+        TORCH_CHECK(pointers[rank] > 0,
+                    "MoK: _kimi_k3_tail requires ", field,
+                    " to hold only positive device pointers, but entry ", rank,
+                    " is ", pointers[rank]);
+    }
+}
+
+static __host__ void check_multicast_pointer(
+    const std::int64_t pointer,
+    const char *field
+) {
+    TORCH_CHECK(pointer > 0,
+                "MoK: _kimi_k3_tail requires ", field,
+                " to be a positive device pointer, got ", pointer);
+}
+
+/// Run the fused TP8 latent-MoE tail for one decode step, in one launch.
+///
+/// Every rank must call this with the same active token count: the tail
+/// rendezvouses all eight ranks twice inside the launch, so a divergent count
+/// would leave the collective and the mailbox half-published.
+static __host__ void kimi_k3_tail_entrypoint(
+    const at::Tensor &routed_latent_rmsnorm_weight,
+    const at::Tensor &latent_up_proj,
+    const at::Tensor &collective_buffer,
+    const std::vector<std::int64_t> &collective_buffer_ptrs,
+    std::int64_t collective_buffer_multicast_ptr,
+    const at::Tensor &output_mailbox,
+    const std::vector<std::int64_t> &output_mailbox_ptrs,
+    std::int64_t output_mailbox_multicast_ptr,
+    const at::Tensor &barrier_buffer,
+    const std::vector<std::int64_t> &barrier_buffer_ptrs,
+    std::int64_t barrier_buffer_multicast_ptr,
+    const at::Tensor &barrier_target,
+    const at::Tensor &scratch,
+    std::int64_t tp_rank,
+    std::int64_t active_tokens
+) {
+    CHECK_INPUT(routed_latent_rmsnorm_weight);
+    CHECK_INPUT(latent_up_proj);
+    CHECK_INPUT(collective_buffer);
+    CHECK_INPUT(output_mailbox);
+    CHECK_INPUT(barrier_buffer);
+    CHECK_INPUT(barrier_target);
+    CHECK_INPUT(scratch);
+
+    constexpr int shard_columns = kHiddenSize / kTensorParallelSize;
+    constexpr int collective_columns = kLatentSize + kHiddenSize;
+
+    TORCH_CHECK(routed_latent_rmsnorm_weight.dim() == 1
+                    && routed_latent_rmsnorm_weight.size(0) == kLatentSize
+                    && routed_latent_rmsnorm_weight.scalar_type()
+                        == at::kBFloat16,
+                "MoK: _kimi_k3_tail requires a BF16 "
+                "routed_latent_rmsnorm_weight [", kLatentSize, "]");
+    TORCH_CHECK(latent_up_proj.dim() == 2
+                    && latent_up_proj.size(0) == kHiddenSize
+                    && latent_up_proj.size(1) == kLatentSize
+                    && latent_up_proj.scalar_type() == at::kBFloat16,
+                "MoK: _kimi_k3_tail requires a BF16 latent_up_proj [",
+                kHiddenSize, ", ", kLatentSize, "]");
+    TORCH_CHECK(collective_buffer.dim() == 2
+                    && collective_buffer.size(0) == kMaxTokens
+                    && collective_buffer.size(1) == collective_columns
+                    && collective_buffer.scalar_type() == at::kBFloat16,
+                "MoK: _kimi_k3_tail requires a BF16 collective_buffer [",
+                kMaxTokens, ", ", collective_columns, "]");
+    TORCH_CHECK(output_mailbox.dim() == 3
+                    && output_mailbox.size(0) == kMaxTokens
+                    && output_mailbox.size(1) == kTensorParallelSize
+                    && output_mailbox.size(2) == shard_columns
+                    && output_mailbox.scalar_type() == at::kBFloat16,
+                "MoK: _kimi_k3_tail requires a token-major BF16 output_mailbox [",
+                kMaxTokens, ", ", kTensorParallelSize, ", ", shard_columns, "]");
+    TORCH_CHECK(barrier_buffer.dim() == 1 && barrier_buffer.size(0) == 1
+                    && barrier_buffer.scalar_type() == at::kInt,
+                "MoK: _kimi_k3_tail requires barrier_buffer to be int32 [1]");
+    TORCH_CHECK(barrier_target.dim() == 1 && barrier_target.size(0) == 1
+                    && barrier_target.scalar_type() == at::kInt,
+                "MoK: _kimi_k3_tail requires barrier_target to be int32 [1]");
+    TORCH_CHECK(scratch.dim() == 1 && scratch.scalar_type() == at::kByte
+                    && scratch.size(0) >= SCRATCH_BYTES,
+                "MoK: _kimi_k3_tail requires a uint8 scratch of at least ",
+                SCRATCH_BYTES, " bytes");
+    TORCH_CHECK(active_tokens >= 1 && active_tokens <= kMaxTokens,
+                "MoK: _kimi_k3_tail requires active_tokens in [1, ",
+                kMaxTokens, "]");
+    TORCH_CHECK(tp_rank >= 0 && tp_rank < kTensorParallelSize,
+                "MoK: _kimi_k3_tail requires tp_rank in [0, ",
+                kTensorParallelSize - 1, "]");
+
+    check_peer_pointers(collective_buffer_ptrs, "collective_buffer_ptrs");
+    check_peer_pointers(output_mailbox_ptrs, "output_mailbox_ptrs");
+    check_peer_pointers(barrier_buffer_ptrs, "barrier_buffer_ptrs");
+    check_multicast_pointer(collective_buffer_multicast_ptr,
+                            "collective_buffer_multicast_ptr");
+    check_multicast_pointer(output_mailbox_multicast_ptr,
+                            "output_mailbox_multicast_ptr");
+    check_multicast_pointer(barrier_buffer_multicast_ptr,
+                            "barrier_buffer_multicast_ptr");
+    const at::Device device = output_mailbox.device();
+    for (const auto &item : {
+             std::pair<const at::Tensor *, const char *>{
+                 &routed_latent_rmsnorm_weight,
+                 "routed_latent_rmsnorm_weight"},
+             {&latent_up_proj, "latent_up_proj"},
+             {&collective_buffer, "collective_buffer"},
+             {&barrier_buffer, "barrier_buffer"},
+             {&barrier_target, "barrier_target"},
+             {&scratch, "scratch"}}) {
+        TORCH_CHECK(item.first->device() == device,
+                    "MoK: _kimi_k3_tail requires ", item.second, " on ",
+                    device);
+    }
+
+    for (const auto &item : {
+             std::pair<const at::Tensor *, const char *>{
+                 &routed_latent_rmsnorm_weight,
+                 "routed_latent_rmsnorm_weight"},
+             {&latent_up_proj, "latent_up_proj"},
+             {&collective_buffer, "collective_buffer"},
+             {&output_mailbox, "output_mailbox"}}) {
+        check_tensor_alignment(*item.first, "_kimi_k3_tail", item.second,
+                               VECTOR_ALIGNMENT);
+    }
+    check_tensor_alignment(scratch, "_kimi_k3_tail", "scratch",
+                           SCRATCH_ALIGNMENT);
+
+    const cudaDeviceProp properties =
+        check_sm103(output_mailbox, "_kimi_k3_tail");
+
+    const c10::cuda::CUDAGuard device_guard(device);
+    tail::launch_tail(
+        routed_latent_rmsnorm_weight, latent_up_proj,
+        collective_buffer_multicast_ptr, output_mailbox_multicast_ptr,
+        barrier_buffer, barrier_buffer_multicast_ptr, barrier_target, scratch,
+        static_cast<int>(tp_rank), static_cast<int>(active_tokens),
+        properties.multiProcessorCount);
+}
+
 static __host__ at::Tensor kimi_k3_decode_entrypoint(
     const at::Tensor &hidden_states,
     const at::Tensor &router_weight,

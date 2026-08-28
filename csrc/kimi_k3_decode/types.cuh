@@ -16,7 +16,7 @@ inline constexpr int kTensorParallelSize = 8;
 inline constexpr int kMaxTokens = 128;
 inline constexpr int kMaxRoutes = kMaxTokens * kTopK;
 
-static constexpr int NUM_PHASE_COUNTERS = 20;
+static constexpr int NUM_PHASE_COUNTERS = 32;
 static constexpr int SCRATCH_ALIGNMENT = 256;
 
 // Hidden states and both projection weights are read through 16-byte vector loads
@@ -79,11 +79,23 @@ inline constexpr int kSharedActivatedBytes =
     + scratch_byte_region_bytes(
         kMaxTokens * (kSharedIntermediateSize / kTensorParallelSize)
         * sizeof(__nv_bfloat16));
-
-static constexpr int SCRATCH_BYTES =
+// The tail's normalized latent and its own reduced shared shard. Both are read
+// through TMA descriptors on the tcgen05 path, so their row pitches are already
+// multiples of 16 bytes and the 256-byte region alignment covers the base.
+inline constexpr int kTailNormalizedBytes =
     kSharedActivatedBytes
     + scratch_byte_region_bytes(
         kMaxTokens * (kSharedIntermediateSize / kTensorParallelSize)
+        * sizeof(__nv_bfloat16));
+inline constexpr int kTailSharedShardBytes =
+    kTailNormalizedBytes
+    + scratch_byte_region_bytes(
+        kMaxTokens * kLatentSize * sizeof(__nv_bfloat16));
+
+static constexpr int SCRATCH_BYTES =
+    kTailSharedShardBytes
+    + scratch_byte_region_bytes(
+        kMaxTokens * (kHiddenSize / kTensorParallelSize)
         * sizeof(__nv_bfloat16));
 
 static_assert(kLatentMxfp8Bytes == 40448);
@@ -94,7 +106,9 @@ static_assert(kRoutedAccumulatorBytes == 1324544);
 static_assert(kSharedGateBytes == 3159552);
 static_assert(kSharedUpBytes == 3356160);
 static_assert(kSharedActivatedBytes == 3552768);
-static_assert(SCRATCH_BYTES == 3749376);
+static_assert(kTailNormalizedBytes == 3749376);
+static_assert(kTailSharedShardBytes == 4666880);
+static_assert(SCRATCH_BYTES == 4896256);
 
 // Generation-tagged completion counters. Each role's last CTA clears its arrival
 // counter and bumps its generation, so a reused workspace never needs a host reset.
@@ -119,6 +133,23 @@ inline constexpr int kSharedDownGeneration = 16;
 inline constexpr int kSharedTimeoutPhase = 17;
 static_assert(kSharedTimeoutPhase < NUM_PHASE_COUNTERS);
 
+// Fused TP8 tail phases. The coordinator CTA owns both cross-rank edges, so its
+// entry and exit generations have no arrival counter; the reduce, shard, and
+// drain roles each count their CTAs into one arrival slot and the last arrival
+// clears it before advancing that role's generation.
+inline constexpr int kTailEntryGeneration = 18;
+inline constexpr int kTailReduceArrivals = 19;
+inline constexpr int kTailReduceGeneration = 20;
+inline constexpr int kTailShardArrivals = 21;
+inline constexpr int kTailShardGeneration = 22;
+inline constexpr int kTailExitGeneration = 23;
+inline constexpr int kTailDrainArrivals = 24;
+inline constexpr int kTailDrainGeneration = 25;
+// A zero value means no tail wait timed out. On timeout the waiting CTA records
+// the generation slot it was waiting on before trapping.
+inline constexpr int kTailTimeoutPhase = 26;
+static_assert(kTailTimeoutPhase < NUM_PHASE_COUNTERS);
+
 /// Typed device pointers into one decode workspace.
 struct Scratch {
     int *phase;
@@ -136,6 +167,8 @@ struct Scratch {
     __nv_bfloat16 *shared_gate;
     __nv_bfloat16 *shared_up;
     __nv_bfloat16 *shared_activated;
+    __nv_bfloat16 *tail_normalized;
+    __nv_bfloat16 *tail_shared_shard;
 };
 
 __host__ __device__ inline Scratch scratch_view(std::uint8_t *base) {
@@ -155,6 +188,8 @@ __host__ __device__ inline Scratch scratch_view(std::uint8_t *base) {
         reinterpret_cast<__nv_bfloat16 *>(base + kSharedGateBytes),
         reinterpret_cast<__nv_bfloat16 *>(base + kSharedUpBytes),
         reinterpret_cast<__nv_bfloat16 *>(base + kSharedActivatedBytes),
+        reinterpret_cast<__nv_bfloat16 *>(base + kTailNormalizedBytes),
+        reinterpret_cast<__nv_bfloat16 *>(base + kTailSharedShardBytes),
     };
 }
 

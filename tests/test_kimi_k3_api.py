@@ -154,12 +154,19 @@ def test_workspace_create_is_caller_owned_with_canonical_layout(
         assert created.device == device
         assert created.max_tokens == 128
 
-        assert created.scratch.shape == (3_749_376,)
+        assert created.scratch.shape == (4_896_256,)
         assert created.scratch.dtype == torch.uint8
         assert created.collective_buffer.shape == (128, 10752)
         assert created.collective_buffer.dtype == torch.bfloat16
-        assert created.output_mailbox.shape == (8, 128, 896)
+        # Token-major, so the same allocation is the contiguous [128, 7168]
+        # decode output without a copy once every rank slot is filled.
+        assert created.output_mailbox.shape == (128, 8, 896)
         assert created.output_mailbox.dtype == torch.bfloat16
+        assert created.output_mailbox.is_contiguous()
+        assert (
+            created.output_mailbox.view(128, 7168).data_ptr()
+            == created.output_mailbox.data_ptr()
+        )
         assert created.barrier_buffer.shape == (1,)
         assert created.barrier_buffer.dtype == torch.int32
         assert created.barrier_target.shape == (1,)
@@ -177,6 +184,7 @@ def test_workspace_create_is_caller_owned_with_canonical_layout(
         assert all(pointer > 0 for pointer in created.output_mailbox_ptrs)
         assert all(pointer > 0 for pointer in created.barrier_ptrs)
         assert created.collective_multicast_ptr > 0
+        assert created.output_mailbox_multicast_ptr > 0
         assert created.barrier_multicast_ptr > 0
     finally:
         barrier_all(

@@ -73,6 +73,43 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("current"));
     m.def("_kimi_k3_shared_experts_timeout_metadata",
           &kimi_k3_decode::shared_experts::timeout_metadata_for_testing);
+    m.def("_kimi_k3_tail", &kimi_k3_decode::kimi_k3_tail_entrypoint, "",
+          pybind11::arg("routed_latent_rmsnorm_weight"),
+          pybind11::arg("latent_up_proj"),
+          pybind11::arg("collective_buffer"),
+          pybind11::arg("collective_buffer_ptrs"),
+          pybind11::arg("collective_buffer_multicast_ptr"),
+          pybind11::arg("output_mailbox"),
+          pybind11::arg("output_mailbox_ptrs"),
+          pybind11::arg("output_mailbox_multicast_ptr"),
+          pybind11::arg("barrier_buffer"),
+          pybind11::arg("barrier_buffer_ptrs"),
+          pybind11::arg("barrier_buffer_multicast_ptr"),
+          pybind11::arg("barrier_target"),
+          pybind11::arg("scratch"),
+          pybind11::arg("tp_rank"),
+          pybind11::arg("active_tokens"));
+    m.def("_kimi_k3_tail_role_plan",
+          &kimi_k3_decode::tail::role_plan_for_testing, "",
+          pybind11::arg("active_tokens"));
+    m.def("_kimi_k3_tail_validate_residency",
+          &kimi_k3_decode::tail::validate_residency, "",
+          pybind11::arg("active_tokens"),
+          pybind11::arg("available_sms"));
+    m.def("_kimi_k3_tail_generation_advanced",
+          &kimi_k3_decode::tail::generation_advanced, "",
+          pybind11::arg("observed"), pybind11::arg("consumed"));
+    m.def("_kimi_k3_tail_barrier_reached",
+          &kimi_k3_decode::tail::barrier_reached, "",
+          pybind11::arg("observed"), pybind11::arg("target"));
+    m.def("_kimi_k3_tail_wait_timeout_clocks", []() {
+        return kimi_k3_decode::tail::kGenerationWaitTimeoutClocks;
+    });
+    m.def("_kimi_k3_tail_wait_timed_out",
+          &kimi_k3_decode::tail::wait_timed_out, "",
+          pybind11::arg("started"), pybind11::arg("current"));
+    m.def("_kimi_k3_tail_timeout_metadata",
+          &kimi_k3_decode::tail::timeout_metadata_for_testing);
     m.def("pack_kimi_k3_mxfp4", &kimi_k3_decode::mxfp4::pack_entrypoint, "",
           pybind11::arg("weight"), pybind11::arg("padded_k"));
     m.def("dequant_kimi_k3_mxfp4", &kimi_k3_decode::mxfp4::dequant_entrypoint, "",

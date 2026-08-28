@@ -317,6 +317,128 @@ def _kimi_k3_shared_experts(
     )
 
 
+_TAIL_ALIGNMENT = (
+    ("routed_latent_rmsnorm_weight", 16),
+    ("latent_up_proj", 16),
+    ("collective_buffer", 16),
+    ("output_mailbox", 16),
+    ("scratch", 256),
+)
+
+# The tail mutates the mailbox in place and returns nothing: a custom operator
+# may not return a view that aliases one of its own mutated inputs, so the
+# active-row view is taken by the Python helper after the operator returns.
+_TAIL_SCHEMA = (
+    "_kimi_k3_tail("
+    "Tensor routed_latent_rmsnorm_weight, Tensor latent_up_proj, "
+    "Tensor(a!) collective_buffer, int[] collective_buffer_ptrs, "
+    "int collective_buffer_multicast_ptr, "
+    "Tensor(b!) output_mailbox, int[] output_mailbox_ptrs, "
+    "int output_mailbox_multicast_ptr, "
+    "Tensor(c!) barrier_buffer, int[] barrier_buffer_ptrs, "
+    "int barrier_buffer_multicast_ptr, Tensor(d!) barrier_target, "
+    "Tensor(e!) scratch, int tp_rank, int active_tokens"
+    ") -> ()"
+)
+_TAIL_LIBRARY = torch.library.Library("mok", "FRAGMENT")
+_TAIL_LIBRARY.define(_TAIL_SCHEMA)
+
+
+@torch.library.impl("mok::_kimi_k3_tail", "cuda")
+def _kimi_k3_tail_cuda(
+    routed_latent_rmsnorm_weight: torch.Tensor,
+    latent_up_proj: torch.Tensor,
+    collective_buffer: torch.Tensor,
+    collective_buffer_ptrs: list[int],
+    collective_buffer_multicast_ptr: int,
+    output_mailbox: torch.Tensor,
+    output_mailbox_ptrs: list[int],
+    output_mailbox_multicast_ptr: int,
+    barrier_buffer: torch.Tensor,
+    barrier_buffer_ptrs: list[int],
+    barrier_buffer_multicast_ptr: int,
+    barrier_target: torch.Tensor,
+    scratch: torch.Tensor,
+    tp_rank: int,
+    active_tokens: int,
+) -> None:
+    _C._kimi_k3_tail(
+        routed_latent_rmsnorm_weight,
+        latent_up_proj,
+        collective_buffer,
+        collective_buffer_ptrs,
+        collective_buffer_multicast_ptr,
+        output_mailbox,
+        output_mailbox_ptrs,
+        output_mailbox_multicast_ptr,
+        barrier_buffer,
+        barrier_buffer_ptrs,
+        barrier_buffer_multicast_ptr,
+        barrier_target,
+        scratch,
+        tp_rank,
+        active_tokens,
+    )
+
+
+def _kimi_k3_tail(
+    routed_latent_rmsnorm_weight: torch.Tensor,
+    latent_up_proj: torch.Tensor,
+    collective_buffer: torch.Tensor,
+    collective_buffer_ptrs: list[int],
+    collective_buffer_multicast_ptr: int,
+    output_mailbox: torch.Tensor,
+    output_mailbox_ptrs: list[int],
+    output_mailbox_multicast_ptr: int,
+    barrier_buffer: torch.Tensor,
+    barrier_buffer_ptrs: list[int],
+    barrier_buffer_multicast_ptr: int,
+    barrier_target: torch.Tensor,
+    scratch: torch.Tensor,
+    tp_rank: int,
+    active_tokens: int,
+) -> torch.Tensor:
+    """Close one TP8 Kimi K3 decode step and return the assembled output.
+
+    The single launch all-reduces the routed latent partials and
+    reduce-scatters the shared partials out of the symmetric collective
+    buffer, applies FP32 RMSNorm, contracts this rank's 896 rows of the
+    replicated latent-up weight, beta-adds its reduced shared shard, and
+    multicasts that shard into every rank's token-major mailbox slot. Every
+    rank returns the identical ``[active_tokens, 7168]`` view of its own
+    mailbox storage; nothing is allocated.
+    """
+    arguments = locals()
+    for field, alignment in _TAIL_ALIGNMENT:
+        if is_fake(arguments[field]):
+            continue
+        past = arguments[field].data_ptr() % alignment
+        if past:
+            raise RuntimeError(
+                f"MoK: _kimi_k3_tail requires {field} aligned to "
+                f"{alignment} bytes, got a pointer {past} bytes past one"
+            )
+    torch.ops.mok._kimi_k3_tail(
+        routed_latent_rmsnorm_weight,
+        latent_up_proj,
+        collective_buffer,
+        collective_buffer_ptrs,
+        collective_buffer_multicast_ptr,
+        output_mailbox,
+        output_mailbox_ptrs,
+        output_mailbox_multicast_ptr,
+        barrier_buffer,
+        barrier_buffer_ptrs,
+        barrier_buffer_multicast_ptr,
+        barrier_target,
+        scratch,
+        tp_rank,
+        active_tokens,
+    )
+    tokens, ranks, shard_columns = output_mailbox.shape
+    return output_mailbox.view(tokens, ranks * shard_columns)[:active_tokens]
+
+
 @torch.library.custom_op("mok::pack_kimi_k3_mxfp4", mutates_args=())
 def pack_kimi_k3_mxfp4(
     weight: torch.Tensor,
