@@ -14,6 +14,7 @@ the reference sums the per-rank partials the same way the fused tail does.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import math
@@ -688,6 +689,50 @@ def published_shared_partial(
     therefore still holds this rank's contribution alone, unsummed.
     """
     return collective_buffer[:active_tokens, LATENT:]
+
+
+def _device_trace(device: torch.device) -> list[str]:
+    """One device's allocator history, as a list of action names.
+
+    Reading the history is itself recorded, as a ``snapshot`` marker appended
+    by the very call that returns the trace, so that one action is dropped
+    here: it says nothing about the code being measured.
+    """
+    traces = torch.cuda.memory._snapshot().get("device_traces", [])
+    index = 0 if device.index is None else device.index
+    entries = traces[index] if index < len(traces) else []
+    return [
+        str(entry.get("action"))
+        for entry in entries
+        if entry.get("action") != "snapshot"
+    ]
+
+
+@contextlib.contextmanager
+def recorded_allocator_events(
+    device: torch.device,
+) -> Iterator[list[str]]:
+    """Collect every caching-allocator event raised inside the block.
+
+    ``memory_allocated()`` reports only the net change, so a hot path that
+    allocated a tensor and freed it again inside one call reads as having
+    allocated nothing at all. The allocator's own history records each event
+    separately, which is what turns "this call allocates nothing" into
+    something a test can actually observe. The list is filled in when the block
+    exits, so callers inspect it afterwards.
+    """
+    torch.cuda.synchronize(device)
+    torch.cuda.memory._record_memory_history(
+        enabled="all", context=None, stacks="python", max_entries=100_000
+    )
+    events: list[str] = []
+    try:
+        before = len(_device_trace(device))
+        yield events
+        torch.cuda.synchronize(device)
+        events.extend(_device_trace(device)[before:])
+    finally:
+        torch.cuda.memory._record_memory_history(enabled=None)
 
 
 def published_routes(

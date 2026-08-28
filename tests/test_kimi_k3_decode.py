@@ -68,6 +68,7 @@ from .kimi_k3_decode_support import (
     profiled_kernel_names,
     published_routes,
     published_shared_partial,
+    recorded_allocator_events,
     routing,
     shared_partial_reference,
     weights,  # noqa: F401
@@ -726,6 +727,11 @@ def test_the_step_allocates_nothing_and_returns_a_mailbox_view(
 
     A decode step runs inside a serving loop's steady state, so an allocation
     or a 1.8 MB copy per call is a cost the caller cannot see and cannot avoid.
+
+    The net allocation is checked as well, but on its own it would pass a step
+    that allocated a scratch tensor and freed it again, so the allocator's
+    event history is what the claim actually rests on: a warmed call must raise
+    no allocator event at all.
     """
     _, _, device = tp8_context
     tokens = 24
@@ -735,9 +741,19 @@ def test_the_step_allocates_nothing_and_returns_a_mailbox_view(
 
     torch.cuda.synchronize(device)
     before = torch.cuda.memory_allocated(device)
-    actual = _decode(workspace, weights, hidden)
-    torch.cuda.synchronize(device)
+    with recorded_allocator_events(device) as events:
+        actual = kimi_k3_decode(CONFIG, workspace, weights, hidden)
+    assert int(workspace.error_flag.item()) == 0
     assert torch.cuda.memory_allocated(device) == before
+    assert events == [], events
+
+    # An empty history proves nothing unless the recorder was listening, so
+    # the same instrumentation is shown catching a transient that
+    # `memory_allocated()` alone would report as no allocation at all.
+    with recorded_allocator_events(device) as control:
+        torch.empty(1024, device=device).sum()
+    assert torch.cuda.memory_allocated(device) == before
+    assert "alloc" in control, control
 
     mailbox = workspace.output_mailbox
     assert actual.data_ptr() == mailbox.data_ptr()
