@@ -26,6 +26,7 @@ Environment overrides:
     MOK_BENCH_NPROC  (default 8)     GPUs / EP ranks for the benchmark (1, 4, or 8)
 """
 
+import io
 import os
 import subprocess
 import tempfile
@@ -163,6 +164,13 @@ _COMPARISON_BUILD_COMMAND = (
 )
 
 
+# Only these paths take part in the CUDA compile. The harness packages are added
+# after it so editing a driver or an adapter reuses the cached compile layer.
+COMPARISON_BUILD_DIRS = ("csrc", "mok", "third_party/ThunderKittens")
+COMPARISON_RUNTIME_DIRS = ("benchmarks", "tests")
+_COPY_IGNORE = ["**/__pycache__", "**/*.so", "**/*.egg-info", "**/.git"]
+
+
 def framework_comparison_image(registry_tag: str) -> modal.Image:
     """Derive a comparison image from one official Kimi K3 serving image."""
     image = (
@@ -178,21 +186,24 @@ def framework_comparison_image(registry_tag: str) -> modal.Image:
         .pip_install("setuptools>=80", "wheel")
         .env({"MOK_ARCH": "SM103"})
     )
-    for directory in BUILD_DIRS:
+    for directory in COMPARISON_BUILD_DIRS:
         image = image.add_local_dir(
             directory,
             remote_path=f"{REMOTE_ROOT}/{directory}",
             copy=True,
-            ignore=["**/__pycache__", "**/*.so", "**/*.egg-info", "**/.git"],
+            ignore=_COPY_IGNORE,
         )
     for file in BUILD_FILES:
         image = image.add_local_file(file, remote_path=f"{REMOTE_ROOT}/{file}", copy=True)
-    image = image.add_local_file(
-        "benchmarks/framework_manifest.json",
-        remote_path=f"{REMOTE_ROOT}/benchmarks/framework_manifest.json",
-        copy=True,
-    )
-    return image.run_commands(_COMPARISON_BUILD_COMMAND).workdir(REMOTE_ROOT)
+    compiled = image.run_commands(_COMPARISON_BUILD_COMMAND)
+    for directory in COMPARISON_RUNTIME_DIRS:
+        compiled = compiled.add_local_dir(
+            directory,
+            remote_path=f"{REMOTE_ROOT}/{directory}",
+            copy=True,
+            ignore=_COPY_IGNORE,
+        )
+    return compiled.workdir(REMOTE_ROOT)
 
 
 VLLM_COMPARISON_IMAGE = framework_comparison_image(COMPARISON_IMAGES["vllm"])
@@ -385,7 +396,14 @@ def _run_framework_comparison(
             timeout=79_000,
             environment={"MOK_GIT_SHA": git_sha},
         )
-        expected = set(COMPARISON_ARTIFACT_FILES)
+        measured = [mode for mode in modes.split(",") if mode]
+        skipped = {
+            f"latency_{mode}.{suffix}"
+            for mode in ("block8", "block16")
+            if mode not in measured
+            for suffix in ("json", "csv")
+        }
+        expected = set(COMPARISON_ARTIFACT_FILES) - skipped
         actual = {path.name for path in output_dir.iterdir()}
         if actual != expected:
             raise RuntimeError(
@@ -435,6 +453,42 @@ def compare_sglang(
         modes=modes,
         tokens=tokens,
     )
+
+
+@app.local_entrypoint()
+def compare(
+    git_sha: str,
+    output_dir: str = "kimi_k3_comparison",
+    warmup_count: int = 500,
+    sample_count: int = 1000,
+    modes: str = "block8,block16",
+    tokens: str = "",
+    frameworks: str = "vllm,sglang",
+) -> None:
+    """Run the framework comparisons and unpack their archives locally."""
+    import tarfile
+
+    entrypoints = {"vllm": compare_vllm, "sglang": compare_sglang}
+    root = Path(output_dir)
+    handles = {
+        name: entrypoints[name].spawn(
+            git_sha,
+            warmup_count=warmup_count,
+            sample_count=sample_count,
+            modes=modes,
+            tokens=tokens,
+        )
+        for name in frameworks.split(",")
+        if name
+    }
+    for name, handle in handles.items():
+        destination = root / name
+        destination.mkdir(parents=True, exist_ok=True)
+        archive = handle.get()
+        (root / f"{name}.tar").write_bytes(archive)
+        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+            tar.extractall(destination, filter="data")
+        print(f"{name}: {sorted(path.name for path in destination.iterdir())}")
 
 
 @app.local_entrypoint()

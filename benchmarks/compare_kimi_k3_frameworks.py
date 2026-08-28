@@ -82,6 +82,18 @@ ARTIFACT_FILES = (
     "performance_gates.json",
 )
 
+
+def comparison_artifact_files(modes: Sequence[str]) -> tuple[str, ...]:
+    """Return the artifacts one run writes for the modes it measures."""
+    unmeasured = set(SHAPE_GROUPS) - set(modes)
+    skipped = {
+        f"latency_{mode}.{suffix}"
+        for mode in unmeasured
+        for suffix in ("json", "csv")
+    }
+    return tuple(name for name in ARTIFACT_FILES if name not in skipped)
+
+
 LATENCY_COLUMNS = (
     "backend",
     "mode",
@@ -815,17 +827,82 @@ def _run_gpu(
             output_dir / "performance_gates.json",
             _partial_gates(framework, tables.get("block16", [])),
         )
+        expected = comparison_artifact_files(list(shape_groups))
         missing = [
-            name for name in ARTIFACT_FILES if not (output_dir / name).is_file()
+            name for name in expected if not (output_dir / name).is_file()
         ]
         if missing:
             raise AssertionError(f"missing comparison artifacts: {missing}")
-        print(json.dumps({"framework": framework, "artifacts": list(ARTIFACT_FILES)}))
+        print(json.dumps({"framework": framework, "artifacts": list(expected)}))
+        print(json.dumps(parity_summary(framework, parity), indent=2, sort_keys=True))
+        for mode in shape_groups:
+            for row in tables[mode]:
+                print(
+                    "LATENCY "
+                    + json.dumps(
+                        {
+                            key: row[key]
+                            for key in (
+                                "backend",
+                                "mode",
+                                "tokens",
+                                "median_ms",
+                                "p90_ms",
+                                "p99_ms",
+                            )
+                        },
+                        sort_keys=True,
+                    )
+                )
 
     _barrier(device)
     adapter.close()
     kimi.clear_kimi_k3_decode_workspace_cache()
     torch.distributed.destroy_process_group()
+
+
+def parity_summary(
+    framework: str,
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Reduce every parity row to the worst value the tolerances constrain."""
+
+    def worst(path: Sequence[str], reducer: Callable[[Iterable[float]], float]) -> float:
+        values = []
+        for row in rows:
+            value: Any = row
+            for key in path:
+                value = value[key]
+            values.append(float(value))
+        return reducer(values)
+
+    comparisons = {}
+    for comparison in (
+        "custom_vs_native",
+        "custom_vs_reference",
+        "native_vs_reference",
+        "routed_latent_vs_reference",
+        "shared_output_vs_reference",
+    ):
+        comparisons[comparison] = {
+            "max_relative_l1": worst((comparison, "relative_l1"), max),
+            "min_cosine_similarity": worst(
+                (comparison, "cosine_similarity"), min
+            ),
+            "max_abs": worst((comparison, "max_abs"), max),
+        }
+    return {
+        "framework": framework,
+        "row_count": len(rows),
+        "router_expert_ids_all_match": all(
+            row["router"]["expert_ids_match"] for row in rows
+        ),
+        "router_weight_max_abs": max(
+            float(row["router"]["router_weight_max_abs"]) for row in rows
+        ),
+        "comparisons": comparisons,
+        "tolerances": dict(NUMERICAL_TOLERANCES),
+    }
 
 
 def entry_index(pool: Sequence[Any], entry: Any) -> int:

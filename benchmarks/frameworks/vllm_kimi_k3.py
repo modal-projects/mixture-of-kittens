@@ -1,7 +1,7 @@
 """Adapter around vLLM's complete native Kimi K3 sparse-MoE layer.
 
-The adapter builds one real ``vllm.model_executor.models.kimi_k3.nvidia.model
-.KimiMoE`` on the running TP8 group and drives its own ``forward``: the FP32
+The adapter builds one real ``vllm.models.kimi_k3.nvidia.model.KimiMoE`` on
+the running TP8 group and drives its own ``forward``: the FP32
 router, the replicated latent down projection, the MXFP4 ``FusedMoE`` with the
 native SiTU activation, the shared experts, the fused latent/shared reduction,
 the RMSNorm, the replicated latent up projection, and the final add. No stage
@@ -28,6 +28,7 @@ from benchmarks.frameworks.kimi_k3_adapter_common import (
     check_native_shapes,
     compare_routes,
     copy_into,
+    expert_tensor_shapes,
     latent_reference,
     native_weights,
     shared_reference,
@@ -76,32 +77,27 @@ class VllmKimiK3Adapter:
         self._config_dir = self._exit_stack.enter_context(
             tempfile.TemporaryDirectory(prefix="kimi-k3-vllm-")
         )
-        write_model_config(self._config_dir)
+        write_model_config(self._config_dir, FRAMEWORK)
         self._layer = self._build_layer()
         self._load(weights)
 
     # -- construction ----------------------------------------------------
 
     def _build_layer(self) -> Any:
-        from vllm.config import (
-            CacheConfig,
-            DeviceConfig,
-            LoadConfig,
-            ModelConfig,
-            ParallelConfig,
-            SchedulerConfig,
-            VllmConfig,
-            set_current_vllm_config,
-        )
+        from vllm.config import set_current_vllm_config
         from vllm.distributed import (
             ensure_model_parallel_initialized,
             init_distributed_environment,
         )
+        from vllm.engine.arg_utils import EngineArgs
         from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4Config
-        from vllm.model_executor.models.kimi_k3.nvidia.model import KimiMoE
+        from vllm.models.kimi_k3.nvidia.model import KimiMoE
         from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
-        model_config = ModelConfig(
+        # EngineArgs wires every sub-config the way a real server would, which
+        # is what the layer's own constructor reads (kernel backend selection,
+        # parallel config, compilation config).
+        vllm_config = EngineArgs(
             model=self._config_dir,
             tokenizer=self._config_dir,
             skip_tokenizer_init=True,
@@ -109,39 +105,34 @@ class VllmKimiK3Adapter:
             dtype="bfloat16",
             seed=0,
             max_model_len=MODEL_CONFIG["max_position_embeddings"],
+            tensor_parallel_size=self.tp_size,
+            load_format="dummy",
             enforce_eager=False,
-        )
-        vllm_config = VllmConfig(
-            model_config=model_config,
-            cache_config=CacheConfig(),
-            parallel_config=ParallelConfig(tensor_parallel_size=self.tp_size),
-            scheduler_config=SchedulerConfig(),
-            device_config=DeviceConfig(device="cuda"),
-            load_config=LoadConfig(load_format="dummy"),
-        )
-
-        init_distributed_environment(
-            world_size=self.tp_size,
-            rank=self.tp_rank,
-            distributed_init_method="env://",
-            local_rank=self.device.index,
-            backend="nccl",
-        )
-        ensure_model_parallel_initialized(self.tp_size, 1)
+        ).create_engine_config()
 
         self._vllm_config = vllm_config
         text_config = KimiLinearConfig(
             **{
                 key: value
                 for key, value in MODEL_CONFIG.items()
-                if key not in {"architectures", "model_type"}
+                if key != "model_type"
             }
         )
         quant_config = Mxfp4Config(ignored_layers=list(_ignored_layers()))
         previous_dtype = torch.get_default_dtype()
         torch.set_default_dtype(torch.bfloat16)
         try:
+            # Both the group setup and the layer read the ambient config, so
+            # they have to share one context.
             with set_current_vllm_config(vllm_config):
+                init_distributed_environment(
+                    world_size=self.tp_size,
+                    rank=self.tp_rank,
+                    distributed_init_method="env://",
+                    local_rank=self.device.index,
+                    backend="nccl",
+                )
+                ensure_model_parallel_initialized(self.tp_size, 1)
                 layer = KimiMoE(
                     config=text_config,
                     vllm_config=vllm_config,
@@ -173,25 +164,9 @@ class VllmKimiK3Adapter:
         copy_into(layer.routed_expert_up_proj.weight, mapped.routed_expert_up_proj)
         copy_into(layer.routed_expert_norm.weight, mapped.routed_expert_norm)
 
-        before = {
-            name: tuple(getattr(experts, name).shape)
-            for name in (
-                "w13_weight",
-                "w13_weight_scale",
-                "w2_weight",
-                "w2_weight_scale",
-            )
-        }
+        before = expert_tensor_shapes(experts)
         experts.quant_method.process_weights_after_loading(experts)
-        after = {
-            name: tuple(getattr(experts, name).shape)
-            for name in (
-                "w13_weight",
-                "w13_weight_scale",
-                "w2_weight",
-                "w2_weight_scale",
-            )
-        }
+        after = expert_tensor_shapes(experts)
         self._transformations.append(
             {
                 "stage": "process_weights_after_loading",
@@ -231,10 +206,14 @@ class VllmKimiK3Adapter:
 
     @contextlib.contextmanager
     def _forward_context(self, num_tokens: int):
+        from vllm.config import set_current_vllm_config
         from vllm.forward_context import set_forward_context
 
-        with set_forward_context(None, self._vllm_config, num_tokens=num_tokens):
-            yield
+        with set_current_vllm_config(self._vllm_config):
+            with set_forward_context(
+                None, self._vllm_config, num_tokens=num_tokens
+            ):
+                yield
 
     def router_comparison(self, hidden: torch.Tensor, weights: Any) -> dict[str, Any]:
         from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (

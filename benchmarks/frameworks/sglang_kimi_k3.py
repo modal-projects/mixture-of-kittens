@@ -29,6 +29,7 @@ from benchmarks.frameworks.kimi_k3_adapter_common import (
     check_native_shapes,
     compare_routes,
     copy_into,
+    expert_tensor_shapes,
     latent_reference,
     native_weights,
     shared_reference,
@@ -79,7 +80,7 @@ class SglangKimiK3Adapter:
         self._config_dir = self._exit_stack.enter_context(
             tempfile.TemporaryDirectory(prefix="kimi-k3-sglang-")
         )
-        write_model_config(self._config_dir)
+        write_model_config(self._config_dir, FRAMEWORK)
         self._layer = self._build_layer()
         self._load(weights)
 
@@ -122,7 +123,7 @@ class SglangKimiK3Adapter:
             **{
                 key: value
                 for key, value in MODEL_CONFIG.items()
-                if key not in {"architectures", "model_type"}
+                if key != "model_type"
             }
         )
         quant_config = Mxfp4Config(
@@ -167,25 +168,9 @@ class SglangKimiK3Adapter:
         copy_into(layer.routed_expert_up_proj.weight, mapped.routed_expert_up_proj)
         copy_into(layer.routed_expert_norm.weight, mapped.routed_expert_norm)
 
-        before = {
-            name: tuple(getattr(experts, name).shape)
-            for name in (
-                "w13_weight",
-                "w13_weight_scale",
-                "w2_weight",
-                "w2_weight_scale",
-            )
-        }
+        before = expert_tensor_shapes(experts)
         experts.quant_method.process_weights_after_loading(experts)
-        after = {
-            name: tuple(getattr(experts, name).shape)
-            for name in (
-                "w13_weight",
-                "w13_weight_scale",
-                "w2_weight",
-                "w2_weight_scale",
-            )
-        }
+        after = expert_tensor_shapes(experts)
         self._transformations.append(
             {
                 "stage": "process_weights_after_loading",

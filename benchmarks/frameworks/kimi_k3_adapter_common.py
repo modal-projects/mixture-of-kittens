@@ -25,9 +25,16 @@ from mok.kimi_k3 import (
     kimi_k3_router_reference,
 )
 
+# Each loader validates ``architectures`` against its own model registry before
+# it will build a config, and the two registries spell the Kimi K3 linear
+# decoder differently. Nothing else in the standalone config differs.
+ARCHITECTURES = {
+    "vllm": ["KimiLinearForCausalLM"],
+    "sglang": ["KimiK3LinearForCausalLM"],
+}
+
 MODEL_CONFIG = {
     "model_type": "kimi_linear",
-    "architectures": ["KimiK3LinearForCausalLM"],
     "hidden_size": KIMI_K3_HIDDEN_SIZE,
     "intermediate_size": KIMI_K3_HIDDEN_SIZE,
     "moe_intermediate_size": KIMI_K3_ROUTED_INTERMEDIATE_SIZE,
@@ -72,15 +79,16 @@ ROUTED_PER_RANK = KIMI_K3_ROUTED_INTERMEDIATE_SIZE // KIMI_K3_TP_SIZE
 SHARED_PER_RANK = KIMI_K3_SHARED_INTERMEDIATE_SIZE // KIMI_K3_TP_SIZE
 
 
-def write_model_config(directory: str) -> str:
-    """Write the standalone Kimi K3 ``config.json`` both loaders read."""
+def write_model_config(directory: str, framework: str) -> str:
+    """Write the standalone Kimi K3 ``config.json`` one loader reads."""
     import json
     import os
 
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, "config.json")
+    payload = {**MODEL_CONFIG, "architectures": ARCHITECTURES[framework]}
     with open(path, "w", encoding="utf-8") as handle:
-        json.dump(MODEL_CONFIG, handle, indent=2, sort_keys=True)
+        json.dump(payload, handle, indent=2, sort_keys=True)
     return directory
 
 
@@ -161,6 +169,36 @@ def check_native_shapes(mapped: NativeWeights) -> None:
         actual = tuple(getattr(mapped, name).shape)
         if actual != shape:
             raise ValueError(f"{name} must have shape {shape}, got {actual}")
+
+
+EXPERT_TENSOR_NAMES = (
+    "w13_weight",
+    "w13_weight_scale",
+    "w13_weight_bias",
+    "w2_weight",
+    "w2_weight_scale",
+    "w2_weight_bias",
+)
+
+
+def expert_tensor_shapes(experts: Any) -> dict[str, Any]:
+    """Snapshot the expert tensors a native runner currently exposes.
+
+    ``process_weights_after_loading`` is free to drop, rename, or re-type these
+    attributes when it converts to a kernel format, so the snapshot records
+    whatever is present rather than assuming a fixed set.
+    """
+    snapshot: dict[str, Any] = {}
+    for name in EXPERT_TENSOR_NAMES:
+        value = getattr(experts, name, None)
+        if value is None:
+            continue
+        shape = getattr(value, "shape", None)
+        snapshot[name] = {
+            "shape": list(shape) if shape is not None else None,
+            "dtype": str(getattr(value, "dtype", type(value).__name__)),
+        }
+    return snapshot
 
 
 def copy_into(destination: torch.Tensor, source: torch.Tensor) -> None:
@@ -263,6 +301,8 @@ class GraphPool:
 
 
 __all__ = [
+    "ARCHITECTURES",
+    "EXPERT_TENSOR_NAMES",
     "GraphPool",
     "LAYER_PREFIX",
     "MODEL_CONFIG",
@@ -275,6 +315,7 @@ __all__ = [
     "compare_routes",
     "copy_into",
     "expected_native_shapes",
+    "expert_tensor_shapes",
     "latent_reference",
     "native_weights",
     "router_reference",
