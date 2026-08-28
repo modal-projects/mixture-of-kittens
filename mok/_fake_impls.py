@@ -27,14 +27,22 @@ def _kimi_k3_decode_fake(
     collective_buffer_multicast_ptr: int,
     output_mailbox: torch.Tensor,
     output_mailbox_ptrs: list[int],
+    output_mailbox_multicast_ptr: int,
     barrier_buffer: torch.Tensor,
     barrier_buffer_ptrs: list[int],
     barrier_buffer_multicast_ptr: int,
+    barrier_target: torch.Tensor,
     error_flag: torch.Tensor,
     tp_rank: int,
     active_tokens: int,
-) -> torch.Tensor:
-    return hidden_states.new_empty(hidden_states.shape)
+    workspace_signature: int,
+) -> None:
+    # The step writes only into tensors the caller already owns, so a trace has
+    # nothing to allocate. A trace also carries placeholder addresses, so
+    # `workspace_signature` is the documented placeholder zero here rather than
+    # a real workspace's value; `mok.ops` enforces that, and nothing in a trace
+    # depends on it.
+    return None
 
 
 @torch.library.register_fake("mok::_kimi_k3_route_and_project")

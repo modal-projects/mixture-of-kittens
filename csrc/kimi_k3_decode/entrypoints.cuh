@@ -4,6 +4,7 @@
 
 #include "kernel.cuh"
 #include "mxfp4.cuh"
+#include "persistent_kernel.cuh"
 #include "types.cuh"
 #include "workspace_signature.cuh"
 
@@ -12,7 +13,10 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime_api.h>
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <tuple>
 #include <vector>
 
@@ -22,16 +26,38 @@ inline std::int64_t kimi_k3_decode_workspace_bytes() noexcept {
     return SCRATCH_BYTES;
 }
 
-static __host__ cudaDeviceProp check_sm103(
+/// Return one device's immutable properties, querying the driver once.
+///
+/// `cudaGetDeviceProperties` fills a kilobyte-sized record and is far too heavy
+/// to sit on a decode hot path that is otherwise free of runtime API calls.
+/// The record never changes for a device, so it is read once per ordinal and
+/// kept.
+static __host__ const cudaDeviceProp &cached_device_properties(
+    const int device_index
+) {
+    static std::array<cudaDeviceProp, persistent::kMaxCudaDevices> properties{};
+    static std::array<std::once_flag, persistent::kMaxCudaDevices> queried;
+    TORCH_CHECK(device_index >= 0
+                    && device_index < persistent::kMaxCudaDevices,
+                "MoK: Kimi K3 supports CUDA devices 0 through ",
+                persistent::kMaxCudaDevices - 1, ", got ", device_index);
+    const auto slot = static_cast<std::size_t>(device_index);
+    std::call_once(queried[slot], [slot, device_index] {
+        const cudaError_t status =
+            cudaGetDeviceProperties(&properties[slot], device_index);
+        TORCH_CHECK(status == cudaSuccess,
+                    "MoK: cudaGetDeviceProperties failed for device ",
+                    device_index, ": ", cudaGetErrorString(status));
+    });
+    return properties[slot];
+}
+
+static __host__ const cudaDeviceProp &check_sm103(
     const at::Tensor &hidden_states,
     const char *name
 ) {
-    cudaDeviceProp properties{};
-    const int device_index = hidden_states.get_device();
-    const cudaError_t status = cudaGetDeviceProperties(&properties, device_index);
-    TORCH_CHECK(status == cudaSuccess,
-                "MoK: cudaGetDeviceProperties failed for device ", device_index,
-                ": ", cudaGetErrorString(status));
+    const cudaDeviceProp &properties =
+        cached_device_properties(hidden_states.get_device());
     TORCH_CHECK(properties.major == 10 && properties.minor == 3,
                 "MoK: ", name, " requires SM103, found sm_",
                 properties.major, properties.minor);
@@ -323,7 +349,7 @@ static __host__ at::Tensor shared_experts_entrypoint(
     }
     check_tensor_alignment(scratch, "_kimi_k3_shared_experts", "scratch",
                            SCRATCH_ALIGNMENT);
-    const cudaDeviceProp properties =
+    const cudaDeviceProp &properties =
         check_sm103(hidden_states, "_kimi_k3_shared_experts");
 
     const c10::cuda::CUDAGuard device_guard(device);
@@ -347,6 +373,7 @@ static __host__ at::Tensor shared_experts_entrypoint(
 /// rank's slot holding the local tensor's own address, plus a multicast alias
 /// that aliases none of them.
 static __host__ void check_symmetric_pointers(
+    const char *operation,
     const std::vector<std::int64_t> &pointers,
     const std::int64_t multicast_pointer,
     const at::Tensor &tensor,
@@ -356,11 +383,11 @@ static __host__ void check_symmetric_pointers(
     const std::int64_t alignment
 ) {
     TORCH_CHECK(pointers.size() == static_cast<std::size_t>(kTensorParallelSize),
-                "MoK: _kimi_k3_tail requires ", list_field, " with exactly ",
+                "MoK: ", operation, " requires ", list_field, " with exactly ",
                 kTensorParallelSize, " pointers, got ", pointers.size());
     for (int rank = 0; rank < kTensorParallelSize; ++rank) {
         TORCH_CHECK(pointers[rank] > 0,
-                    "MoK: _kimi_k3_tail requires ", list_field,
+                    "MoK: ", operation, " requires ", list_field,
                     " to hold only positive device pointers, but entry ", rank,
                     " is ", pointers[rank]);
     }
@@ -370,7 +397,7 @@ static __host__ void check_symmetric_pointers(
     const auto local = reinterpret_cast<std::int64_t>(tensor.data_ptr());
     TORCH_CHECK(
         pointers[static_cast<std::size_t>(tp_rank)] == local,
-        "MoK: _kimi_k3_tail requires ", list_field,
+        "MoK: ", operation, " requires ", list_field,
         "[tp_rank] to be this rank's own device pointer, but entry ", tp_rank,
         " is ", pointers[static_cast<std::size_t>(tp_rank)],
         " while the matching tensor is at ", local,
@@ -379,14 +406,14 @@ static __host__ void check_symmetric_pointers(
 
     for (int rank = 0; rank < kTensorParallelSize; ++rank) {
         TORCH_CHECK(pointers[rank] % alignment == 0,
-                    "MoK: _kimi_k3_tail requires every ", list_field,
+                    "MoK: ", operation, " requires every ", list_field,
                     " entry aligned to ", alignment, " bytes, but entry ", rank,
                     " is ", pointers[rank] % alignment, " bytes past one");
     }
     for (int rank = 0; rank < kTensorParallelSize; ++rank) {
         for (int peer = rank + 1; peer < kTensorParallelSize; ++peer) {
             TORCH_CHECK(pointers[rank] != pointers[peer],
-                        "MoK: _kimi_k3_tail requires ", list_field,
+                        "MoK: ", operation, " requires ", list_field,
                         " to hold one distinct pointer per rank, but entries ",
                         rank, " and ", peer, " are both ", pointers[rank]);
         }
@@ -414,7 +441,7 @@ static __host__ void check_symmetric_pointers(
         }
         owner[rank] = attributes.device;
         TORCH_CHECK(attributes.type == cudaMemoryTypeDevice,
-                    "MoK: _kimi_k3_tail requires every ", list_field,
+                    "MoK: ", operation, " requires every ", list_field,
                     " entry to name device memory, but entry ", rank,
                     " is of CUDA memory type ",
                     static_cast<int>(attributes.type));
@@ -424,7 +451,7 @@ static __host__ void check_symmetric_pointers(
         for (int peer = rank + 1; peer < kTensorParallelSize; ++peer) {
             if (!owner_known[peer]) continue;
             TORCH_CHECK(owner[rank] != owner[peer],
-                        "MoK: _kimi_k3_tail requires ", list_field,
+                        "MoK: ", operation, " requires ", list_field,
                         " to hold one distinct device per rank, but entries ",
                         rank, " and ", peer, " both live on CUDA device ",
                         owner[rank]);
@@ -433,7 +460,7 @@ static __host__ void check_symmetric_pointers(
     if (owner_known[static_cast<std::size_t>(tp_rank)]) {
         TORCH_CHECK(owner[static_cast<std::size_t>(tp_rank)]
                         == tensor.get_device(),
-                    "MoK: _kimi_k3_tail requires ", list_field,
+                    "MoK: ", operation, " requires ", list_field,
                     "[tp_rank] to live on the same device as its tensor, but "
                     "entry ", tp_rank, " is on CUDA device ",
                     owner[static_cast<std::size_t>(tp_rank)],
@@ -441,16 +468,16 @@ static __host__ void check_symmetric_pointers(
     }
 
     TORCH_CHECK(multicast_pointer > 0,
-                "MoK: _kimi_k3_tail requires ", multicast_field,
+                "MoK: ", operation, " requires ", multicast_field,
                 " to be a positive device pointer, got ", multicast_pointer);
     TORCH_CHECK(multicast_pointer % alignment == 0,
-                "MoK: _kimi_k3_tail requires ", multicast_field,
+                "MoK: ", operation, " requires ", multicast_field,
                 " aligned to ", alignment, " bytes, but it is ",
                 multicast_pointer % alignment, " bytes past one");
     for (int rank = 0; rank < kTensorParallelSize; ++rank) {
         TORCH_CHECK(
             multicast_pointer != pointers[rank],
-            "MoK: _kimi_k3_tail requires one distinct multicast pointer per "
+            "MoK: ", operation, " requires one distinct multicast pointer per "
             "symmetric allocation, but ", multicast_field, " equals ",
             list_field, " entry ", rank);
     }
@@ -459,7 +486,7 @@ static __host__ void check_symmetric_pointers(
             &multicast_attributes,
             reinterpret_cast<void *>(multicast_pointer)) == cudaSuccess) {
         TORCH_CHECK(multicast_attributes.type == cudaMemoryTypeDevice,
-                    "MoK: _kimi_k3_tail requires ", multicast_field,
+                    "MoK: ", operation, " requires ", multicast_field,
                     " to name device memory, but it is of CUDA memory type ",
                     static_cast<int>(multicast_attributes.type));
     } else {
@@ -473,6 +500,7 @@ static __host__ void check_symmetric_pointers(
 /// individually valid, so only comparing them against each other reveals that
 /// the caller pointed two allocations at the same fabric address.
 static __host__ void check_multicast_pointers_are_disjoint(
+    const char *operation,
     const std::int64_t collective_buffer_multicast_ptr,
     const std::int64_t output_mailbox_multicast_ptr,
     const std::int64_t barrier_buffer_multicast_ptr
@@ -489,7 +517,7 @@ static __host__ void check_multicast_pointers_are_disjoint(
         for (int second = first + 1; second < 3; ++second) {
             TORCH_CHECK(
                 pointers[first] != pointers[second],
-                "MoK: _kimi_k3_tail requires one distinct multicast pointer "
+                "MoK: ", operation, " requires one distinct multicast pointer "
                 "per symmetric allocation, but ", fields[first], " and ",
                 fields[second], " are both ", pointers[first]);
         }
@@ -606,20 +634,22 @@ static __host__ void kimi_k3_tail_entrypoint(
     // The two BF16 allocations are dereferenced with 16-byte multimem octets;
     // the barrier is a single int32 word.
     check_symmetric_pointers(
-        collective_buffer_ptrs, collective_buffer_multicast_ptr,
-        collective_buffer, tp_rank, "collective_buffer_ptrs",
-        "collective_buffer_multicast_ptr", VECTOR_ALIGNMENT);
-    check_symmetric_pointers(
-        output_mailbox_ptrs, output_mailbox_multicast_ptr, output_mailbox,
-        tp_rank, "output_mailbox_ptrs", "output_mailbox_multicast_ptr",
+        "_kimi_k3_tail", collective_buffer_ptrs,
+        collective_buffer_multicast_ptr, collective_buffer, tp_rank,
+        "collective_buffer_ptrs", "collective_buffer_multicast_ptr",
         VECTOR_ALIGNMENT);
     check_symmetric_pointers(
-        barrier_buffer_ptrs, barrier_buffer_multicast_ptr, barrier_buffer,
-        tp_rank, "barrier_buffer_ptrs", "barrier_buffer_multicast_ptr",
+        "_kimi_k3_tail", output_mailbox_ptrs, output_mailbox_multicast_ptr,
+        output_mailbox, tp_rank, "output_mailbox_ptrs",
+        "output_mailbox_multicast_ptr", VECTOR_ALIGNMENT);
+    check_symmetric_pointers(
+        "_kimi_k3_tail", barrier_buffer_ptrs, barrier_buffer_multicast_ptr,
+        barrier_buffer, tp_rank, "barrier_buffer_ptrs",
+        "barrier_buffer_multicast_ptr",
         static_cast<std::int64_t>(sizeof(std::int32_t)));
     check_multicast_pointers_are_disjoint(
-        collective_buffer_multicast_ptr, output_mailbox_multicast_ptr,
-        barrier_buffer_multicast_ptr);
+        "_kimi_k3_tail", collective_buffer_multicast_ptr,
+        output_mailbox_multicast_ptr, barrier_buffer_multicast_ptr);
 
     // Every rule above is per allocation, so none of them can see a caller that
     // took eight of these pointers from one workspace and the ninth from
@@ -669,7 +699,7 @@ static __host__ void kimi_k3_tail_entrypoint(
     check_tensor_alignment(scratch, "_kimi_k3_tail", "scratch",
                            SCRATCH_ALIGNMENT);
 
-    const cudaDeviceProp properties =
+    const cudaDeviceProp &properties =
         check_sm103(output_mailbox, "_kimi_k3_tail");
 
     const c10::cuda::CUDAGuard device_guard(device);
@@ -681,7 +711,18 @@ static __host__ void kimi_k3_tail_entrypoint(
         properties.multiProcessorCount);
 }
 
-static __host__ at::Tensor kimi_k3_decode_entrypoint(
+/// Run one whole TP8 Kimi K3 decode step in a single persistent launch.
+///
+/// The operator mutates the workspace and returns nothing: the assembled output
+/// is this rank's own mailbox storage, and a custom operator may not return a
+/// view that aliases one of its own mutated inputs. `mok.kimi_k3.kimi_k3_decode`
+/// takes that view afterwards.
+///
+/// Every rank must call this with the same active token count, for the reason
+/// spelled out above `kimi_k3_tail_entrypoint`: the cross-rank rendezvous is
+/// driven by one coordinator thread whose arrival does not depend on the count,
+/// so a divergent count returns mixed-generation rows rather than deadlocking.
+static __host__ void kimi_k3_decode_entrypoint(
     const at::Tensor &hidden_states,
     const at::Tensor &router_weight,
     const at::Tensor &router_correction_bias,
@@ -703,18 +744,235 @@ static __host__ at::Tensor kimi_k3_decode_entrypoint(
     std::int64_t collective_buffer_multicast_ptr,
     const at::Tensor &output_mailbox,
     const std::vector<std::int64_t> &output_mailbox_ptrs,
+    std::int64_t output_mailbox_multicast_ptr,
     const at::Tensor &barrier_buffer,
     const std::vector<std::int64_t> &barrier_buffer_ptrs,
     std::int64_t barrier_buffer_multicast_ptr,
+    const at::Tensor &barrier_target,
     const at::Tensor &error_flag,
-    int tp_rank,
-    int active_tokens
+    std::int64_t tp_rank,
+    std::int64_t active_tokens,
+    std::int64_t workspace_signature_value
 ) {
-    TORCH_CHECK(hidden_states.is_cuda(),
-                "MoK: kimi_k3_decode requires CUDA hidden_states");
-    check_sm103(hidden_states, "kimi_k3_decode");
+    constexpr const char *kOperation = "kimi_k3_decode";
+    constexpr int shard_columns = kHiddenSize / kTensorParallelSize;
+    constexpr int collective_columns = kLatentSize + kHiddenSize;
+    constexpr int shared_intermediate =
+        kSharedIntermediateSize / kTensorParallelSize;
 
-    return at::empty_like(hidden_states);
+    // Every tensor the launch touches, with the boundary the device
+    // dereferences it on. A contiguous view at a nonzero storage offset clears
+    // every shape and dtype rule below and still under-aligns the pointer,
+    // which faults the vector loads and TMA descriptors or silently shifts
+    // every scratch region. Zero marks the three int32 control words and the
+    // correction bias, which are only ever read one scalar at a time.
+    struct DecodeTensor {
+        const at::Tensor *tensor;
+        const char *name;
+        int alignment;
+    };
+    const DecodeTensor decode_tensors[] = {
+        {&hidden_states, "hidden_states", VECTOR_ALIGNMENT},
+        {&router_weight, "router_weight", VECTOR_ALIGNMENT},
+        {&router_correction_bias, "router_correction_bias", 0},
+        {&routed_expert_down_proj, "routed_expert_down_proj", VECTOR_ALIGNMENT},
+        {&routed_expert_up_proj, "routed_expert_up_proj", VECTOR_ALIGNMENT},
+        {&routed_latent_rmsnorm_weight, "routed_latent_rmsnorm_weight",
+         VECTOR_ALIGNMENT},
+        {&expert_w1_packed, "expert_w1_packed", VECTOR_ALIGNMENT},
+        {&expert_w1_scale, "expert_w1_scale", VECTOR_ALIGNMENT},
+        {&expert_w3_packed, "expert_w3_packed", VECTOR_ALIGNMENT},
+        {&expert_w3_scale, "expert_w3_scale", VECTOR_ALIGNMENT},
+        {&expert_w2_packed, "expert_w2_packed", VECTOR_ALIGNMENT},
+        {&expert_w2_scale, "expert_w2_scale", VECTOR_ALIGNMENT},
+        {&shared_gate_proj, "shared_gate_proj", VECTOR_ALIGNMENT},
+        {&shared_up_proj, "shared_up_proj", VECTOR_ALIGNMENT},
+        {&shared_down_proj, "shared_down_proj", VECTOR_ALIGNMENT},
+        {&scratch, "scratch", SCRATCH_ALIGNMENT},
+        {&collective_buffer, "collective_buffer", VECTOR_ALIGNMENT},
+        {&output_mailbox, "output_mailbox", VECTOR_ALIGNMENT},
+        {&barrier_buffer, "barrier_buffer", 0},
+        {&barrier_target, "barrier_target", 0},
+        {&error_flag, "error_flag", 0},
+    };
+    const at::Device device = hidden_states.device();
+    for (const DecodeTensor &entry : decode_tensors) {
+        TORCH_CHECK(entry.tensor->device().is_cuda(),
+                    "MoK: kimi_k3_decode requires a CUDA ", entry.name);
+        TORCH_CHECK(entry.tensor->is_contiguous(),
+                    "MoK: kimi_k3_decode requires a contiguous ", entry.name);
+        TORCH_CHECK(entry.tensor->device() == device,
+                    "MoK: kimi_k3_decode requires ", entry.name, " on ",
+                    device);
+        if (entry.alignment > 0) {
+            check_tensor_alignment(*entry.tensor, kOperation, entry.name,
+                                   entry.alignment);
+        }
+    }
+
+    TORCH_CHECK(hidden_states.dim() == 2
+                    && hidden_states.size(1) == kHiddenSize
+                    && hidden_states.scalar_type() == at::kBFloat16,
+                "MoK: kimi_k3_decode requires BF16 hidden_states [M, ",
+                kHiddenSize, "]");
+    const std::int64_t tokens = hidden_states.size(0);
+    TORCH_CHECK(tokens >= 1 && tokens <= kMaxTokens,
+                "MoK: kimi_k3_decode requires hidden_states with 1 to ",
+                kMaxTokens, " tokens");
+    TORCH_CHECK(active_tokens >= 1 && active_tokens <= tokens,
+                "MoK: kimi_k3_decode requires active_tokens in [1, ", tokens,
+                "]");
+    TORCH_CHECK(tp_rank >= 0 && tp_rank < kTensorParallelSize,
+                "MoK: kimi_k3_decode requires tp_rank in [0, ",
+                kTensorParallelSize - 1, "]");
+
+    const auto check_bf16 = [](const at::Tensor &tensor,
+                               const char *name,
+                               const std::initializer_list<std::int64_t> shape) {
+        TORCH_CHECK(tensor.sizes() == at::IntArrayRef(shape)
+                        && tensor.scalar_type() == at::kBFloat16,
+                    "MoK: kimi_k3_decode requires a BF16 ", name, " ",
+                    at::IntArrayRef(shape));
+    };
+    check_bf16(router_weight, "router_weight", {kNumExperts, kHiddenSize});
+    check_bf16(routed_expert_down_proj, "routed_expert_down_proj",
+               {kLatentSize, kHiddenSize});
+    check_bf16(routed_expert_up_proj, "routed_expert_up_proj",
+               {kHiddenSize, kLatentSize});
+    check_bf16(routed_latent_rmsnorm_weight, "routed_latent_rmsnorm_weight",
+               {kLatentSize});
+    check_bf16(shared_gate_proj, "shared_gate_proj",
+               {shared_intermediate, kHiddenSize});
+    check_bf16(shared_up_proj, "shared_up_proj",
+               {shared_intermediate, kHiddenSize});
+    check_bf16(shared_down_proj, "shared_down_proj",
+               {kHiddenSize, shared_intermediate});
+    TORCH_CHECK(router_correction_bias.dim() == 1
+                    && router_correction_bias.size(0) == kNumExperts
+                    && router_correction_bias.scalar_type() == at::kFloat,
+                "MoK: kimi_k3_decode requires a float32 "
+                "router_correction_bias [", kNumExperts, "]");
+
+    const auto check_expert = [](const at::Tensor &tensor,
+                                 const char *name,
+                                 const int rows,
+                                 const int columns) {
+        TORCH_CHECK(tensor.dim() == 3 && tensor.size(0) == kNumExperts
+                        && tensor.size(1) == rows
+                        && tensor.size(2) == columns
+                        && tensor.scalar_type() == at::kByte,
+                    "MoK: kimi_k3_decode requires uint8 ", name, " [",
+                    kNumExperts, ", ", rows, ", ", columns, "]");
+    };
+    check_expert(expert_w1_packed, "expert_w1_packed", kExpertW1W3PackedRows,
+                 kExpertW1W3PackedColumns);
+    check_expert(expert_w1_scale, "expert_w1_scale", kExpertW1W3PackedRows,
+                 kExpertW1W3ScaleColumns);
+    check_expert(expert_w3_packed, "expert_w3_packed", kExpertW1W3PackedRows,
+                 kExpertW1W3PackedColumns);
+    check_expert(expert_w3_scale, "expert_w3_scale", kExpertW1W3PackedRows,
+                 kExpertW1W3ScaleColumns);
+    check_expert(expert_w2_packed, "expert_w2_packed", kExpertW2PackedRows,
+                 kExpertW2PackedColumns);
+    check_expert(expert_w2_scale, "expert_w2_scale", kExpertW2PackedRows,
+                 kExpertW2ScaleColumns);
+
+    TORCH_CHECK(scratch.dim() == 1 && scratch.scalar_type() == at::kByte
+                    && scratch.size(0) >= SCRATCH_BYTES,
+                "MoK: kimi_k3_decode requires a uint8 scratch of at least ",
+                SCRATCH_BYTES, " bytes");
+    // The whole workspace is sized for the contract's 128 tokens, not for this
+    // call's token count, because one workspace serves every shape.
+    TORCH_CHECK(collective_buffer.dim() == 2
+                    && collective_buffer.size(0) == kMaxTokens
+                    && collective_buffer.size(1) == collective_columns
+                    && collective_buffer.scalar_type() == at::kBFloat16,
+                "MoK: kimi_k3_decode requires a BF16 collective_buffer [",
+                kMaxTokens, ", ", collective_columns, "]");
+    TORCH_CHECK(output_mailbox.dim() == 3
+                    && output_mailbox.size(0) == kMaxTokens
+                    && output_mailbox.size(1) == kTensorParallelSize
+                    && output_mailbox.size(2) == shard_columns
+                    && output_mailbox.scalar_type() == at::kBFloat16,
+                "MoK: kimi_k3_decode requires a token-major BF16 "
+                "output_mailbox [", kMaxTokens, ", ", kTensorParallelSize,
+                ", ", shard_columns, "]");
+    TORCH_CHECK(barrier_buffer.dim() == 1 && barrier_buffer.size(0) == 1
+                    && barrier_buffer.scalar_type() == at::kInt,
+                "MoK: kimi_k3_decode requires barrier_buffer to be int32 [1]");
+    TORCH_CHECK(barrier_target.dim() == 1 && barrier_target.size(0) == 1
+                    && barrier_target.scalar_type() == at::kInt,
+                "MoK: kimi_k3_decode requires barrier_target to be int32 [1]");
+    TORCH_CHECK(error_flag.dim() == 1 && error_flag.size(0) == 1
+                    && error_flag.scalar_type() == at::kInt,
+                "MoK: kimi_k3_decode requires error_flag to be int32 [1]");
+
+    check_symmetric_pointers(
+        kOperation, collective_buffer_ptrs, collective_buffer_multicast_ptr,
+        collective_buffer, tp_rank, "collective_buffer_ptrs",
+        "collective_buffer_multicast_ptr", VECTOR_ALIGNMENT);
+    check_symmetric_pointers(
+        kOperation, output_mailbox_ptrs, output_mailbox_multicast_ptr,
+        output_mailbox, tp_rank, "output_mailbox_ptrs",
+        "output_mailbox_multicast_ptr", VECTOR_ALIGNMENT);
+    check_symmetric_pointers(
+        kOperation, barrier_buffer_ptrs, barrier_buffer_multicast_ptr,
+        barrier_buffer, tp_rank, "barrier_buffer_ptrs",
+        "barrier_buffer_multicast_ptr",
+        static_cast<std::int64_t>(sizeof(std::int32_t)));
+    check_multicast_pointers_are_disjoint(
+        kOperation, collective_buffer_multicast_ptr,
+        output_mailbox_multicast_ptr, barrier_buffer_multicast_ptr);
+
+    // Per-allocation rules cannot see a caller that took eight of these
+    // pointers from one workspace and the ninth from another; the signature
+    // was folded from all of them at once, so recomputing it here does.
+    const std::int64_t recomputed = workspace_signature::compute(
+        collective_buffer, collective_buffer_ptrs,
+        collective_buffer_multicast_ptr, output_mailbox, output_mailbox_ptrs,
+        output_mailbox_multicast_ptr, barrier_buffer, barrier_buffer_ptrs,
+        barrier_buffer_multicast_ptr, tp_rank);
+    TORCH_CHECK(recomputed == workspace_signature_value,
+                "MoK: kimi_k3_decode requires workspace_signature to match the "
+                "supplied tensors, pointer lists, multicast aliases, and "
+                "tp_rank, but they hash to ", recomputed, " while the caller "
+                "passed ", workspace_signature_value,
+                ". One of these pointers belongs to a different workspace, or "
+                "the signature does");
+
+    const cudaDeviceProp &properties = check_sm103(hidden_states, kOperation);
+
+    // The step must run on the tensors' own device and that device's current
+    // stream, whatever device happens to be current on entry.
+    const c10::cuda::CUDAGuard device_guard(device);
+    persistent::launch_decode(persistent::LaunchArguments{
+        hidden_states,
+        router_weight,
+        router_correction_bias,
+        routed_expert_down_proj,
+        routed_expert_up_proj,
+        routed_latent_rmsnorm_weight,
+        expert_w1_packed,
+        expert_w1_scale,
+        expert_w3_packed,
+        expert_w3_scale,
+        expert_w2_packed,
+        expert_w2_scale,
+        shared_gate_proj,
+        shared_up_proj,
+        shared_down_proj,
+        collective_buffer,
+        collective_buffer_multicast_ptr,
+        output_mailbox_multicast_ptr,
+        barrier_buffer,
+        barrier_buffer_multicast_ptr,
+        barrier_target,
+        scratch,
+        error_flag,
+        static_cast<int>(tp_rank),
+        static_cast<int>(active_tokens),
+        properties.multiProcessorCount,
+    });
 }
 
 }  // namespace kimi_k3_decode

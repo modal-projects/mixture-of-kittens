@@ -105,6 +105,10 @@ void kimi_k3_tail_tensor_kernel(
     const Scratch scratch = scratch_view(scratch_bytes);
     const int block = static_cast<int>(blockIdx.x);
 
+    // The managed allocator barriers the whole CTA, so every block provisions
+    // its tensor memory before the roles diverge.
+    kittens::tensor_allocator<1, 1> tensor_pool{};
+
     if (block < kReduceBegin) {
         coordinate_ranks(
             scratch, barrier_multicast, barrier_local, barrier_target);
@@ -125,8 +129,8 @@ void kimi_k3_tail_tensor_kernel(
             scratch, kTailShardGeneration, &baseline_slot);
         wait_for_generation(scratch, kTailReduceGeneration, baseline);
         shard_tensor(
-            shared_raw, normalized, latent_up_proj, scratch, mailbox_multicast,
-            block - kShardBegin, tp_rank, active_tokens);
+            shared_raw, tensor_pool, normalized, latent_up_proj, scratch,
+            mailbox_multicast, block - kShardBegin, tp_rank, active_tokens);
         publish_generation(
             scratch, kTailShardArrivals, kTailShardGeneration,
             kTensorShardCtas);

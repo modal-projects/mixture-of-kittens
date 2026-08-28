@@ -16,7 +16,9 @@ inline constexpr int kTensorParallelSize = 8;
 inline constexpr int kMaxTokens = 128;
 inline constexpr int kMaxRoutes = kMaxTokens * kTopK;
 
-static constexpr int NUM_PHASE_COUNTERS = 32;
+// The counters occupy one 256-byte scratch region either way, so the persistent
+// kernel's own slots come out of headroom that was already reserved.
+static constexpr int NUM_PHASE_COUNTERS = 64;
 static constexpr int SCRATCH_ALIGNMENT = 256;
 
 // Hidden states and both projection weights are read through 16-byte vector loads
@@ -92,11 +94,29 @@ inline constexpr int kTailSharedShardBytes =
     + scratch_byte_region_bytes(
         kMaxTokens * kLatentSize * sizeof(__nv_bfloat16));
 
-static constexpr int SCRATCH_BYTES =
+// The persistent kernel's own regions. They are appended, so every offset the
+// private stages and their tests already pin stays exactly where it was.
+//
+// `latent_x` is the routed latent the private route-and-project stage returns
+// as a tensor. The one-launch kernel has no tensor to return it in and cannot
+// borrow another region -- the tail's normalized latent is the only one of the
+// right shape and it is still live when the routed experts read this one.
+inline constexpr int kLatentXBytes =
     kTailSharedShardBytes
     + scratch_byte_region_bytes(
         kMaxTokens * (kHiddenSize / kTensorParallelSize)
         * sizeof(__nv_bfloat16));
+// One work unit per expert that any token routed to, compacted so a worker
+// never claims an empty range. A token's sixteen routes are distinct experts,
+// so an expert collects at most `kMaxTokens` assignments and therefore always
+// fits one 128-row MMA batch; the batch's bounds come from `expert_offsets`.
+inline constexpr int kUnitExpertBytes =
+    kLatentXBytes
+    + scratch_byte_region_bytes(
+        kMaxTokens * kLatentSize * sizeof(__nv_bfloat16));
+
+static constexpr int SCRATCH_BYTES =
+    kUnitExpertBytes + scratch_region_bytes(kNumExperts);
 
 static_assert(kLatentMxfp8Bytes == 40448);
 static_assert(kLatentScaleBytes == 499200);
@@ -108,7 +128,9 @@ static_assert(kSharedUpBytes == 3356160);
 static_assert(kSharedActivatedBytes == 3552768);
 static_assert(kTailNormalizedBytes == 3749376);
 static_assert(kTailSharedShardBytes == 4666880);
-static_assert(SCRATCH_BYTES == 4896256);
+static_assert(kLatentXBytes == 4896256);
+static_assert(kUnitExpertBytes == 5813760);
+static_assert(SCRATCH_BYTES == 5817344);
 
 // Generation-tagged completion counters. Each role's last CTA clears its arrival
 // counter and bumps its generation, so a reused workspace never needs a host reset.
@@ -150,6 +172,21 @@ inline constexpr int kTailDrainGeneration = 25;
 inline constexpr int kTailTimeoutPhase = 26;
 static_assert(kTailTimeoutPhase < NUM_PHASE_COUNTERS);
 
+// The one-launch production kernel's own slots. The private stages never touch
+// them, and the kernel clears every queue counter itself before its first grid
+// barrier, so a reused workspace still needs no host reset.
+inline constexpr int kGridArrivals = 27;
+inline constexpr int kGridGeneration = 28;
+inline constexpr int kRouteLatentQueue = 29;
+inline constexpr int kGateUpQueue = 30;
+inline constexpr int kDownQueue = 31;
+inline constexpr int kActivationArrivals = 32;
+inline constexpr int kActiveExpertUnits = 33;
+// A zero value means no persistent wait timed out. On timeout the waiting CTA
+// records the counter slot it gave up on before trapping.
+inline constexpr int kPersistentTimeoutPhase = 34;
+static_assert(kPersistentTimeoutPhase < NUM_PHASE_COUNTERS);
+
 /// Typed device pointers into one decode workspace.
 struct Scratch {
     int *phase;
@@ -169,6 +206,8 @@ struct Scratch {
     __nv_bfloat16 *shared_activated;
     __nv_bfloat16 *tail_normalized;
     __nv_bfloat16 *tail_shared_shard;
+    __nv_bfloat16 *latent_x;
+    int *unit_expert;
 };
 
 __host__ __device__ inline Scratch scratch_view(std::uint8_t *base) {
@@ -190,6 +229,8 @@ __host__ __device__ inline Scratch scratch_view(std::uint8_t *base) {
         reinterpret_cast<__nv_bfloat16 *>(base + kSharedActivatedBytes),
         reinterpret_cast<__nv_bfloat16 *>(base + kTailNormalizedBytes),
         reinterpret_cast<__nv_bfloat16 *>(base + kTailSharedShardBytes),
+        reinterpret_cast<__nv_bfloat16 *>(base + kLatentXBytes),
+        reinterpret_cast<int *>(base + kUnitExpertBytes),
     };
 }
 

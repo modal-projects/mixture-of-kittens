@@ -28,6 +28,22 @@ KIMI_K3_MXFP4_UNIT_SCALE_BYTE = 0x7F
 KIMI_K3_W1W3_K = KIMI_K3_LATENT_SIZE
 
 
+def _operators() -> Any:
+    """Return ``mok.ops``, imported on first use rather than at import time.
+
+    ``mok.ops`` registers every ``mok::`` operator and pulls in the compiled
+    ``mok._C``. The official equations, the weight preparation, and the
+    workspace contract in this module all have to stay reachable without
+    either: the CPU contract tests load this file directly, outside any
+    package and with no extension built, and one of them then loads
+    ``mok/ops.py`` itself behind a stubbed extension -- which the dispatcher
+    only tolerates once per process.
+    """
+    from . import ops
+
+    return ops
+
+
 @dataclass(frozen=True, slots=True)
 class KimiK3DecodeConfig:
     max_tokens: int = KIMI_K3_MAX_TOKENS
@@ -296,10 +312,8 @@ def clear_kimi_k3_decode_workspace_cache() -> None:
     if not workspaces:
         return
 
-    from .ops import barrier_all
-
     for workspace in workspaces:
-        barrier_all(
+        _operators().barrier_all(
             workspace.barrier_buffer,
             workspace.barrier_ptrs,
             workspace.barrier_multicast_ptr,
@@ -397,6 +411,95 @@ def validate_kimi_k3_decode_inputs(
     for name, tensor, _ in uint8_layouts:
         if tensor.dtype != torch.uint8:
             raise TypeError(f"{name} must have dtype torch.uint8")
+
+
+def kimi_k3_decode(
+    config: KimiK3DecodeConfig,
+    workspace: KimiK3DecodeWorkspace,
+    weights: KimiK3DecodeWeights,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    """Run one TP8 Kimi K3 decode step and return this rank's output view.
+
+    The whole step -- routing, the routed latent projection, the mixed W4A8
+    routed experts, the BF16 shared expert, and the TP8 tail -- is one launch
+    of one persistent kernel. The result is assembled in place in
+    ``workspace.output_mailbox``, and the ``[M, 7168]`` value returned here is
+    a view of that storage: this function allocates nothing and copies nothing,
+    and every rank returns the identical rows.
+
+    The workspace, the weights, and the hidden states have to describe the same
+    rank on the same device, because the kernel indexes the replicated latent-up
+    weight and the mailbox by ``tp_rank`` and reaches its peers through pointers
+    the workspace recorded at rendezvous. Mixing two of them is otherwise silent.
+    """
+    if not isinstance(config, KimiK3DecodeConfig):
+        raise TypeError("config must be a KimiK3DecodeConfig instance")
+    if not isinstance(workspace, KimiK3DecodeWorkspace):
+        raise TypeError("workspace must be a KimiK3DecodeWorkspace instance")
+    validate_kimi_k3_decode_inputs(hidden_states, weights)
+
+    if config.max_tokens != workspace.max_tokens:
+        raise ValueError(
+            f"config.max_tokens {config.max_tokens} must equal "
+            f"workspace.max_tokens {workspace.max_tokens}"
+        )
+    if workspace.tp_size != KIMI_K3_TP_SIZE:
+        raise ValueError(f"workspace must be TP{KIMI_K3_TP_SIZE}")
+    if weights.tp_rank != workspace.tp_rank:
+        raise ValueError(
+            f"weights.tp_rank {weights.tp_rank} must equal workspace.tp_rank "
+            f"{workspace.tp_rank}"
+        )
+    if hidden_states.device != workspace.device:
+        raise ValueError(
+            f"hidden_states must be on {workspace.device}, got "
+            f"{hidden_states.device}"
+        )
+
+    num_tokens = hidden_states.shape[0]
+    if num_tokens > workspace.max_tokens:
+        raise ValueError(
+            f"hidden_states token count {num_tokens} must not exceed "
+            f"workspace.max_tokens {workspace.max_tokens}"
+        )
+
+    _operators().kimi_k3_decode(
+        hidden_states,
+        weights.router_weight,
+        weights.router_correction_bias,
+        weights.routed_expert_down_proj,
+        weights.routed_expert_up_proj,
+        weights.routed_latent_rmsnorm_weight,
+        weights.expert_w1_packed,
+        weights.expert_w1_scale,
+        weights.expert_w3_packed,
+        weights.expert_w3_scale,
+        weights.expert_w2_packed,
+        weights.expert_w2_scale,
+        weights.shared_gate_proj,
+        weights.shared_up_proj,
+        weights.shared_down_proj,
+        workspace.scratch,
+        workspace.collective_buffer,
+        workspace.collective_ptrs,
+        workspace.collective_multicast_ptr,
+        workspace.output_mailbox,
+        workspace.output_mailbox_ptrs,
+        workspace.output_mailbox_multicast_ptr,
+        workspace.barrier_buffer,
+        workspace.barrier_ptrs,
+        workspace.barrier_multicast_ptr,
+        workspace.barrier_target,
+        workspace.error_flag,
+        workspace.tp_rank,
+        num_tokens,
+        workspace.workspace_signature,
+    )
+    tokens, ranks, shard_columns = workspace.output_mailbox.shape
+    return workspace.output_mailbox.view(
+        tokens, ranks * shard_columns
+    )[:num_tokens]
 
 
 def _validate_mxfp4_tensor(
@@ -835,6 +938,7 @@ __all__ = [
     "create_kimi_k3_decode_workspace",
     "dequant_kimi_k3_mxfp4",
     "get_kimi_k3_decode_workspace",
+    "kimi_k3_decode",
     "kimi_k3_moe_reference",
     "kimi_k3_rmsnorm_reference",
     "kimi_k3_router_reference",

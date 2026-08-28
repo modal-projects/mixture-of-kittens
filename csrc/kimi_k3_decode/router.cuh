@@ -139,9 +139,56 @@ static __device__ void build_assignments(
     }
 }
 
-/// Score all 896 experts for one token, publish its top-16 routes, and, on the
-/// last arriving CTA, publish the expert-major assignment table.
-static __device__ void route_token(
+/// Compact the experts that took at least one assignment into a work list.
+///
+/// The persistent kernel's routed-expert workers claim entries of this list
+/// instead of sweeping all 896 experts, so an empty expert costs a worker
+/// nothing. A token's sixteen routes are distinct experts, so no expert can
+/// collect more than `active_tokens` assignments and every entry is exactly one
+/// 128-row MMA batch, bounded by `expert_offsets[expert]` and
+/// `expert_offsets[expert + 1]`.
+///
+/// One warp compacts deterministically: lane `l` owns experts `[28l, 28l+28)`,
+/// a warp scan turns each lane's active count into its base position, and the
+/// last lane publishes the total. The caller must have just run
+/// `build_assignments` on the same shared buffer, which is what leaves the
+/// per-expert counts there; that call does not disturb them afterwards.
+static __device__ void build_expert_units(
+    const std::uint8_t *__restrict__ shared,
+    const Scratch &scratch
+) {
+    const int *const counts =
+        reinterpret_cast<const int *>(shared + kCountBytes);
+    const int thread = static_cast<int>(threadIdx.x);
+    if (thread >= 32) return;
+
+    constexpr int kPerLane = kNumExperts / 32;
+    const int lane = thread;
+    int active = 0;
+    for (int i = 0; i < kPerLane; i++) {
+        active += counts[lane * kPerLane + i] > 0 ? 1 : 0;
+    }
+    int inclusive = active;
+    #pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        const int carried = __shfl_up_sync(0xffffffffu, inclusive, offset);
+        if (lane >= offset) inclusive += carried;
+    }
+    int unit = inclusive - active;
+    for (int i = 0; i < kPerLane; i++) {
+        const int expert = lane * kPerLane + i;
+        if (counts[expert] <= 0) continue;
+        scratch.unit_expert[unit] = expert;
+        unit++;
+    }
+    if (lane == 31) scratch.phase[kActiveExpertUnits] = inclusive;
+}
+
+/// Score all 896 experts for one token and publish its top-16 routes.
+///
+/// `expert_ids_out` and `expert_weights_out` are the private stage's returned
+/// tensors; the persistent kernel has none and passes null.
+static __device__ void score_token(
     std::uint8_t *__restrict__ shared,
     const __nv_bfloat16 *__restrict__ hidden_states,
     const __nv_bfloat16 *__restrict__ router_weight,
@@ -149,8 +196,7 @@ static __device__ void route_token(
     const Scratch &scratch,
     int *__restrict__ expert_ids_out,
     float *__restrict__ expert_weights_out,
-    const int token,
-    const int active_tokens
+    const int token
 ) {
     __nv_bfloat16 *const hidden =
         reinterpret_cast<__nv_bfloat16 *>(shared + kHiddenBytes);
@@ -232,11 +278,31 @@ static __device__ void route_token(
 
     if (thread < kTopK) {
         const int route = token * kTopK + thread;
-        expert_ids_out[route] = selected_ids[thread];
-        expert_weights_out[route] = selected_weights[thread];
+        if (expert_ids_out != nullptr) {
+            expert_ids_out[route] = selected_ids[thread];
+            expert_weights_out[route] = selected_weights[thread];
+        }
         scratch.expert_ids[route] = selected_ids[thread];
         scratch.expert_weights[route] = selected_weights[thread];
     }
+}
+
+/// Score one token, then, on the last arriving CTA, publish the expert-major
+/// assignment table for the whole decode step.
+static __device__ void route_token(
+    std::uint8_t *__restrict__ shared,
+    const __nv_bfloat16 *__restrict__ hidden_states,
+    const __nv_bfloat16 *__restrict__ router_weight,
+    const float *__restrict__ router_correction_bias,
+    const Scratch &scratch,
+    int *__restrict__ expert_ids_out,
+    float *__restrict__ expert_weights_out,
+    const int token,
+    const int active_tokens
+) {
+    const int thread = static_cast<int>(threadIdx.x);
+    score_token(shared, hidden_states, router_weight, router_correction_bias,
+                scratch, expert_ids_out, expert_weights_out, token);
 
     // Every thread flushes its own route writes, and the barrier then holds the
     // ticket-taking thread until all of those flushes have landed device-wide.

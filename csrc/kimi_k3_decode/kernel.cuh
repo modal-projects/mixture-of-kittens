@@ -91,6 +91,10 @@ void route_and_project_tensor_kernel(
     const Scratch scratch = scratch_view(scratch_bytes);
     const int block = static_cast<int>(blockIdx.x);
 
+    // The managed allocator barriers the whole CTA, so every block provisions
+    // its tensor memory before the roles diverge.
+    kittens::tensor_allocator<1, 1> tensor_pool{};
+
     if (block < active_tokens) {
         router::route_token(reinterpret_cast<std::uint8_t *>(shared_raw),
                             hidden_states, router_weight, router_correction_bias,
@@ -104,8 +108,8 @@ void route_and_project_tensor_kernel(
         expert_ids, expert_weights, latent_x,
         projection_index * skinny_gemm::kTileN, skinny_gemm::kTileN,
         projection_index, skinny_gemm::kTensorCtas, active_tokens, tokens);
-    skinny_gemm::latent_down_tcgen05(shared_raw, hidden, weight, latent,
-                                     projection_index);
+    skinny_gemm::latent_down_tcgen05(shared_raw, tensor_pool, hidden, weight,
+                                     latent, projection_index);
     skinny_gemm::publish_projection_completion(scratch,
                                                skinny_gemm::kTensorCtas);
 }

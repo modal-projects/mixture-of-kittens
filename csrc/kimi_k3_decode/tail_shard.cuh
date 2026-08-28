@@ -131,8 +131,14 @@ static __device__ void shard_core(
     }
 }
 
+/// Contract one 128-column output tile of this rank's shard and multicast it.
+///
+/// `tensor_pool` is owned by the caller because a CTA may allocate tensor
+/// memory only once: the persistent kernel provisions it at entry and hands the
+/// same pool to every stage, and the private kernel provisions one of its own.
 static __device__ void shard_tensor(
     int *__restrict__ const shared_raw,
+    kittens::tensor_allocator<1, 1> &tensor_pool,
     const tensor_input_layout &normalized,
     const tensor_weight_layout &latent_up_proj,
     const Scratch &scratch,
@@ -163,8 +169,6 @@ static __device__ void shard_tensor(
     }
     __syncthreads();
 
-    // The managed allocator barriers the whole CTA, so both warpgroups enter.
-    tensor_allocator<1, 1> tensor_pool{};
     if (warpgroup::groupid() == 0) {
         tensor_accumulator_tile accumulator =
             tensor_pool.allocate<tensor_accumulator_tile>(0);

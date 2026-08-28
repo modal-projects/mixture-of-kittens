@@ -1,12 +1,14 @@
 """Shared fixtures, helpers, and layout constants for the Kimi K3 tail tests.
 
-The tail's tests live in two files: ``test_kimi_k3_collectives.py`` covers what
-the launch does on the device, and ``test_kimi_k3_tail_contract.py`` covers what
-the host boundary accepts and rejects. Both need the same eight-rank workspace,
-the same replicated weights, and the same NCCL reference, so everything they
-share is defined here and neither file owns the other's setup.
+The tail's tests live in three files: ``test_kimi_k3_collectives.py`` covers
+what the launch does on the device, ``test_kimi_k3_tail_contract.py`` covers
+what the host boundary accepts and rejects, and
+``test_kimi_k3_tail_signature.py`` covers the workspace signature that binds
+one rank's three symmetric allocations together. They need the same eight-rank
+workspace, the same replicated weights, and the same NCCL reference, so
+everything they share is defined here and no file owns another's setup.
 
-Both files need all eight ranks, so both must be launched through
+All three need all eight ranks, so all three must be launched through
 ``torchrun --standalone --nproc-per-node=8``. Each rank writes a *distinct*
 routed and shared partial into its own symmetric collective buffer; the tail is
 only correct when it reduces across ranks, so a rank-local implementation cannot
@@ -16,7 +18,7 @@ pass.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import pytest
 import torch
@@ -40,7 +42,7 @@ COLLECTIVE_COLUMNS = LATENT + HIDDEN
 SHARD = HIDDEN // KIMI_K3_TP_SIZE
 MAX_TOKENS = KIMI_K3_MAX_TOKENS
 ALIGNMENT = 256
-NUM_PHASE_COUNTERS = 32
+NUM_PHASE_COUNTERS = 64
 UINT32 = 1 << 32
 UINT32_MAX = UINT32 - 1
 UINT64_MAX = (1 << 64) - 1
@@ -126,6 +128,8 @@ def _scratch_layout() -> dict[str, tuple[int, int]]:
         ("shared_activated", MAX_TOKENS * 768 * 2),
         ("tail_normalized", MAX_TOKENS * LATENT * 2),
         ("tail_shared_shard", MAX_TOKENS * SHARD * 2),
+        ("latent_x", MAX_TOKENS * LATENT * 2),
+        ("unit_expert", 896 * 4),
     )
     layout: dict[str, tuple[int, int]] = {}
     cursor = 0
@@ -419,3 +423,104 @@ def _coded_reduction(
     ranks = torch.arange(KIMI_K3_TP_SIZE, device=device)
     total = float((1 + ranks).sum())
     return ((total + 1 + index.float()) / scale).bfloat16()
+
+
+# One row per symmetric allocation: the operator's tensor argument, its
+# peer-pointer list, its multicast pointer, the matching workspace attribute
+# names, and the byte boundary the device dereferences it on. The two BF16
+# allocations are read with 16-byte multimem octets; the barrier is one int32.
+_SYMMETRIC_FIELDS = (
+    (
+        "collective_buffer",
+        "collective_buffer_ptrs",
+        "collective_buffer_multicast_ptr",
+        "collective_buffer",
+        "collective_ptrs",
+        "collective_multicast_ptr",
+        16,
+    ),
+    (
+        "output_mailbox",
+        "output_mailbox_ptrs",
+        "output_mailbox_multicast_ptr",
+        "output_mailbox",
+        "output_mailbox_ptrs",
+        "output_mailbox_multicast_ptr",
+        16,
+    ),
+    (
+        "barrier_buffer",
+        "barrier_buffer_ptrs",
+        "barrier_buffer_multicast_ptr",
+        "barrier_buffer",
+        "barrier_ptrs",
+        "barrier_multicast_ptr",
+        4,
+    ),
+)
+
+
+def _symmetric_facts(
+    workspace: KimiK3DecodeWorkspace,
+) -> list[tuple[str, str, torch.Tensor, list[int], int, int]]:
+    """(list argument, multicast argument, tensor, ptrs, multicast, boundary)."""
+    facts = []
+    for (
+        _,
+        list_field,
+        multicast_field,
+        tensor_attribute,
+        list_attribute,
+        multicast_attribute,
+        alignment,
+    ) in _SYMMETRIC_FIELDS:
+        facts.append((
+            list_field,
+            multicast_field,
+            getattr(workspace, tensor_attribute),
+            list(getattr(workspace, list_attribute)),
+            int(getattr(workspace, multicast_attribute)),
+            alignment,
+        ))
+    return facts
+
+
+def _valid_arguments(
+    workspace: KimiK3DecodeWorkspace,
+    norm_weight: torch.Tensor,
+    latent_up: torch.Tensor,
+    active_tokens: int,
+) -> dict[str, object]:
+    return {
+        "routed_latent_rmsnorm_weight": norm_weight,
+        "latent_up_proj": latent_up,
+        "collective_buffer": workspace.collective_buffer,
+        "collective_buffer_ptrs": workspace.collective_ptrs,
+        "collective_buffer_multicast_ptr": workspace.collective_multicast_ptr,
+        "output_mailbox": workspace.output_mailbox,
+        "output_mailbox_ptrs": workspace.output_mailbox_ptrs,
+        "output_mailbox_multicast_ptr": (
+            workspace.output_mailbox_multicast_ptr
+        ),
+        "barrier_buffer": workspace.barrier_buffer,
+        "barrier_buffer_ptrs": workspace.barrier_ptrs,
+        "barrier_buffer_multicast_ptr": workspace.barrier_multicast_ptr,
+        "barrier_target": workspace.barrier_target,
+        "scratch": workspace.scratch,
+        "tp_rank": workspace.tp_rank,
+        "active_tokens": active_tokens,
+        "workspace_signature": workspace.workspace_signature,
+    }
+
+
+def _expect_rejection(
+    label: str, pattern: str, call: Callable[[], object]
+) -> None:
+    """Require one rejection, naming the substitution that was not caught."""
+    try:
+        with pytest.raises(RuntimeError, match=pattern):
+            call()
+    except BaseException as failure:
+        raise AssertionError(
+            f"{label}: expected a RuntimeError matching /{pattern}/"
+        ) from failure

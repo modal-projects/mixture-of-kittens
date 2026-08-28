@@ -198,10 +198,14 @@ static __device__ void latent_down_cuda_core(
 
 /// Project one 128-column latent tile with a two-stage tcgen05 BF16 pipeline.
 ///
-/// All 256 threads must enter so the tensor-memory allocator's CTA barrier is
-/// satisfied; the MMA pipeline and its epilogue then run on the first warpgroup.
+/// All 256 threads must enter so the CTA barriers below are satisfied; the MMA
+/// pipeline and its epilogue then run on the first warpgroup. `tensor_pool` is
+/// owned by the caller because a CTA may allocate tensor memory only once: the
+/// persistent kernel provisions it at entry and hands the same pool to every
+/// stage, and the private kernels provision one of their own.
 static __device__ void latent_down_tcgen05(
     int *__restrict__ shared,
+    kittens::tensor_allocator<1, 1> &tensor_pool,
     const hidden_layout &hidden,
     const weight_layout &weight,
     const latent_layout &latent,
@@ -228,8 +232,6 @@ static __device__ void latent_down_tcgen05(
     }
     __syncthreads();
 
-    // The managed allocator barriers the whole CTA, so both warpgroups enter.
-    tensor_allocator<1, 1> tensor_pool{};
     if (warpgroup::groupid() == 0) {
         accumulator_tile accumulator = tensor_pool.allocate<accumulator_tile>(0);
         const int warpgroup_lane = warpgroup::laneid();

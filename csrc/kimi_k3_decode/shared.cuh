@@ -528,8 +528,14 @@ static __device__ void down_core(
     }
 }
 
+/// Contract one 128-column output tile of a shared projection.
+///
+/// `tensor_pool` is owned by the caller because a CTA may allocate tensor
+/// memory only once: the persistent kernel provisions it at entry and hands the
+/// same pool to every stage, and the private kernels provision one of their own.
 static __device__ void project_tensor(
     int *__restrict__ shared_raw,
+    kittens::tensor_allocator<1, 1> &tensor_pool,
     const tensor_input_layout &input,
     const tensor_weight_layout &weight,
     const tensor_output_layout &output,
@@ -558,7 +564,6 @@ static __device__ void project_tensor(
     }
     __syncthreads();
 
-    tensor_allocator<1, 1> tensor_pool{};
     if (warpgroup::groupid() == 0) {
         tensor_accumulator_tile accumulator =
             tensor_pool.allocate<tensor_accumulator_tile>(0);
@@ -614,6 +619,7 @@ static __device__ void project_tensor(
 
 static __device__ void down_tensor(
     int *__restrict__ shared_raw,
+    kittens::tensor_allocator<1, 1> &tensor_pool,
     const tensor_input_layout &activated,
     const tensor_weight_layout &down_weight,
     __nv_bfloat16 *__restrict__ collective_buffer,
@@ -643,7 +649,6 @@ static __device__ void down_tensor(
     }
     __syncthreads();
 
-    tensor_allocator<1, 1> tensor_pool{};
     if (warpgroup::groupid() == 0) {
         tensor_accumulator_tile accumulator =
             tensor_pool.allocate<tensor_accumulator_tile>(0);
@@ -772,9 +777,14 @@ void shared_experts_tensor_kernel(
     extern __shared__ __align__(16) int shared_raw[];
     const Scratch scratch = scratch_view(scratch_bytes);
     const int block = static_cast<int>(blockIdx.x);
+
+    // The managed allocator barriers the whole CTA, so every block provisions
+    // its tensor memory before the roles diverge.
+    kittens::tensor_allocator<1, 1> tensor_pool{};
+
     if (block < kTensorUpBegin) {
         project_tensor(
-            shared_raw, hidden, shared_gate_proj, gate_output,
+            shared_raw, tensor_pool, hidden, shared_gate_proj, gate_output,
             block - kTensorGateBegin, kTensorGateKIterations);
         publish_phase(
             scratch,
@@ -785,7 +795,7 @@ void shared_experts_tensor_kernel(
     }
     if (block < kTensorActivationBegin) {
         project_tensor(
-            shared_raw, hidden, shared_up_proj, up_output,
+            shared_raw, tensor_pool, hidden, shared_up_proj, up_output,
             block - kTensorUpBegin, kTensorGateKIterations);
         publish_phase(
             scratch,
@@ -814,8 +824,8 @@ void shared_experts_tensor_kernel(
     wait_for_phase(
         scratch, kSharedActivationGeneration, kSharedDownGeneration);
     down_tensor(
-        shared_raw, activated, shared_down_proj, collective_buffer,
-        block - kTensorDownBegin, active_tokens, tokens);
+        shared_raw, tensor_pool, activated, shared_down_proj,
+        collective_buffer, block - kTensorDownBegin, active_tokens, tokens);
     publish_down(scratch, kTensorDownCtas);
 }
 

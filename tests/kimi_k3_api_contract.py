@@ -57,13 +57,30 @@ LOW_LEVEL_ARGUMENTS = (
     "collective_buffer_multicast_ptr",
     "output_mailbox",
     "output_mailbox_ptrs",
+    "output_mailbox_multicast_ptr",
     "barrier_buffer",
     "barrier_buffer_ptrs",
     "barrier_buffer_multicast_ptr",
+    "barrier_target",
     "error_flag",
     "tp_rank",
     "active_tokens",
+    "workspace_signature",
 )
+# Every tensor the step writes into, in schema order. A missing alias
+# annotation would let a compiler reorder the call against a reader of one of
+# these, which is exactly what the schema exists to prevent.
+LOW_LEVEL_MUTATED_ARGUMENTS = (
+    "scratch",
+    "collective_buffer",
+    "output_mailbox",
+    "barrier_buffer",
+    "barrier_target",
+    "error_flag",
+)
+# A fake trace has no addresses to fold, so it carries this placeholder in
+# place of a real workspace signature.
+TRACE_SIGNATURE = 0
 MXFP4_LAYOUTS = (
     ("expert_w1_packed", (896, 384, 1792)),
     ("expert_w1_scale", (896, 384, 112)),
@@ -107,9 +124,7 @@ def _load_contract_modules() -> tuple[ModuleType, ModuleType, ModuleType]:
     package.__path__ = [str(package_dir)]
     package.__package__ = "mok"
     extension = ModuleType("mok._C")
-    extension.kimi_k3_decode = lambda hidden_states, *args: torch.empty_like(
-        hidden_states
-    )
+    extension.kimi_k3_decode = lambda *args: None
     extension.kimi_k3_decode_workspace_bytes = lambda: 0
     package._C = extension
     sys.modules["mok"] = package
@@ -156,22 +171,29 @@ def _fake_operator_args(hidden_states: torch.Tensor) -> tuple[object, ...]:
     collective_buffer = hidden_states.new_empty((1,))
     output_mailbox = hidden_states.new_empty((1,))
     barrier_buffer = hidden_states.new_empty((1,), dtype=torch.int32)
+    barrier_target = hidden_states.new_empty((1,), dtype=torch.int32)
     error_flag = hidden_states.new_empty((1,), dtype=torch.int32)
+    # Distinct placeholder pointers and multicast aliases, because the
+    # operator's shape rules apply to a trace even though its address rules
+    # cannot.
     return (
         hidden_states,
         *weights,
         scratch,
         collective_buffer,
-        [1] * 8,
-        1,
+        list(range(16, 16 + 8 * 16, 16)),
+        1024,
         output_mailbox,
-        [1] * 8,
+        list(range(2048, 2048 + 8 * 16, 16)),
+        4096,
         barrier_buffer,
-        [1] * 8,
-        1,
+        list(range(8192, 8192 + 8 * 4, 4)),
+        8448,
+        barrier_target,
         error_flag,
         0,
         16,
+        TRACE_SIGNATURE,
     )
 
 
@@ -311,30 +333,53 @@ def check_decode_rejects_noncontiguous_hidden_states() -> None:
         kimi_k3.validate_kimi_k3_decode_hidden_states(hidden_states)
 
 
-def check_fake_decode_preserves_active_shape() -> None:
+def check_fake_decode_traces_and_returns_nothing() -> None:
+    """The step writes into the caller's mailbox, so a trace allocates nothing."""
     _, ops, _ = _load_contract_modules()
-    mode = FakeTensorMode()
-    with mode:
+    with FakeTensorMode():
         hidden_states = torch.empty(
             16, 7168, dtype=torch.bfloat16, device="cuda"
         )
-        output = ops.kimi_k3_decode(*_fake_operator_args(hidden_states))
+        assert ops.kimi_k3_decode(*_fake_operator_args(hidden_states)) is None
 
-    assert output.shape == (16, 7168)
-    assert output.dtype == torch.bfloat16
+
+def check_fake_decode_requires_the_placeholder_signature() -> None:
+    """A trace must carry the documented zero, not an invented value.
+
+    A trace's pointers are placeholders, so the operator cannot recompute a
+    signature from them. Accepting an arbitrary number there would let a
+    traced call carry a signature that was never checked against anything;
+    pinning it to zero keeps the placeholder a placeholder.
+    """
+    _, ops, _ = _load_contract_modules()
+    with FakeTensorMode():
+        hidden_states = torch.empty(
+            16, 7168, dtype=torch.bfloat16, device="cuda"
+        )
+        arguments = list(_fake_operator_args(hidden_states))
+        assert arguments[-1] == TRACE_SIGNATURE
+        arguments[-1] = 1
+        with pytest.raises(RuntimeError, match="while tracing fake tensors"):
+            ops.kimi_k3_decode(*arguments)
 
 
 def check_fake_decode_signature_matches_custom_op() -> None:
     _, _, fake_impls = _load_contract_modules()
+    schema = torch.ops.mok.kimi_k3_decode.default._schema
     schema_names = tuple(
-        argument.name
-        for argument in torch.ops.mok.kimi_k3_decode.default._schema.arguments
+        argument.name for argument in schema.arguments
     )
 
     assert schema_names == LOW_LEVEL_ARGUMENTS
     assert tuple(
         inspect.signature(fake_impls._kimi_k3_decode_fake).parameters
     ) == schema_names
+    assert schema.returns == []
+    assert tuple(
+        argument.name
+        for argument in schema.arguments
+        if argument.alias_info is not None and argument.alias_info.is_write
+    ) == LOW_LEVEL_MUTATED_ARGUMENTS
 
 
 CHECKS: dict[str, Callable[[], None]] = {
@@ -376,8 +421,10 @@ CHECKS: dict[str, Callable[[], None]] = {
         check_decode_rejects_non_bf16_hidden_states,
     "decode_rejects_noncontiguous_hidden_states":
         check_decode_rejects_noncontiguous_hidden_states,
-    "fake_decode_preserves_active_shape":
-        check_fake_decode_preserves_active_shape,
+    "fake_decode_traces_and_returns_nothing":
+        check_fake_decode_traces_and_returns_nothing,
+    "fake_decode_requires_the_placeholder_signature":
+        check_fake_decode_requires_the_placeholder_signature,
     "fake_decode_signature_matches_custom_op":
         check_fake_decode_signature_matches_custom_op,
 }

@@ -5,10 +5,16 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import fields
+from dataclasses import fields, replace
 
 import pytest
 import torch
+
+from mok.kimi_k3 import KimiK3DecodeWorkspace
+
+# The production decode step needs a rendezvoused TP8 workspace, and the tail
+# suite already owns the fixture that builds one.
+from .kimi_k3_tail_support import workspace  # noqa: F401
 
 
 KIMI_K3_GROUP_SIZE = 32
@@ -732,11 +738,20 @@ def test_prepare_weights_slices_routed_and_shared_tp_ranges(
 
 
 def test_prepare_weights_are_not_repacked_by_decode_calls(
-    device: torch.device,
+    workspace: KimiK3DecodeWorkspace,
     prepared_weights: PreparedWeights,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Preparation is one-time: the decode step reads the shard it was given.
+
+    The packer is the expensive part of preparation, so a hot path that
+    repacked -- or that quietly handed back a repacked copy -- would cost far
+    more than the step itself. Driving the real production call twice, with the
+    packer instrumented, is what rules that out; the tensors the second call
+    reads must still be the very ones preparation produced.
+    """
     from mok import ops
+    from mok.kimi_k3 import KimiK3DecodeConfig, kimi_k3_decode
 
     weights, _, _ = prepared_weights()
     packed_fields = (
@@ -757,36 +772,16 @@ def test_prepare_weights_are_not_repacked_by_decode_calls(
 
     monkeypatch.setattr(ops, "pack_kimi_k3_mxfp4", counting_pack)
 
-    hidden_states = torch.zeros(4, 7168, dtype=torch.bfloat16, device=device)
-    scratch = torch.zeros(256, dtype=torch.uint8, device=device)
-    collective_buffer = torch.zeros(1, dtype=torch.bfloat16, device=device)
-    output_mailbox = torch.zeros(1, dtype=torch.bfloat16, device=device)
-    barrier_buffer = torch.zeros(1, dtype=torch.int32, device=device)
-    error_flag = torch.zeros(1, dtype=torch.int32, device=device)
+    # The shard was prepared for one fixed rank so that its packed layout is
+    # comparable on every rank; the step only needs the rank it is told, and
+    # nothing here reads the values it computes.
+    local = replace(weights, tp_rank=workspace.tp_rank)
+    hidden_states = torch.zeros(
+        4, 7168, dtype=torch.bfloat16, device=workspace.device
+    )
     for _ in range(2):
-        output = ops.kimi_k3_decode(
-            hidden_states,
-            weights.router_weight,
-            weights.router_correction_bias,
-            weights.routed_expert_down_proj,
-            weights.routed_expert_up_proj,
-            weights.routed_latent_rmsnorm_weight,
-            *packed_fields,
-            weights.shared_gate_proj,
-            weights.shared_up_proj,
-            weights.shared_down_proj,
-            scratch,
-            collective_buffer,
-            [collective_buffer.data_ptr()] * 8,
-            collective_buffer.data_ptr(),
-            output_mailbox,
-            [output_mailbox.data_ptr()] * 8,
-            barrier_buffer,
-            [barrier_buffer.data_ptr()] * 8,
-            barrier_buffer.data_ptr(),
-            error_flag,
-            weights.tp_rank,
-            4,
+        output = kimi_k3_decode(
+            KimiK3DecodeConfig(), workspace, local, hidden_states
         )
         assert output.shape == (4, 7168)
 

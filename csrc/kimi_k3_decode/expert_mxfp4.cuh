@@ -416,15 +416,22 @@ __device__ __forceinline__ void store_accumulator(
     __syncthreads();
 }
 
+/// Quantize this worker's stride of the routed latent to MXFP8.
+///
+/// The private stage runs one CTA and passes `worker = 0, workers = 1`; the
+/// persistent kernel spreads the same groups over its whole resident grid.
 __device__ __forceinline__ void quantize_latent_rows(
     const __nv_bfloat16 *__restrict__ latent_x,
     const Scratch &scratch,
-    const int active_tokens
+    const int active_tokens,
+    const int worker,
+    const int workers
 ) {
     const int thread = static_cast<int>(threadIdx.x);
     const int total_groups = active_tokens * kLatentGroups;
-    for (int index = thread; index < total_groups;
-         index += kDecodeCtaThreads) {
+    for (int index = worker * kDecodeCtaThreads + thread;
+         index < total_groups;
+         index += workers * kDecodeCtaThreads) {
         const int token = index / kLatentGroups;
         const int group = index % kLatentGroups;
         float values[kMmaK];
@@ -526,22 +533,54 @@ __device__ __forceinline__ void accumulate_down_tile(
     }
 }
 
-static __global__ __launch_bounds__(kDecodeCtaThreads, 1)
-void kimi_k3_routed_experts_kernel(
-    const __nv_bfloat16 *__restrict__ latent_x,
+// ---------------------------------------------------------------------------
+// One routed-expert work unit.
+//
+// A unit is one 128-column output tile of one expert's assignment batch: three
+// gate/up units and twenty-eight down units per batch. The private stage below
+// walks every unit of every expert from a single CTA; the persistent kernel
+// hands the same units out through a device task queue. Both call the two
+// functions here, so the fallback and the production path contract identical
+// arithmetic in identical order.
+//
+// Each unit re-derives its shared tiles from the same base and re-initializes
+// its own semaphore, which is safe because a unit always waits for its last
+// commit before returning: nothing is ever in flight across the boundary.
+// ---------------------------------------------------------------------------
+
+/// Shared bytes one gate/up unit stages, which is the widest of any K3 stage.
+///
+/// The allocator aligns each object independently to 1 KiB, so this counts the
+/// padded sizes rather than the raw ones.
+inline constexpr int kGateUpUnitSharedBytes =
+    3 * static_cast<int>(sizeof(mixed_operand_tile))
+    + 3 * 1024
+    + 2 * static_cast<int>(sizeof(mixed_result_tile));
+
+static_assert(sizeof(mixed_operand_tile) == 4096);
+static_assert(sizeof(mixed_scale_tile) == 512);
+static_assert(sizeof(mixed_result_tile) == 65536);
+static_assert(kGateUpUnitSharedBytes == 146432);
+
+/// Contract one expert batch's gate and up tiles and stage the SiTU result.
+///
+/// `tensor_pool` is owned by the caller because a CTA may allocate tensor
+/// memory only once: the persistent kernel provisions one pool at entry and
+/// hands it to every unit, and the private kernel provisions one of its own.
+static __device__ void routed_gate_up_unit(
+    int *__restrict__ shared_raw,
+    kittens::tensor_allocator<1, 1> &tensor_pool,
     const std::uint8_t *__restrict__ expert_w1_packed,
     const std::uint8_t *__restrict__ expert_w1_scale,
     const std::uint8_t *__restrict__ expert_w3_packed,
     const std::uint8_t *__restrict__ expert_w3_scale,
-    const std::uint8_t *__restrict__ expert_w2_packed,
-    const std::uint8_t *__restrict__ expert_w2_scale,
-    __nv_bfloat16 *__restrict__ routed_output,
-    std::uint8_t *__restrict__ scratch_bytes,
-    const int active_tokens,
-    const int tokens
+    const Scratch &scratch,
+    const int expert,
+    const int assignment_begin,
+    const int batch_rows,
+    const int output_tile
 ) {
     using namespace kittens;
-    extern __shared__ __align__(16) int shared_raw[];
     tma_swizzle_allocator allocator(shared_raw);
     mixed_operand_tile (&activation_tile) =
         allocator.allocate<mixed_operand_tile>();
@@ -560,22 +599,176 @@ void kimi_k3_routed_experts_kernel(
     mixed_result_tile (&second_result_shared) =
         allocator.allocate<mixed_result_tile>();
 
-    __shared__ semaphore compute_done;
-    if (threadIdx.x == 0) init_semaphore(compute_done, 0, 1);
+    __shared__ semaphore gate_up_done;
+    const int thread = static_cast<int>(threadIdx.x);
+    if (thread == 0) init_semaphore(gate_up_done, 0, 1);
     __syncthreads();
 
-    tensor_allocator<1, 1> tensor_pool{};
     mixed_accumulator_tile first_accumulator =
         tensor_pool.allocate<mixed_accumulator_tile>(0);
     mixed_accumulator_tile second_accumulator =
         tensor_pool.allocate<mixed_accumulator_tile>(128);
-    auto activation_scale =
-        tensor_pool.allocate<full_tt_fp8e8m0<16>>(256);
-    auto first_scale =
-        tensor_pool.allocate<full_tt_fp8e8m0<16>>(260);
-    auto second_scale =
-        tensor_pool.allocate<full_tt_fp8e8m0<16>>(264);
+    auto activation_scale = tensor_pool.allocate<full_tt_fp8e8m0<16>>(256);
+    auto first_scale = tensor_pool.allocate<full_tt_fp8e8m0<16>>(260);
+    auto second_scale = tensor_pool.allocate<full_tt_fp8e8m0<16>>(264);
+
+    const int output_base = output_tile * kMmaN;
     int compute_phase = 0;
+    for (int k_group = 0; k_group < kLatentGroups; ++k_group) {
+        load_quantized_activation_tile(
+            activation_tile, activation_scale_shared, scratch,
+            assignment_begin, batch_rows, k_group, false);
+        load_mxfp4_weight_tile(
+            first_weight_tile, first_scale_shared, expert_w1_packed,
+            expert_w1_scale, expert, kExpertW1W3PackedRows,
+            kExpertW1W3PackedColumns, kExpertW1W3ScaleColumns, output_base,
+            k_group);
+        load_mxfp4_weight_tile(
+            second_weight_tile, second_scale_shared, expert_w3_packed,
+            expert_w3_scale, expert, kExpertW1W3PackedRows,
+            kExpertW1W3PackedColumns, kExpertW1W3ScaleColumns, output_base,
+            k_group);
+        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+        __syncthreads();
+        if (warpid() == 0) {
+            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+            load_mxnv_scale_async(activation_scale, activation_scale_shared);
+            load_mxnv_scale_async(first_scale, first_scale_shared);
+            load_mxnv_scale_async(second_scale, second_scale_shared);
+            tensor_store_wait();
+        }
+        __syncthreads();
+        if (thread == 0) {
+            if (k_group == 0) {
+                mixed_mma<0, false>(
+                    first_accumulator, activation_tile, first_weight_tile,
+                    activation_scale, first_scale);
+                mixed_mma<0, false>(
+                    second_accumulator, activation_tile, second_weight_tile,
+                    activation_scale, second_scale);
+            } else {
+                mixed_mma<0, true>(
+                    first_accumulator, activation_tile, first_weight_tile,
+                    activation_scale, first_scale);
+                mixed_mma<0, true>(
+                    second_accumulator, activation_tile, second_weight_tile,
+                    activation_scale, second_scale);
+            }
+            detail::tcgen05::commit<1>(gate_up_done);
+        }
+        wait(gate_up_done, compute_phase);
+        __syncthreads();
+        compute_phase ^= 1;
+    }
+
+    store_accumulator(first_accumulator, first_result_shared);
+    store_accumulator(second_accumulator, second_result_shared);
+    quantize_situ_tile(
+        first_result_shared, second_result_shared, scratch, assignment_begin,
+        batch_rows, output_base);
+    __syncthreads();
+}
+
+/// Contract one expert batch's down tile and weight it into the accumulator.
+static __device__ void routed_down_unit(
+    int *__restrict__ shared_raw,
+    kittens::tensor_allocator<1, 1> &tensor_pool,
+    const std::uint8_t *__restrict__ expert_w2_packed,
+    const std::uint8_t *__restrict__ expert_w2_scale,
+    const Scratch &scratch,
+    const int expert,
+    const int assignment_begin,
+    const int batch_rows,
+    const int output_tile,
+    const int active_tokens
+) {
+    using namespace kittens;
+    tma_swizzle_allocator allocator(shared_raw);
+    mixed_operand_tile (&activation_tile) =
+        allocator.allocate<mixed_operand_tile>();
+    mixed_operand_tile (&weight_tile) =
+        allocator.allocate<mixed_operand_tile>();
+    mixed_scale_tile (&activation_scale_shared) =
+        allocator.allocate<mixed_scale_tile>();
+    mixed_scale_tile (&weight_scale_shared) =
+        allocator.allocate<mixed_scale_tile>();
+    mixed_result_tile (&result_shared) =
+        allocator.allocate<mixed_result_tile>();
+
+    __shared__ semaphore down_done;
+    const int thread = static_cast<int>(threadIdx.x);
+    if (thread == 0) init_semaphore(down_done, 0, 1);
+    __syncthreads();
+
+    mixed_accumulator_tile accumulator =
+        tensor_pool.allocate<mixed_accumulator_tile>(0);
+    auto activation_scale = tensor_pool.allocate<full_tt_fp8e8m0<16>>(256);
+    auto weight_scale = tensor_pool.allocate<full_tt_fp8e8m0<16>>(260);
+
+    const int output_base = output_tile * kMmaN;
+    int compute_phase = 0;
+    for (int k_group = 0; k_group < kSituGroups; ++k_group) {
+        load_quantized_activation_tile(
+            activation_tile, activation_scale_shared, scratch,
+            assignment_begin, batch_rows, k_group, true);
+        load_mxfp4_weight_tile(
+            weight_tile, weight_scale_shared, expert_w2_packed,
+            expert_w2_scale, expert, kExpertW2PackedRows,
+            kExpertW2PackedColumns, kExpertW2ScaleColumns, output_base,
+            k_group);
+        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+        __syncthreads();
+        if (warpid() == 0) {
+            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+            load_mxnv_scale_async(activation_scale, activation_scale_shared);
+            load_mxnv_scale_async(weight_scale, weight_scale_shared);
+            tensor_store_wait();
+        }
+        __syncthreads();
+        if (thread == 0) {
+            if (k_group == 0) {
+                mixed_mma<0, false>(
+                    accumulator, activation_tile, weight_tile,
+                    activation_scale, weight_scale);
+            } else {
+                mixed_mma<0, true>(
+                    accumulator, activation_tile, weight_tile,
+                    activation_scale, weight_scale);
+            }
+            detail::tcgen05::commit<1>(down_done);
+        }
+        wait(down_done, compute_phase);
+        __syncthreads();
+        compute_phase ^= 1;
+    }
+
+    store_accumulator(accumulator, result_shared);
+    accumulate_down_tile(
+        result_shared, scratch, assignment_begin, batch_rows, output_base,
+        active_tokens);
+    __syncthreads();
+}
+
+static __global__ __launch_bounds__(kDecodeCtaThreads, 1)
+void kimi_k3_routed_experts_kernel(
+    const __nv_bfloat16 *__restrict__ latent_x,
+    const std::uint8_t *__restrict__ expert_w1_packed,
+    const std::uint8_t *__restrict__ expert_w1_scale,
+    const std::uint8_t *__restrict__ expert_w3_packed,
+    const std::uint8_t *__restrict__ expert_w3_scale,
+    const std::uint8_t *__restrict__ expert_w2_packed,
+    const std::uint8_t *__restrict__ expert_w2_scale,
+    __nv_bfloat16 *__restrict__ routed_output,
+    std::uint8_t *__restrict__ scratch_bytes,
+    const int active_tokens,
+    const int tokens
+) {
+    using namespace kittens;
+    extern __shared__ __align__(16) int shared_raw[];
+
+    // The managed allocator barriers the whole CTA, so provisioning it here
+    // covers every unit this block later runs.
+    tensor_allocator<1, 1> tensor_pool{};
 
     const Scratch scratch = scratch_view(scratch_bytes);
     const int thread = static_cast<int>(threadIdx.x);
@@ -591,7 +784,7 @@ void kimi_k3_routed_experts_kernel(
     }
     __syncthreads();
 
-    quantize_latent_rows(latent_x, scratch, active_tokens);
+    quantize_latent_rows(latent_x, scratch, active_tokens, 0, 1);
     // Every thread flushes its own MXFP8 writes, and the barrier then holds the
     // publishing thread until all of those flushes have landed device-wide, so a
     // consumer that sees the new generation cannot read a stale block.
@@ -621,124 +814,18 @@ void kimi_k3_routed_experts_kernel(
 
             for (int output_tile = 0; output_tile < kGateUpTiles;
                  ++output_tile) {
-                const int output_base = output_tile * kMmaN;
-                for (int k_group = 0; k_group < kLatentGroups; ++k_group) {
-                    load_quantized_activation_tile(
-                        activation_tile, activation_scale_shared, scratch,
-                        assignment_begin, batch_rows, k_group, false);
-                    load_mxfp4_weight_tile(
-                        first_weight_tile, first_scale_shared,
-                        expert_w1_packed, expert_w1_scale, expert,
-                        kExpertW1W3PackedRows,
-                        kExpertW1W3PackedColumns,
-                        kExpertW1W3ScaleColumns,
-                        output_base, k_group);
-                    load_mxfp4_weight_tile(
-                        second_weight_tile, second_scale_shared,
-                        expert_w3_packed, expert_w3_scale, expert,
-                        kExpertW1W3PackedRows,
-                        kExpertW1W3PackedColumns,
-                        kExpertW1W3ScaleColumns,
-                        output_base, k_group);
-                    asm volatile(
-                        "fence.proxy.async.shared::cta;\n" ::: "memory");
-                    __syncthreads();
-                    if (warpid() == 0) {
-                        asm volatile(
-                            "fence.proxy.async.shared::cta;\n" ::: "memory");
-                        load_mxnv_scale_async(
-                            activation_scale, activation_scale_shared);
-                        load_mxnv_scale_async(
-                            first_scale, first_scale_shared);
-                        load_mxnv_scale_async(
-                            second_scale, second_scale_shared);
-                        tensor_store_wait();
-                    }
-                    __syncthreads();
-                    if (thread == 0) {
-                        if (k_group == 0) {
-                            mixed_mma<0, false>(
-                                first_accumulator, activation_tile,
-                                first_weight_tile, activation_scale,
-                                first_scale);
-                            mixed_mma<0, false>(
-                                second_accumulator, activation_tile,
-                                second_weight_tile, activation_scale,
-                                second_scale);
-                        } else {
-                            mixed_mma<0, true>(
-                                first_accumulator, activation_tile,
-                                first_weight_tile, activation_scale,
-                                first_scale);
-                            mixed_mma<0, true>(
-                                second_accumulator, activation_tile,
-                                second_weight_tile, activation_scale,
-                                second_scale);
-                        }
-                        detail::tcgen05::commit<1>(compute_done);
-                    }
-                    wait(compute_done, compute_phase);
-                    __syncthreads();
-                    compute_phase ^= 1;
-                }
-                store_accumulator(first_accumulator, first_result_shared);
-                store_accumulator(second_accumulator, second_result_shared);
-                quantize_situ_tile(
-                    first_result_shared, second_result_shared, scratch,
-                    assignment_begin, batch_rows, output_base);
-                __syncthreads();
+                routed_gate_up_unit(
+                    shared_raw, tensor_pool, expert_w1_packed, expert_w1_scale,
+                    expert_w3_packed, expert_w3_scale, scratch, expert,
+                    assignment_begin, batch_rows, output_tile);
             }
 
             for (int output_tile = 0; output_tile < kDownTiles;
                  ++output_tile) {
-                const int output_base = output_tile * kMmaN;
-                for (int k_group = 0; k_group < kSituGroups; ++k_group) {
-                    load_quantized_activation_tile(
-                        activation_tile, activation_scale_shared, scratch,
-                        assignment_begin, batch_rows, k_group, true);
-                    load_mxfp4_weight_tile(
-                        first_weight_tile, first_scale_shared,
-                        expert_w2_packed, expert_w2_scale, expert,
-                        kExpertW2PackedRows,
-                        kExpertW2PackedColumns,
-                        kExpertW2ScaleColumns,
-                        output_base, k_group);
-                    asm volatile(
-                        "fence.proxy.async.shared::cta;\n" ::: "memory");
-                    __syncthreads();
-                    if (warpid() == 0) {
-                        asm volatile(
-                            "fence.proxy.async.shared::cta;\n" ::: "memory");
-                        load_mxnv_scale_async(
-                            activation_scale, activation_scale_shared);
-                        load_mxnv_scale_async(
-                            first_scale, first_scale_shared);
-                        tensor_store_wait();
-                    }
-                    __syncthreads();
-                    if (thread == 0) {
-                        if (k_group == 0) {
-                            mixed_mma<0, false>(
-                                first_accumulator, activation_tile,
-                                first_weight_tile, activation_scale,
-                                first_scale);
-                        } else {
-                            mixed_mma<0, true>(
-                                first_accumulator, activation_tile,
-                                first_weight_tile, activation_scale,
-                                first_scale);
-                        }
-                        detail::tcgen05::commit<1>(compute_done);
-                    }
-                    wait(compute_done, compute_phase);
-                    __syncthreads();
-                    compute_phase ^= 1;
-                }
-                store_accumulator(first_accumulator, first_result_shared);
-                accumulate_down_tile(
-                    first_result_shared, scratch, assignment_begin,
-                    batch_rows, output_base, active_tokens);
-                __syncthreads();
+                routed_down_unit(
+                    shared_raw, tensor_pool, expert_w2_packed, expert_w2_scale,
+                    scratch, expert, assignment_begin, batch_rows, output_tile,
+                    active_tokens);
             }
         }
     }
