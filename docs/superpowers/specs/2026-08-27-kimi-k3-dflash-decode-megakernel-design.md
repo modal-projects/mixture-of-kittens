@@ -257,6 +257,11 @@ activations, counters, and cached pointer lists. The low-level custom op in
 `mok/ops.py` accepts unpacked tensors and pointers for compatibility with
 `torch.library` and `torch.compile`.
 
+The symmetric output mailbox uses token-major BF16 layout `[128, 8, 896]`.
+After every rank publishes its 896-column shard, the same storage is a
+contiguous `[128, 7168]` view. Returning its active rows therefore requires no
+output allocation or copy.
+
 The operator is inference-only and registered with a fake implementation that
 returns BF16 `[M, 7168]`.
 

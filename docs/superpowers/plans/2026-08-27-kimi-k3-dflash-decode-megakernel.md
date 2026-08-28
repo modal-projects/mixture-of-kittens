@@ -362,7 +362,8 @@ class KimiK3DecodeWorkspace:
 ```
 
 Allocate `collective_buffer` as BF16 `[128, 10752]`, where 10752 is
-`3584 + 7168`. Allocate `output_mailbox` as BF16 `[8, 128, 896]`. Allocate
+`3584 + 7168`. Allocate `output_mailbox` as BF16 `[128, 8, 896]`, so its
+token-major storage is also a contiguous `[128, 7168]` final-output view. Allocate
 `barrier_buffer` as int32 `[1]`; generation-tagged phase counters live in the
 local scratch tensor. Size scratch with `_C.kimi_k3_decode_workspace_bytes()`.
 Obtain pointer lists and multicast pointers from
@@ -752,6 +753,13 @@ git commit -m "feat: add Kimi K3 shared expert branch"
 **Files:**
 - Create: `csrc/kimi_k3_decode/collectives.cuh`
 - Modify: `csrc/kimi_k3_decode/kernel.cuh`
+- Modify: `csrc/kimi_k3_decode/types.cuh`
+- Modify: `csrc/kimi_k3_decode/entrypoints.cuh`
+- Modify: `csrc/bindings.cu`
+- Modify: `mok/kimi_k3.py`
+- Modify: `mok/ops.py`
+- Modify: `mok/_fake_impls.py`
+- Modify: `tests/test_kimi_k3_api.py`
 - Create: `tests/test_kimi_k3_collectives.py`
 
 **Interfaces:**
@@ -770,7 +778,8 @@ and all-gather reference for `M=1,5,16,64,128`.
 Run:
 
 ```bash
-torchrun --standalone --nproc-per-node=8 -m pytest -q tests/test_kimi_k3_collectives.py
+source .venv/bin/activate
+script -qec "modal shell --env rahul-dev modal_app.py::bench --cmd 'cd /root/mok && torchrun --standalone --nproc-per-node=8 -m pytest -q tests/test_kimi_k3_collectives.py'" /dev/null
 ```
 
 Expected: the tail output is unavailable.
@@ -787,12 +796,26 @@ contiguous `[896,3584]` row slice of the replicated latent-up weight, beta-adds
 its `[M,896]` shared shard, writes its output shard to every peer's rank slot,
 then assembles all eight slots into `[M,7168]`.
 
+Migrate `KimiK3DecodeWorkspace.output_mailbox` to token-major BF16
+`[128,8,896]`. Each rank multicasts its `[M,896]` output shard into mailbox
+slot `[:,tp_rank,:]`; after the device barrier, the same allocation is viewed
+without a copy as contiguous `[128,7168]`. The production path returns an
+active-row alias of this workspace storage and does not allocate an output.
+
+Add a private `mok::_kimi_k3_tail` operator across Python, fake, C++, and
+pybind. It consumes the routed/shared partials in the symmetric collective
+buffer, replicated RMSNorm and latent-up weights, output mailbox pointers,
+barrier state, scratch, TP rank, and active token count. It performs the full
+tail in exactly one launch and returns the active contiguous output alias for
+tests. Task 9 invokes the same device implementation from the final grid.
+
 - [ ] **Step 4: Run collective tests and graph replay**
 
 Run:
 
 ```bash
-torchrun --standalone --nproc-per-node=8 -m pytest -q tests/test_kimi_k3_collectives.py
+source .venv/bin/activate
+script -qec "modal shell --env rahul-dev modal_app.py::bench --cmd 'cd /root/mok && torchrun --standalone --nproc-per-node=8 -m pytest -q tests/test_kimi_k3_collectives.py'" /dev/null
 ```
 
 Expected: every rank matches the NCCL reference; 1,000 graph replays complete
@@ -801,7 +824,7 @@ without deadlock or stale-generation output.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add csrc/kimi_k3_decode/collectives.cuh csrc/kimi_k3_decode/kernel.cuh tests/test_kimi_k3_collectives.py
+git add csrc/kimi_k3_decode csrc/bindings.cu mok/kimi_k3.py mok/ops.py mok/_fake_impls.py tests/test_kimi_k3_api.py tests/test_kimi_k3_collectives.py
 git commit -m "feat: fuse Kimi K3 TP8 latent MoE tail"
 ```
 
