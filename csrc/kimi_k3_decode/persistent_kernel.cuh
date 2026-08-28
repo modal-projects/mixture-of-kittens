@@ -25,8 +25,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <tuple>
 #include <type_traits>
+#include <vector>
 
 namespace kimi_k3_decode {
 namespace persistent {
@@ -224,6 +226,43 @@ inline std::int64_t benchmark_grid_ctas_for_testing() {
     return benchmark_grid_ctas_storage().load(std::memory_order_relaxed);
 }
 
+/// Whether this process collects the kernel's phase clocks.
+///
+/// Guarded exactly like the grid override, and for the same reason: the
+/// accumulators are a benchmark instrument, and a production launch must not
+/// be able to turn them on by accident and pay their atomics.
+static __host__ std::atomic<int> &benchmark_phase_profile_storage() {
+    static std::atomic<int> profile{0};
+    return profile;
+}
+
+inline bool benchmark_phase_profile_enabled() {
+    if (!benchmark_grid_tuning_enabled()) return false;
+    return benchmark_phase_profile_storage().load(std::memory_order_relaxed)
+        != 0;
+}
+
+inline void set_benchmark_phase_profile_for_testing(const bool enabled) {
+    TORCH_CHECK(
+        benchmark_grid_tuning_enabled(),
+        "MoK: Kimi K3 phase profiling is benchmark-only; set "
+        "MOK_KIMI_K3_ENABLE_GRID_TUNING=1 in a dedicated benchmark process");
+    benchmark_phase_profile_storage().store(
+        enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+inline bool benchmark_phase_profile_for_testing() {
+    return benchmark_phase_profile_enabled();
+}
+
+/// The accumulators' scratch band and their names, for the reader.
+inline std::tuple<std::int64_t, std::vector<std::string>>
+phase_clock_metadata_for_testing() {
+    std::vector<std::string> names;
+    for (const char *const name : kPhaseClockNames) names.emplace_back(name);
+    return {static_cast<std::int64_t>(kPhaseClockBegin), names};
+}
+
 inline void set_benchmark_grid_ctas_for_testing(const std::int64_t grid_ctas) {
     TORCH_CHECK(
         benchmark_grid_tuning_enabled(),
@@ -323,7 +362,8 @@ void kimi_k3_decode_persistent_kernel(
     std::uint8_t *__restrict__ scratch_bytes,
     int *__restrict__ error_flag,
     const int tp_rank,
-    const int active_tokens
+    const int active_tokens,
+    const int profile_phases
 ) {
     extern __shared__ __align__(16) int shared_raw[];
     std::uint8_t *const shared = reinterpret_cast<std::uint8_t *>(shared_raw);
@@ -331,9 +371,11 @@ void kimi_k3_decode_persistent_kernel(
     __shared__ int claim_slot;
 
     const Scratch scratch = scratch_view(scratch_bytes);
+    const PhaseClocks clocks = phase_clocks(scratch, profile_phases != 0);
     const int block = static_cast<int>(blockIdx.x);
     const int thread = static_cast<int>(threadIdx.x);
     const int grid_ctas = static_cast<int>(gridDim.x);
+    unsigned long long mark = clocks.now();
 
     // The managed allocator barriers the whole CTA and a CTA may allocate
     // tensor memory only once, so the pool is provisioned here, before any
@@ -358,13 +400,20 @@ void kimi_k3_decode_persistent_kernel(
                 &scratch.phase[cleared_counter(thread)]),
             0u);
     }
+    // The accumulators are cleared alongside the queues so a profiled replay
+    // reports its own cycles rather than every replay the graph ever made.
+    if (clocks.enabled() && block == 0 && thread < kPhaseClockCount) {
+        clocks.counters[thread] = 0ull;
+    }
     const int routed_values = active_tokens * kLatentSize;
     for (int index = block * kDecodeCtaThreads + thread;
          index < routed_values;
          index += grid_ctas * kDecodeCtaThreads) {
         scratch.routed_accumulator[index] = 0.0f;
     }
+    mark = clocks.lap(kClockQueueClear, mark);
     grid_barrier(scratch, error_flag, grid, grid_ctas);
+    mark = clocks.lap(kClockGridBarrier, mark);
 
     // -----------------------------------------------------------------------
     // Phase 1: score every token and project the routed latent.
@@ -382,7 +431,11 @@ void kimi_k3_decode_persistent_kernel(
                 router::score_token(
                     shared, hidden_states, router_weight,
                     router_correction_bias, scratch, nullptr, nullptr, unit);
-            } else if constexpr (TENSOR_PATH) {
+                __syncthreads();
+                mark = clocks.lap(kClockRouterScore, mark);
+                continue;
+            }
+            if constexpr (TENSOR_PATH) {
                 skinny_gemm::latent_down_tcgen05(
                     shared_raw, tensor_pool, layouts.hidden,
                     layouts.latent_down, layouts.latent, unit - active_tokens);
@@ -393,9 +446,11 @@ void kimi_k3_decode_persistent_kernel(
                     scratch.latent_x, unit - active_tokens, active_tokens);
             }
             __syncthreads();
+            mark = clocks.lap(kClockLatentProject, mark);
         }
     }
     grid_barrier(scratch, error_flag, grid, grid_ctas);
+    mark = clocks.lap(kClockGridBarrier, mark);
 
     // -----------------------------------------------------------------------
     // Phase 2: build the assignment table while the grid quantizes the latent.
@@ -408,12 +463,17 @@ void kimi_k3_decode_persistent_kernel(
         router::build_assignments(shared, scratch, active_tokens);
         __syncthreads();
         router::build_expert_units(shared, scratch);
+        __syncthreads();
+        mark = clocks.lap(kClockAssignments, mark);
     } else {
         expert_mxfp4::quantize_latent_rows(
             scratch.latent_x, scratch, active_tokens, block - 1,
             grid_ctas - 1);
+        __syncthreads();
+        mark = clocks.lap(kClockLatentQuantize, mark);
     }
     grid_barrier(scratch, error_flag, grid, grid_ctas);
+    mark = clocks.lap(kClockGridBarrier, mark);
 
     // Read past L1 and clamp: the count steers two queue lengths, and a queue
     // longer than the table behind it would index that table out of bounds.
@@ -453,21 +513,25 @@ void kimi_k3_decode_persistent_kernel(
                         shared, hidden_states, shared_gate_proj, shared_up_proj,
                         scratch, unit, active_tokens);
                 }
-            } else {
-                const int routed = unit - shared_units;
-                const int expert =
-                    scratch.unit_expert[routed / expert_mxfp4::kGateUpTiles];
-                const int begin = scratch.expert_offsets[expert];
-                expert_mxfp4::routed_gate_up_unit(
-                    shared_raw, tensor_pool, expert_w1_packed, expert_w1_scale,
-                    expert_w3_packed, expert_w3_scale, scratch, expert, begin,
-                    scratch.expert_offsets[expert + 1] - begin,
-                    routed % expert_mxfp4::kGateUpTiles);
+                __syncthreads();
+                mark = clocks.lap(kClockSharedExperts, mark);
+                continue;
             }
+            const int routed = unit - shared_units;
+            const int expert =
+                scratch.unit_expert[routed / expert_mxfp4::kGateUpTiles];
+            const int begin = scratch.expert_offsets[expert];
+            expert_mxfp4::routed_gate_up_unit(
+                shared_raw, tensor_pool, expert_w1_packed, expert_w1_scale,
+                expert_w3_packed, expert_w3_scale, scratch, expert, begin,
+                scratch.expert_offsets[expert + 1] - begin,
+                routed % expert_mxfp4::kGateUpTiles, clocks);
             __syncthreads();
+            mark = clocks.lap(kClockRoutedGateUp, mark);
         }
     }
     grid_barrier(scratch, error_flag, grid, grid_ctas);
+    mark = clocks.lap(kClockGridBarrier, mark);
 
     // -----------------------------------------------------------------------
     // Phase 4: shared activation, the shared down units, and routed down units.
@@ -491,40 +555,43 @@ void kimi_k3_decode_persistent_kernel(
         int unit;
         while ((unit = claim_unit(
                     scratch, kDownQueue, units, &claim_slot)) >= 0) {
-            if (unit < activation_units) {
-                shared_experts::activate_shared_tile(
-                    scratch, unit, active_tokens);
-                publish_count(scratch, kActivationArrivals);
-            } else if (unit < shared_units) {
-                const int column_block = unit - activation_units;
-                if constexpr (TENSOR_PATH) {
+            if (unit < shared_units) {
+                if (unit < activation_units) {
+                    shared_experts::activate_shared_tile(
+                        scratch, unit, active_tokens);
+                    publish_count(scratch, kActivationArrivals);
+                } else if constexpr (TENSOR_PATH) {
                     wait_for_count(
                         scratch, error_flag, kActivationArrivals,
                         activation_units, kErrorPersistentActivation);
                     shared_experts::down_tensor(
                         shared_raw, tensor_pool, layouts.activated,
-                        layouts.shared_down, collective_buffer, column_block,
-                        active_tokens, active_tokens);
+                        layouts.shared_down, collective_buffer,
+                        unit - activation_units, active_tokens, active_tokens);
                 } else {
                     shared_experts::down_core<kMaxCoreCapacity>(
                         shared, scratch, shared_down_proj, collective_buffer,
-                        column_block, active_tokens, active_tokens);
+                        unit - activation_units, active_tokens, active_tokens);
                 }
-            } else {
-                const int routed = unit - shared_units;
-                const int expert =
-                    scratch.unit_expert[routed / expert_mxfp4::kDownTiles];
-                const int begin = scratch.expert_offsets[expert];
-                expert_mxfp4::routed_down_unit(
-                    shared_raw, tensor_pool, expert_w2_packed, expert_w2_scale,
-                    scratch, expert, begin,
-                    scratch.expert_offsets[expert + 1] - begin,
-                    routed % expert_mxfp4::kDownTiles, active_tokens);
+                __syncthreads();
+                mark = clocks.lap(kClockSharedExperts, mark);
+                continue;
             }
+            const int routed = unit - shared_units;
+            const int expert =
+                scratch.unit_expert[routed / expert_mxfp4::kDownTiles];
+            const int begin = scratch.expert_offsets[expert];
+            expert_mxfp4::routed_down_unit(
+                shared_raw, tensor_pool, expert_w2_packed, expert_w2_scale,
+                scratch, expert, begin,
+                scratch.expert_offsets[expert + 1] - begin,
+                routed % expert_mxfp4::kDownTiles, active_tokens, clocks);
             __syncthreads();
+            mark = clocks.lap(kClockRoutedDown, mark);
         }
     }
     grid_barrier(scratch, error_flag, grid, grid_ctas);
+    mark = clocks.lap(kClockGridBarrier, mark);
 
     // -----------------------------------------------------------------------
     // Phase 5: publish this rank's routed partial next to its shared partial.
@@ -545,6 +612,7 @@ void kimi_k3_decode_persistent_kernel(
     // buffer is visible to its peers before its coordinator opens the entry
     // rendezvous that tells them it is.
     grid_barrier(scratch, error_flag, grid, grid_ctas);
+    mark = clocks.lap(kClockGridBarrier, mark);
 
     // -----------------------------------------------------------------------
     // Phase 6: the fused TP8 tail, on the CTAs that carry its three roles.
@@ -554,6 +622,7 @@ void kimi_k3_decode_persistent_kernel(
     if (block < tail::kReduceBegin) {
         tail::coordinate_ranks(scratch, error_flag, barrier_multicast,
                                barrier_local, barrier_target);
+        clocks.lap(kClockTail, mark);
         return;
     }
     if (block >= tail::kShardBegin + shard_ctas) return;
@@ -590,6 +659,7 @@ void kimi_k3_decode_persistent_kernel(
 
     tail::drain_ranks(scratch, error_flag, &latch_slot,
                       tail::kReduceCtas + shard_ctas);
+    clocks.lap(kClockTail, mark);
 }
 
 // ---------------------------------------------------------------------------
@@ -722,6 +792,7 @@ struct LaunchArguments {
     int active_tokens;
     int available_sms;
     int grid_ctas;
+    int profile_phases;
 };
 
 template<bool TENSOR_PATH>
@@ -775,7 +846,8 @@ static __host__ void launch_persistent(
             reinterpret_cast<std::uint8_t *>(arguments.scratch.data_ptr()),
             reinterpret_cast<int *>(arguments.error_flag.data_ptr()),
             arguments.tp_rank,
-            arguments.active_tokens);
+            arguments.active_tokens,
+            arguments.profile_phases);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

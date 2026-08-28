@@ -979,6 +979,7 @@ static __host__ void kimi_k3_decode_entrypoint(
         static_cast<int>(active_tokens),
         properties.multiProcessorCount,
         static_cast<int>(persistent::benchmark_grid_ctas_for_testing()),
+        persistent::benchmark_phase_profile_enabled() ? 1 : 0,
     });
 }
 

@@ -45,6 +45,47 @@ def decode_step(
     return result
 
 
+@contextlib.contextmanager
+def phase_profiling() -> Iterator[None]:
+    """Turn the kernel's clock64 accumulators on for the enclosed calls.
+
+    The extension refuses the switch outside a benchmark process, so the guard
+    is set here rather than expected of the caller.
+    """
+    from mok import _C
+
+    previous_guard = os.environ.get("MOK_KIMI_K3_ENABLE_GRID_TUNING")
+    os.environ["MOK_KIMI_K3_ENABLE_GRID_TUNING"] = "1"
+    _C._kimi_k3_decode_set_phase_profile(True)
+    try:
+        yield
+    finally:
+        _C._kimi_k3_decode_set_phase_profile(False)
+        if previous_guard is None:
+            os.environ.pop("MOK_KIMI_K3_ENABLE_GRID_TUNING", None)
+        else:
+            os.environ["MOK_KIMI_K3_ENABLE_GRID_TUNING"] = previous_guard
+
+
+def phase_clock_cycles(
+    workspace: KimiK3DecodeWorkspace,
+) -> dict[str, int]:
+    """Read the accumulators the last profiled launch left in the workspace.
+
+    Every counter is a summed cycle count over the CTAs that ran that region,
+    so the useful comparison is between regions of one launch rather than
+    against wall time.
+    """
+    from mok import _C
+
+    begin, names = _C._kimi_k3_decode_phase_clock_metadata()
+    # `.cpu()` rebases the slice on its own storage, which is what lets the
+    # uint8 bytes be reinterpreted as the 64-bit counters they hold.
+    words = workspace.scratch[begin * 4 : (begin + 2 * len(names)) * 4].cpu()
+    counters = words.view(torch.int64).tolist()
+    return dict(zip(names, counters, strict=True))
+
+
 def _e8m0_scale_bytes(absolute_max: torch.Tensor) -> torch.Tensor:
     mantissa, exponent = torch.frexp(absolute_max.float())
     scale_exponent = torch.where(mantissa <= 0.875, exponent - 9, exponent - 8)

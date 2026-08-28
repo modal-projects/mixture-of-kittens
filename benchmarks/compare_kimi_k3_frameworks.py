@@ -79,6 +79,7 @@ ARTIFACT_FILES = (
     "latency_block16.csv",
     "raw_samples.json",
     "launch_traces.json",
+    "phase_profile.json",
     "performance_gates.json",
 )
 
@@ -92,6 +93,61 @@ def comparison_artifact_files(modes: Sequence[str]) -> tuple[str, ...]:
         for suffix in ("json", "csv")
     }
     return tuple(name for name in ARTIFACT_FILES if name not in skipped)
+
+
+# The kernel's clock64 accumulators, in `csrc/kimi_k3_decode/types.cuh` order.
+# The two `_stage`/`_mma` pairs measure the inside of the routed region above
+# them rather than a region of their own.
+PHASE_CLOCK_NAMES = (
+    "queue_clear",
+    "router_score",
+    "latent_project",
+    "assignments",
+    "latent_quantize",
+    "routed_gate_up",
+    "routed_gate_up_stage",
+    "routed_gate_up_mma",
+    "routed_down",
+    "routed_down_stage",
+    "routed_down_mma",
+    "shared_experts",
+    "grid_barrier",
+    "tail",
+)
+PHASE_CLOCK_BREAKDOWN_SUFFIXES = ("_stage", "_mma")
+
+
+def summarize_phase_cycles(cycles: Mapping[str, int]) -> dict[str, Any]:
+    """Rank the kernel's accumulated regions by their share of the total.
+
+    Only the regions that partition the launch are summed. A region's own
+    breakdown counters are reported alongside their share of the same total,
+    which is what makes "the staging inside routed gate/up is 83% of the whole
+    launch" a statement about the launch rather than about its parent region.
+    """
+    accounted = sum(
+        value
+        for name, value in cycles.items()
+        if not name.endswith(PHASE_CLOCK_BREAKDOWN_SUFFIXES)
+    )
+    ranked = sorted(
+        (
+            (name, value)
+            for name, value in cycles.items()
+            if not name.endswith(PHASE_CLOCK_BREAKDOWN_SUFFIXES)
+        ),
+        key=lambda item: (-item[1], item[0]),
+    )
+    return {
+        "accounted_cycles": accounted,
+        "share_of_accounted": {
+            name: (value / accounted if accounted else 0.0)
+            for name, value in cycles.items()
+        },
+        "ranked": ranked,
+        "dominant_region": ranked[0][0] if accounted else None,
+        "dominant_share": (ranked[0][1] / accounted) if accounted else 0.0,
+    }
 
 
 LATENCY_COLUMNS = (
@@ -651,6 +707,32 @@ def _kernel_trace(call: Callable[[], Any]) -> list[str]:
     ]
 
 
+def _phase_profile(
+    workspace: Any,
+    pool: Sequence[Any],
+    runtime: Any,
+    device: Any,
+) -> dict[str, Any]:
+    """Accumulated clock64 cycles per kernel region for one replayed shape.
+
+    Collected outside the timed section and outside the captured graphs: the
+    accumulators cost atomics that the measured launches must not pay, and a
+    graph would have recorded whichever launch it captured anyway.
+    """
+    import torch
+
+    with runtime.phase_profiling():
+        for entry in pool:
+            runtime.decode_step(workspace, entry.weights, entry.hidden)
+        torch.cuda.synchronize(device)
+        cycles = runtime.phase_clock_cycles(workspace)
+    return {
+        "replays": len(pool),
+        "cycles": cycles,
+        **summarize_phase_cycles(cycles),
+    }
+
+
 def _run_gpu(
     framework: str,
     output_dir: Path,
@@ -685,6 +767,7 @@ def _run_gpu(
     occupancy: list[dict[str, Any]] = []
     raw_samples: list[dict[str, Any]] = []
     tables: dict[str, list[dict[str, Any]]] = {}
+    phase_profiles: list[dict[str, Any]] = []
 
     for mode, shapes in shape_groups.items():
         rows: list[dict[str, Any]] = []
@@ -756,6 +839,13 @@ def _run_gpu(
                 warmup_count=warmup_count,
                 sample_count=sample_count,
             )
+            phase_profiles.append(
+                {
+                    "mode": mode,
+                    "tokens": tokens,
+                    **_phase_profile(workspace, pool, runtime, device),
+                }
+            )
             for measurement in measurements:
                 raw_samples.append(measurement)
                 rows.append(
@@ -821,6 +911,10 @@ def _run_gpu(
             {"framework": framework, "rows": raw_samples},
         )
         write_json(output_dir / "launch_traces.json", traces)
+        write_json(
+            output_dir / "phase_profile.json",
+            {"backend": "mok", "rows": phase_profiles},
+        )
         for mode in shape_groups:
             write_latency_table(output_dir, f"latency_{mode}", tables[mode])
         write_json(

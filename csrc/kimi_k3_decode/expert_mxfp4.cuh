@@ -578,7 +578,8 @@ static __device__ void routed_gate_up_unit(
     const int expert,
     const int assignment_begin,
     const int batch_rows,
-    const int output_tile
+    const int output_tile,
+    const PhaseClocks clocks
 ) {
     using namespace kittens;
     tma_swizzle_allocator allocator(shared_raw);
@@ -614,6 +615,7 @@ static __device__ void routed_gate_up_unit(
 
     const int output_base = output_tile * kMmaN;
     int compute_phase = 0;
+    unsigned long long mark = clocks.now();
     for (int k_group = 0; k_group < kLatentGroups; ++k_group) {
         load_quantized_activation_tile(
             activation_tile, activation_scale_shared, scratch,
@@ -638,6 +640,7 @@ static __device__ void routed_gate_up_unit(
             tensor_store_wait();
         }
         __syncthreads();
+        mark = clocks.lap(kClockRoutedGateUpStage, mark);
         if (thread == 0) {
             if (k_group == 0) {
                 mixed_mma<0, false>(
@@ -658,6 +661,7 @@ static __device__ void routed_gate_up_unit(
         }
         wait(gate_up_done, compute_phase);
         __syncthreads();
+        mark = clocks.lap(kClockRoutedGateUpMma, mark);
         compute_phase ^= 1;
     }
 
@@ -680,7 +684,8 @@ static __device__ void routed_down_unit(
     const int assignment_begin,
     const int batch_rows,
     const int output_tile,
-    const int active_tokens
+    const int active_tokens,
+    const PhaseClocks clocks
 ) {
     using namespace kittens;
     tma_swizzle_allocator allocator(shared_raw);
@@ -707,6 +712,7 @@ static __device__ void routed_down_unit(
 
     const int output_base = output_tile * kMmaN;
     int compute_phase = 0;
+    unsigned long long mark = clocks.now();
     for (int k_group = 0; k_group < kSituGroups; ++k_group) {
         load_quantized_activation_tile(
             activation_tile, activation_scale_shared, scratch,
@@ -725,6 +731,7 @@ static __device__ void routed_down_unit(
             tensor_store_wait();
         }
         __syncthreads();
+        mark = clocks.lap(kClockRoutedDownStage, mark);
         if (thread == 0) {
             if (k_group == 0) {
                 mixed_mma<0, false>(
@@ -739,6 +746,7 @@ static __device__ void routed_down_unit(
         }
         wait(down_done, compute_phase);
         __syncthreads();
+        mark = clocks.lap(kClockRoutedDownMma, mark);
         compute_phase ^= 1;
     }
 
@@ -817,7 +825,8 @@ void kimi_k3_routed_experts_kernel(
                 routed_gate_up_unit(
                     shared_raw, tensor_pool, expert_w1_packed, expert_w1_scale,
                     expert_w3_packed, expert_w3_scale, scratch, expert,
-                    assignment_begin, batch_rows, output_tile);
+                    assignment_begin, batch_rows, output_tile,
+                    PhaseClocks{nullptr});
             }
 
             for (int output_tile = 0; output_tile < kDownTiles;
@@ -825,7 +834,7 @@ void kimi_k3_routed_experts_kernel(
                 routed_down_unit(
                     shared_raw, tensor_pool, expert_w2_packed, expert_w2_scale,
                     scratch, expert, assignment_begin, batch_rows, output_tile,
-                    active_tokens);
+                    active_tokens, PhaseClocks{nullptr});
             }
         }
     }

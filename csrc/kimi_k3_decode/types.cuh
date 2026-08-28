@@ -188,6 +188,68 @@ inline constexpr int kPersistentTimeoutPhase = 34;
 static_assert(kPersistentTimeoutPhase < NUM_PHASE_COUNTERS);
 
 // ---------------------------------------------------------------------------
+// Benchmark-only phase clocks.
+//
+// A CTA reads `clock64()` around each region it runs and accumulates the delta
+// into one shared counter per region, so a single guarded launch reports where
+// its own resident CTAs spent their cycles. The counters are aligned pairs of
+// the phase region's unused tail slots, read as one 64-bit accumulator each:
+// a decode step is millions of cycles summed over 148 CTAs, which overflows 32
+// bits, and appending a scratch region would move every offset the private
+// stages pin.
+// ---------------------------------------------------------------------------
+
+/// One accumulated region, in the order the kernel runs them.
+enum PhaseClock : int {
+    kClockQueueClear = 0,
+    kClockRouterScore,
+    kClockLatentProject,
+    kClockAssignments,
+    kClockLatentQuantize,
+    kClockRoutedGateUp,
+    kClockRoutedGateUpStage,
+    kClockRoutedGateUpMma,
+    kClockRoutedDown,
+    kClockRoutedDownStage,
+    kClockRoutedDownMma,
+    kClockSharedExperts,
+    kClockGridBarrier,
+    kClockTail,
+    kPhaseClockCount,
+};
+
+/// First slot of the 64-bit accumulator band, which ends the phase region.
+inline constexpr int kPhaseClockBegin =
+    NUM_PHASE_COUNTERS - 2 * kPhaseClockCount;
+
+static_assert(kPhaseClockBegin == 36);
+static_assert(kPhaseClockBegin % 2 == 0,
+              "a 64-bit accumulator must start on an aligned slot pair");
+static_assert(kPhaseClockBegin > kPersistentTimeoutPhase,
+              "the accumulators must not overlap a live counter");
+
+/// Every accumulated region's reported name, in `PhaseClock` order.
+inline constexpr const char *kPhaseClockNames[] = {
+    "queue_clear",
+    "router_score",
+    "latent_project",
+    "assignments",
+    "latent_quantize",
+    "routed_gate_up",
+    "routed_gate_up_stage",
+    "routed_gate_up_mma",
+    "routed_down",
+    "routed_down_stage",
+    "routed_down_mma",
+    "shared_experts",
+    "grid_barrier",
+    "tail",
+};
+
+static_assert(sizeof(kPhaseClockNames) / sizeof(kPhaseClockNames[0])
+                  == kPhaseClockCount);
+
+// ---------------------------------------------------------------------------
 // Timeout diagnostics.
 //
 // A bounded wait that gives up writes two things before it traps: the phase
@@ -293,6 +355,56 @@ __host__ __device__ inline Scratch scratch_view(std::uint8_t *base) {
         reinterpret_cast<__nv_bfloat16 *>(base + kLatentXBytes),
         reinterpret_cast<int *>(base + kUnitExpertBytes),
     };
+}
+
+/// A CTA's handle on the phase clocks, inert unless the launch enabled them.
+///
+/// It travels by value into every stage, so a stage neither reads the guard
+/// from global memory nor branches on a kernel argument it was not given.
+struct PhaseClocks {
+    unsigned long long *counters;
+
+    __device__ __forceinline__ bool enabled() const {
+        return counters != nullptr;
+    }
+
+    /// Read this CTA's cycle counter, or zero when the launch is not profiled.
+    __device__ __forceinline__ unsigned long long now() const {
+        return counters == nullptr
+            ? 0ull
+            : static_cast<unsigned long long>(clock64());
+    }
+
+    __device__ __forceinline__ void add(
+        const int index,
+        const unsigned long long cycles
+    ) const {
+        if (counters != nullptr && threadIdx.x == 0) {
+            atomicAdd(&counters[index], cycles);
+        }
+    }
+
+    /// Accumulate the cycles since `started` and return a fresh reading.
+    __device__ __forceinline__ unsigned long long lap(
+        const int index,
+        const unsigned long long started
+    ) const {
+        if (counters == nullptr) return 0ull;
+        const unsigned long long current =
+            static_cast<unsigned long long>(clock64());
+        add(index, current - started);
+        return current;
+    }
+};
+
+__device__ __forceinline__ PhaseClocks phase_clocks(
+    const Scratch &scratch,
+    const bool profiled
+) {
+    return PhaseClocks{
+        profiled ? reinterpret_cast<unsigned long long *>(
+                       &scratch.phase[kPhaseClockBegin])
+                 : nullptr};
 }
 
 /// Round an active token count up to the decode contract's capacity bucket.

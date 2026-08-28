@@ -239,6 +239,71 @@ def test_performance_gates_require_every_block16_shape_from_all_backends() -> No
         compare.evaluate_performance_gates(incomplete)
 
 
+def test_phase_profile_is_archived_for_every_measured_mode() -> None:
+    compare = _compare()
+
+    assert "phase_profile.json" in compare.ARTIFACT_FILES
+    for modes in (["block8"], ["block16"], ["block8", "block16"]):
+        assert "phase_profile.json" in compare.comparison_artifact_files(modes)
+
+
+def test_phase_cycle_summary_ranks_regions_by_their_accounted_share() -> None:
+    """The split counters describe a region, they do not add to the total.
+
+    ``routed_gate_up_stage`` and ``routed_gate_up_mma`` are measured inside
+    ``routed_gate_up``, so counting all three would report a total larger than
+    the cycles the kernel actually spent and would understate every share.
+    """
+    compare = _compare()
+    summary = compare.summarize_phase_cycles(
+        {
+            "router_score": 100,
+            "routed_gate_up": 600,
+            "routed_gate_up_stage": 500,
+            "routed_gate_up_mma": 90,
+            "routed_down": 300,
+            "routed_down_stage": 250,
+            "routed_down_mma": 40,
+        }
+    )
+
+    assert summary["accounted_cycles"] == 1000
+    assert summary["share_of_accounted"]["routed_gate_up"] == pytest.approx(0.6)
+    assert summary["share_of_accounted"]["routed_down"] == pytest.approx(0.3)
+    assert summary["ranked"][0] == ("routed_gate_up", 600)
+    assert summary["ranked"][1] == ("routed_down", 300)
+    assert summary["dominant_region"] == "routed_gate_up"
+    assert summary["dominant_share"] == pytest.approx(0.6)
+
+
+def test_phase_cycle_summary_tolerates_an_unprofiled_launch() -> None:
+    compare = _compare()
+    summary = compare.summarize_phase_cycles({"router_score": 0, "tail": 0})
+
+    assert summary["accounted_cycles"] == 0
+    assert summary["dominant_region"] is None
+    assert summary["share_of_accounted"] == {"router_score": 0.0, "tail": 0.0}
+
+
+def test_phase_clock_names_match_the_kernel_scratch_band() -> None:
+    """The reader names the counters; the kernel decides how many there are."""
+    compare = _compare()
+    source = (REPO_ROOT / "csrc" / "kimi_k3_decode" / "types.cuh").read_text()
+    names = [
+        match.group(1)
+        for match in __import__("re").finditer(
+            r'^\s{4}"([a-z0-9_]+)",$',
+            source.split("kPhaseClockNames[] = {", 1)[1].split("};", 1)[0],
+            __import__("re").MULTILINE,
+        )
+    ]
+
+    assert names == list(compare.PHASE_CLOCK_NAMES)
+    assert names[0] == "queue_clear"
+    assert "routed_gate_up_stage" in names
+    assert "routed_gate_up_mma" in names
+
+
 def test_dry_run_writes_the_complete_comparison_manifest(tmp_path: Path) -> None:
     import subprocess
     import sys
