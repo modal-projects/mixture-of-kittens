@@ -1235,6 +1235,8 @@ def test_tail_is_exactly_one_kernel_launch_per_rank(
 
     assert len(names) == 1, names
     assert expected_kernel in names[0], names
+    if rank == 0:
+        print(f"K3 tail M={active_tokens} launches={len(names)} {names[0]}")
 
 
 def test_replicated_fixtures_and_partials_are_distinct_per_rank(
