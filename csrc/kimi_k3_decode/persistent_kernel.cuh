@@ -22,6 +22,8 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <tuple>
 #include <type_traits>
@@ -53,6 +55,9 @@ namespace persistent {
 // reservation and the occupancy query happen once per device even when one
 // process drives several.
 inline constexpr int kMaxCudaDevices = 32;
+
+/// Largest grid accepted by the benchmark-only runtime tuning hook.
+inline constexpr int kMaximumBenchmarkCtas = 148;
 
 /// The widest shared-memory footprint any stage this kernel runs asks for.
 inline constexpr int kWidestStageSharedBytes =
@@ -135,7 +140,7 @@ inline constexpr int longest_queue_units() {
 /// overshoot past the last unit is exactly one refused ticket per CTA.
 inline constexpr int kLongestQueueUnits = longest_queue_units();
 inline constexpr int kLongestQueueTicket =
-    kLongestQueueUnits + kPersistentCtas;
+    kLongestQueueUnits + kMaximumBenchmarkCtas;
 
 static_assert(kLongestQueueUnits == 25150,
               "the widest phase is 6 activation + 56 shared-down + 896 * 28 "
@@ -166,6 +171,37 @@ inline std::tuple<int, int, int, int> timeout_metadata_for_testing() {
 
 inline std::tuple<int, int> queue_bound_for_testing() {
     return {kLongestQueueUnits, kLongestQueueTicket};
+}
+
+/// Select a non-production grid only from an explicitly-enabled benchmark.
+///
+/// The public decode wrapper has no grid option and this value starts at the
+/// validated production constant. The private binding checks an environment
+/// guard before changing it, so application code cannot accidentally retain a
+/// tuning candidate.
+static __host__ std::atomic<int> &benchmark_grid_ctas_storage() {
+    static std::atomic<int> grid{kPersistentCtas};
+    return grid;
+}
+
+inline std::int64_t benchmark_grid_ctas_for_testing() {
+    return benchmark_grid_ctas_storage().load(std::memory_order_relaxed);
+}
+
+inline void set_benchmark_grid_ctas_for_testing(const std::int64_t grid_ctas) {
+    const char *const enabled =
+        std::getenv("MOK_KIMI_K3_ENABLE_GRID_TUNING");
+    TORCH_CHECK(
+        enabled != nullptr && std::strcmp(enabled, "1") == 0,
+        "MoK: Kimi K3 grid override is benchmark-only; set "
+        "MOK_KIMI_K3_ENABLE_GRID_TUNING=1 in a dedicated benchmark process");
+    TORCH_CHECK(
+        grid_ctas == 64 || grid_ctas == 96 || grid_ctas == 128
+            || grid_ctas == 148,
+        "MoK: Kimi K3 benchmark grid must be one of 64, 96, 128, or 148, got ",
+        grid_ctas);
+    benchmark_grid_ctas_storage().store(
+        static_cast<int>(grid_ctas), std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -250,7 +286,8 @@ void kimi_k3_decode_persistent_kernel(
     std::uint8_t *__restrict__ scratch_bytes,
     int *__restrict__ error_flag,
     const int tp_rank,
-    const int active_tokens
+    const int active_tokens,
+    const int grid_ctas
 ) {
     extern __shared__ __align__(16) int shared_raw[];
     std::uint8_t *const shared = reinterpret_cast<std::uint8_t *>(shared_raw);
@@ -287,10 +324,10 @@ void kimi_k3_decode_persistent_kernel(
     const int routed_values = active_tokens * kLatentSize;
     for (int index = block * kDecodeCtaThreads + thread;
          index < routed_values;
-         index += kPersistentCtas * kDecodeCtaThreads) {
+         index += grid_ctas * kDecodeCtaThreads) {
         scratch.routed_accumulator[index] = 0.0f;
     }
-    grid_barrier(scratch, error_flag, grid);
+    grid_barrier(scratch, error_flag, grid, grid_ctas);
 
     // -----------------------------------------------------------------------
     // Phase 1: score every token and project the routed latent.
@@ -321,7 +358,7 @@ void kimi_k3_decode_persistent_kernel(
             __syncthreads();
         }
     }
-    grid_barrier(scratch, error_flag, grid);
+    grid_barrier(scratch, error_flag, grid, grid_ctas);
 
     // -----------------------------------------------------------------------
     // Phase 2: build the assignment table while the grid quantizes the latent.
@@ -337,9 +374,9 @@ void kimi_k3_decode_persistent_kernel(
     } else {
         expert_mxfp4::quantize_latent_rows(
             scratch.latent_x, scratch, active_tokens, block - 1,
-            kPersistentCtas - 1);
+            grid_ctas - 1);
     }
-    grid_barrier(scratch, error_flag, grid);
+    grid_barrier(scratch, error_flag, grid, grid_ctas);
 
     // Read past L1 and clamp: the count steers two queue lengths, and a queue
     // longer than the table behind it would index that table out of bounds.
@@ -393,7 +430,7 @@ void kimi_k3_decode_persistent_kernel(
             __syncthreads();
         }
     }
-    grid_barrier(scratch, error_flag, grid);
+    grid_barrier(scratch, error_flag, grid, grid_ctas);
 
     // -----------------------------------------------------------------------
     // Phase 4: shared activation, the shared down units, and routed down units.
@@ -450,7 +487,7 @@ void kimi_k3_decode_persistent_kernel(
             __syncthreads();
         }
     }
-    grid_barrier(scratch, error_flag, grid);
+    grid_barrier(scratch, error_flag, grid, grid_ctas);
 
     // -----------------------------------------------------------------------
     // Phase 5: publish this rank's routed partial next to its shared partial.
@@ -460,7 +497,7 @@ void kimi_k3_decode_persistent_kernel(
     // -----------------------------------------------------------------------
     for (int index = block * kDecodeCtaThreads + thread;
          index < routed_values;
-         index += kPersistentCtas * kDecodeCtaThreads) {
+         index += grid_ctas * kDecodeCtaThreads) {
         const int row = index / kLatentSize;
         collective_buffer[
             static_cast<long long>(row) * shared_experts::kCollectiveColumns
@@ -470,7 +507,7 @@ void kimi_k3_decode_persistent_kernel(
     // The barrier releases at system scope, so this rank's whole collective
     // buffer is visible to its peers before its coordinator opens the entry
     // rendezvous that tells them it is.
-    grid_barrier(scratch, error_flag, grid);
+    grid_barrier(scratch, error_flag, grid, grid_ctas);
 
     // -----------------------------------------------------------------------
     // Phase 6: the fused TP8 tail, on the CTAs that carry its three roles.
@@ -583,9 +620,10 @@ static __host__ int resident_blocks_per_sm() {
 /// cannot arrive, so a grid that only partly fits does not run slowly -- it
 /// deadlocks. The occupancy query is the measurement that matters; the SM count
 /// is what turns it into a whole-grid answer.
-inline void validate_residency(
+inline void validate_grid_residency(
     const std::int64_t available_sms,
-    const std::int64_t blocks_per_sm
+    const std::int64_t blocks_per_sm,
+    const std::int64_t grid_ctas
 ) {
     TORCH_CHECK(blocks_per_sm >= 1,
                 "MoK: kimi_k3_decode requires the persistent kernel to place "
@@ -593,10 +631,18 @@ inline void validate_residency(
                 " threads and ", kPersistentSharedBytes,
                 " dynamic shared bytes, but the device reports ",
                 blocks_per_sm);
-    TORCH_CHECK(available_sms >= kPersistentCtas,
-                "MoK: kimi_k3_decode requires all ", kPersistentCtas,
+    TORCH_CHECK(available_sms >= grid_ctas,
+                "MoK: kimi_k3_decode requires all ", grid_ctas,
                 " CTAs of the persistent grid to co-reside one per SM, but the "
                 "selected device exposes ", available_sms, " SMs");
+}
+
+inline void validate_residency(
+    const std::int64_t available_sms,
+    const std::int64_t blocks_per_sm
+) {
+    validate_grid_residency(
+        available_sms, blocks_per_sm, kPersistentCtas);
 }
 
 inline std::int64_t resident_blocks_per_sm_for_testing(
@@ -638,6 +684,7 @@ struct LaunchArguments {
     int tp_rank;
     int active_tokens;
     int available_sms;
+    int grid_ctas;
 };
 
 template<bool TENSOR_PATH>
@@ -645,8 +692,9 @@ static __host__ void launch_persistent(
     const LaunchArguments &arguments,
     const layouts_t<TENSOR_PATH> &layouts
 ) {
-    validate_residency(
-        arguments.available_sms, resident_blocks_per_sm<TENSOR_PATH>());
+    validate_grid_residency(
+        arguments.available_sms, resident_blocks_per_sm<TENSOR_PATH>(),
+        arguments.grid_ctas);
 
     const auto bf16 = [](const at::Tensor &tensor) {
         return reinterpret_cast<const __nv_bfloat16 *>(tensor.data_ptr());
@@ -656,7 +704,7 @@ static __host__ void launch_persistent(
     };
 
     kimi_k3_decode_persistent_kernel<TENSOR_PATH>
-        <<<kPersistentCtas, kDecodeCtaThreads, kPersistentSharedBytes,
+        <<<arguments.grid_ctas, kDecodeCtaThreads, kPersistentSharedBytes,
            at::cuda::getCurrentCUDAStream()>>>(
             bf16(arguments.hidden_states),
             bf16(arguments.router_weight),
@@ -690,7 +738,8 @@ static __host__ void launch_persistent(
             reinterpret_cast<std::uint8_t *>(arguments.scratch.data_ptr()),
             reinterpret_cast<int *>(arguments.error_flag.data_ptr()),
             arguments.tp_rank,
-            arguments.active_tokens);
+            arguments.active_tokens,
+            arguments.grid_ctas);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

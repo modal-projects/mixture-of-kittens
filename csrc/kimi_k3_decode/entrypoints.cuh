@@ -978,6 +978,7 @@ static __host__ void kimi_k3_decode_entrypoint(
         static_cast<int>(tp_rank),
         static_cast<int>(active_tokens),
         properties.multiProcessorCount,
+        static_cast<int>(persistent::benchmark_grid_ctas_for_testing()),
     });
 }
 

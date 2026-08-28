@@ -72,6 +72,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             static_cast<std::int64_t>(
                 kimi_k3_decode::persistent::kPersistentSharedBytes));
     });
+    m.def("_kimi_k3_decode_set_benchmark_grid",
+          &kimi_k3_decode::persistent::set_benchmark_grid_ctas_for_testing, "",
+          pybind11::arg("grid_ctas"));
+    m.def("_kimi_k3_decode_benchmark_grid",
+          &kimi_k3_decode::persistent::benchmark_grid_ctas_for_testing);
     m.def("_kimi_k3_route_and_project",
           &kimi_k3_decode::route_and_project_entrypoint, "",
           pybind11::arg("hidden_states"),

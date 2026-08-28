@@ -28,7 +28,10 @@ Environment overrides:
 
 import os
 import subprocess
+import tarfile
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 
 import modal
 
@@ -81,6 +84,21 @@ BUILD_FILES = ("setup.py", "pyproject.toml", "Makefile", "README.md", "LICENSE")
 REMOTE_ROOT = "/root/mok"
 
 
+def _local_git_sha() -> str:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return "unavailable"
+
+
+GIT_SHA = _local_git_sha()
+
+
 def build_image(spec: GPUSpec) -> modal.Image:
     """Build a MoK image for one architecture. Modal caches each distinct image."""
     image = (
@@ -91,7 +109,7 @@ def build_image(spec: GPUSpec) -> modal.Image:
         .pip_install("setuptools>=80", "wheel")
         .pip_install(spec.torch_spec, index_url=spec.torch_index)
         .pip_install("pytest>=9,<10", "numpy")
-        .env({"MOK_ARCH": spec.mok_arch})
+        .env({"MOK_ARCH": spec.mok_arch, "MOK_GIT_SHA": GIT_SHA})
     )
     for directory in BUILD_DIRS:
         image = image.add_local_dir(
@@ -109,6 +127,7 @@ def build_image(spec: GPUSpec) -> modal.Image:
 
 
 IMAGE = build_image(SPEC)
+B300_IMAGE = build_image(SPECS["B300"])
 
 
 @app.function(image=IMAGE, gpu=SPEC.gpu, timeout=1800)
@@ -170,6 +189,81 @@ def bench() -> None:
 
     print(f"visible GPUs: {torch.cuda.device_count()} ({torch.cuda.get_device_name(0)})")
     _run_bench(BENCH_NPROC)
+
+
+def _run_kimi_k3_torchrun(arguments: list[str], *, timeout: int) -> None:
+    command = [
+        "python",
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc-per-node=8",
+        *arguments,
+    ]
+    print(f"Launching: {' '.join(command)} on 8 x B300")
+    subprocess.run(
+        command,
+        cwd=REMOTE_ROOT,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        check=True,
+        timeout=timeout,
+    )
+
+
+@app.function(image=B300_IMAGE, gpu="B300:8", timeout=14_400)
+def test_kimi_k3_decode() -> None:
+    """Run TP8 decode correctness plus SM103 resource and launch checks."""
+    _run_kimi_k3_torchrun(
+        [
+            "-m",
+            "pytest",
+            "-q",
+            "tests/test_kimi_k3_decode.py",
+            "tests/test_kimi_k3_sm103_binary.py",
+        ],
+        timeout=14_100,
+    )
+
+
+@app.function(image=B300_IMAGE, gpu="B300:8", timeout=86_400)
+def bench_kimi_k3_decode() -> bytes:
+    """Run grid tuning and all decode tables, returning rank-0 artifacts."""
+    with tempfile.TemporaryDirectory(prefix="kimi-k3-decode-") as directory:
+        root = Path(directory)
+        output_dir = root / "artifacts"
+        _run_kimi_k3_torchrun(
+            [
+                "-m",
+                "benchmarks.bench_kimi_k3_decode",
+                "--output-dir",
+                str(output_dir),
+            ],
+            timeout=86_100,
+        )
+        expected = {
+            "manifest.json",
+            "latency_raw_decode.json",
+            "latency_raw_decode.csv",
+            "latency_block8.json",
+            "latency_block8.csv",
+            "latency_block16.json",
+            "latency_block16.csv",
+            "correctness.json",
+            "workspace_stats.json",
+            "tuning.json",
+        }
+        actual = {path.name for path in output_dir.iterdir()}
+        if actual != expected:
+            raise RuntimeError(
+                f"Kimi K3 benchmark artifacts differ: "
+                f"missing={sorted(expected - actual)}, "
+                f"unexpected={sorted(actual - expected)}"
+            )
+        archive_path = root / "kimi_k3_decode_benchmark.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            for path in sorted(output_dir.iterdir()):
+                archive.add(path, arcname=path.name)
+        return archive_path.read_bytes()
 
 
 @app.local_entrypoint()

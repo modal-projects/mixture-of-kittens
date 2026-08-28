@@ -138,7 +138,8 @@ static __device__ GridPhase latch_grid_phase(
 static __device__ void grid_barrier(
     const Scratch &scratch,
     int *__restrict__ const error_flag,
-    GridPhase &phase
+    GridPhase &phase,
+    const int grid_ctas
 ) {
     __threadfence_system();
     __syncthreads();
@@ -150,7 +151,7 @@ static __device__ void grid_barrier(
         auto *const generation = reinterpret_cast<unsigned int *>(
             &scratch.phase[kGridGeneration]);
         const unsigned int ticket = atomicAdd(arrivals, 1u);
-        if (ticket == static_cast<unsigned int>(kPersistentCtas - 1)) {
+        if (ticket == static_cast<unsigned int>(grid_ctas - 1)) {
             atomicExch(arrivals, 0u);
             __threadfence();
             atomicAdd(generation, 1u);
