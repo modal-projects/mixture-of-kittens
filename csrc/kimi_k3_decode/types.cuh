@@ -114,6 +114,10 @@ inline constexpr int kSharedActivationArrivals = 13;
 inline constexpr int kSharedActivationGeneration = 14;
 inline constexpr int kSharedDownArrivals = 15;
 inline constexpr int kSharedDownGeneration = 16;
+// A zero value means no wait timed out. On timeout, the waiting CTA records
+// the published generation slot (gate, up, or activation) before trapping.
+inline constexpr int kSharedTimeoutPhase = 17;
+static_assert(kSharedTimeoutPhase < NUM_PHASE_COUNTERS);
 
 /// Typed device pointers into one decode workspace.
 struct Scratch {

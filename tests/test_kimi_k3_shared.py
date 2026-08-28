@@ -178,9 +178,9 @@ def _reference(
     active_tokens: int,
 ) -> torch.Tensor:
     active = hidden_states[:active_tokens].float()
-    gate = active @ weights.gate.float().T
-    up = active @ weights.up.float().T
-    activated = _situ(gate, up).bfloat16()
+    gate = (active @ weights.gate.float().T).bfloat16()
+    up = (active @ weights.up.float().T).bfloat16()
+    activated = _situ(gate.float(), up.float()).bfloat16()
     return activated.float() @ weights.down.float().T
 
 
@@ -301,13 +301,13 @@ def test_workspace_bytes_matches_shared_scratch_source_of_truth(
 @pytest.mark.parametrize(
     ("active_tokens", "expected"),
     [
-        (1, (24, 0, 6, 112, 142)),
-        (8, (24, 0, 6, 112, 142)),
+        (1, (24, 0, 0, 112, 136)),
+        (8, (24, 0, 0, 112, 136)),
         (16, (6, 6, 6, 56, 74)),
         (128, (6, 6, 6, 56, 74)),
     ],
 )
-def test_role_plan_orders_producers_and_activation_before_consumers(
+def test_role_plan_orders_all_producers_before_consumers(
     device: torch.device,
     active_tokens: int,
     expected: tuple[int, int, int, int, int],
@@ -317,13 +317,18 @@ def test_role_plan_orders_producers_and_activation_before_consumers(
     assert plan == expected
     gate_roles, up_roles, activation_roles, down_roles, total_roles = plan
     assert gate_roles > 0
-    assert activation_roles > 0
     assert down_roles > 0
     assert gate_roles + up_roles + activation_roles + down_roles == total_roles
+    if active_tokens <= 8:
+        assert up_roles == 0
+        assert activation_roles == 0
+    else:
+        assert up_roles > 0
+        assert activation_roles > 0
 
 
 @pytest.mark.parametrize(
-    ("active_tokens", "required_sms"), [(8, 142), (20, 74)]
+    ("active_tokens", "required_sms"), [(8, 136), (20, 74)]
 )
 def test_host_residency_guard_uses_the_selected_role_grid(
     device: torch.device,
@@ -358,6 +363,12 @@ def test_generation_order_and_timeout_helpers_are_wrap_safe(
     assert timed_out(100, 100 + timeout)
     start = UINT64_MAX - timeout // 2
     assert timed_out(start, (start + timeout) & UINT64_MAX)
+    assert _C._kimi_k3_shared_experts_timeout_metadata() == (
+        17,
+        10,
+        12,
+        14,
+    )
 
 
 def test_gate_up_and_down_patterns_are_nonperiodic_and_distinct(
@@ -487,7 +498,7 @@ def test_reused_scratch_advances_generations_and_replaces_intermediates(
     assert down_generations == expected_generations
 
 
-def test_runtime_generations_advance_across_uint32_wrap(
+def test_tensor_generations_advance_across_uint32_wrap(
     device: torch.device,
     weights: SharedWeights,
     scratch: torch.Tensor,
@@ -509,17 +520,17 @@ def test_runtime_generations_advance_across_uint32_wrap(
     assert [int(phase[index]) for index in (10, 12, 14, 16)] == [0, 0, 0, 0]
 
 
-def test_multi_cta_consumers_observe_each_fresh_release_generation(
+def test_tensor_multi_cta_consumers_observe_fresh_published_generations(
     device: torch.device,
     weights: SharedWeights,
     scratch: torch.Tensor,
 ) -> None:
-    """Stress the in-launch publication edge from gate/up CTAs to down CTAs.
+    """Stress tensor gate/up, activation, and down publication edges.
 
-    Every replay poisons all three global intermediates, changes their producer
-    values, and launches 56 down-projection consumers.  A missing device release
-    fence lets a consumer observe the generation tag before the BF16 activation
-    stores it announces, which leaks either poison or a prior replay here.
+    Every replay poisons all three global intermediates, changes their values,
+    and launches 56 down consumers. This can catch stale publication data when
+    reordering manifests, but a passing stress test does not prove fence
+    necessity.
     """
     cases: list[tuple[torch.Tensor, torch.Tensor]] = []
     for step in range(12):
@@ -544,6 +555,7 @@ def test_multi_cta_consumers_observe_each_fresh_release_generation(
         assert int(phase[10]) == int(phase[12])
         assert int(phase[12]) == int(phase[14])
         assert int(phase[14]) == int(phase[16])
+        assert int(phase[17]) == 0
 
 
 def test_shared_stage_uses_the_tensor_devices_current_stream(

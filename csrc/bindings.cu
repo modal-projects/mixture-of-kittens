@@ -71,6 +71,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &kimi_k3_decode::shared_experts::wait_timed_out, "",
           pybind11::arg("started"),
           pybind11::arg("current"));
+    m.def("_kimi_k3_shared_experts_timeout_metadata",
+          &kimi_k3_decode::shared_experts::timeout_metadata_for_testing);
     m.def("pack_kimi_k3_mxfp4", &kimi_k3_decode::mxfp4::pack_entrypoint, "",
           pybind11::arg("weight"), pybind11::arg("padded_k"));
     m.def("dequant_kimi_k3_mxfp4", &kimi_k3_decode::mxfp4::dequant_entrypoint, "",

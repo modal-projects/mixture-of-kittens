@@ -477,7 +477,7 @@ __device__ __forceinline__ void quantize_situ_tile(
             const float sigmoid = 1.0f / (1.0f + expf(-gate_value));
             const float value =
                 4.0f * tanhf(gate_value * 0.25f) * sigmoid
-                * 25.0f * tanhf(up_value * 0.04f);
+                * 25.0f * tanhf(up_value / 25.0f);
             values[k] = value;
             absolute_max = fmaxf(absolute_max, fabsf(value));
         }

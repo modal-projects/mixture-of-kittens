@@ -47,14 +47,13 @@ inline constexpr int kSharedExpertTensorDynamicBytes =
     kittens::MAX_SHARED_MEMORY - 1024;
 inline constexpr int kActivationCtas = kIntermediate / kTileN;
 
-// Every producer and activation role precedes every consumer role. This order
-// lets the scheduler admit producers first, while the host-side residency guard
-// below still makes progress independent of block scheduling order.
+// Every producer role precedes every consumer role. The core producer also
+// computes activation, while the tensor path retains separate gate, up, and
+// activation producers. The host residency guard keeps progress independent of
+// block scheduling order.
 inline constexpr int kCoreGateUpBegin = 0;
-inline constexpr int kCoreActivationBegin =
-    kCoreGateUpBegin + kCoreGateCtas;
 inline constexpr int kCoreDownBegin =
-    kCoreActivationBegin + kActivationCtas;
+    kCoreGateUpBegin + kCoreGateCtas;
 inline constexpr int kCoreRoleCtas = kCoreDownBegin + kCoreDownCtas;
 
 inline constexpr int kTensorGateBegin = 0;
@@ -77,9 +76,8 @@ static_assert(kHiddenSize % kTileN == 0);
 static_assert(kHiddenSize % kTileK == 0);
 static_assert(kIntermediate % kTileK == 0);
 static_assert(kActivationCtas == 6);
-static_assert(kCoreGateUpBegin < kCoreActivationBegin);
-static_assert(kCoreActivationBegin < kCoreDownBegin);
-static_assert(kCoreRoleCtas == 142);
+static_assert(kCoreGateUpBegin < kCoreDownBegin);
+static_assert(kCoreRoleCtas == 136);
 static_assert(kTensorGateBegin < kTensorUpBegin);
 static_assert(kTensorUpBegin < kTensorActivationBegin);
 static_assert(kTensorActivationBegin < kTensorDownBegin);
@@ -119,7 +117,7 @@ struct RolePlan {
 
 inline constexpr RolePlan role_plan(const int active_tokens) {
     return capacity_bucket(active_tokens) <= kMaxCoreCapacity
-        ? RolePlan{kCoreGateCtas, 0, kActivationCtas, kCoreDownCtas}
+        ? RolePlan{kCoreGateCtas, 0, 0, kCoreDownCtas}
         : RolePlan{
               kTensorGateCtas, kTensorGateCtas,
               kActivationCtas, kTensorDownCtas};
@@ -133,6 +131,14 @@ inline std::tuple<int, int, int, int, int> role_plan_for_testing(
                 kMaxTokens, "]");
     const RolePlan plan = role_plan(static_cast<int>(active_tokens));
     return {plan.gate, plan.up, plan.activation, plan.down, plan.total()};
+}
+
+inline std::tuple<int, int, int, int> timeout_metadata_for_testing() {
+    return {
+        kSharedTimeoutPhase,
+        kSharedGateGeneration,
+        kSharedUpGeneration,
+        kSharedActivationGeneration};
 }
 
 inline void validate_residency(
@@ -165,6 +171,18 @@ __host__ __device__ inline constexpr bool wait_timed_out(
     const std::uint64_t current
 ) {
     return current - started >= kGenerationWaitTimeoutClocks;
+}
+
+static __device__ __forceinline__ std::uint32_t load_relaxed_gpu(
+    const int *address
+) {
+    std::uint32_t value;
+    asm volatile(
+        "{ld.relaxed.gpu.global.u32 %0, [%1];}"
+        : "=r"(value)
+        : "l"(address)
+        : "memory");
+    return value;
 }
 
 /// Take one role ticket; the caller supplies the release fence and CTA barrier.
@@ -200,18 +218,36 @@ static __device__ void publish_phase(
     }
 }
 
-/// Core gate/up roles publish both intermediates after one release barrier.
-static __device__ void publish_gate_and_up(
+/// The combined core role publishes all three intermediates after one release.
+///
+/// There is no core activation arrival role. Its generation tag advances with
+/// the same last producer so later tensor launches retain a common baseline
+/// when capacity paths alternate on a reused workspace.
+static __device__ void publish_core_intermediates(
     const Scratch &scratch,
     const int role_ctas
 ) {
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) {
-        arrive_and_publish(
-            scratch, kSharedGateArrivals, kSharedGateGeneration, role_ctas);
-        arrive_and_publish(
-            scratch, kSharedUpArrivals, kSharedUpGeneration, role_ctas);
+        auto *const arrivals = reinterpret_cast<unsigned int *>(
+            &scratch.phase[kSharedGateArrivals]);
+        const unsigned int ticket = atomicAdd(arrivals, 1u);
+        if (ticket == static_cast<unsigned int>(role_ctas - 1)) {
+            atomicExch(arrivals, 0u);
+            atomicAdd(
+                reinterpret_cast<unsigned int *>(
+                    &scratch.phase[kSharedGateGeneration]),
+                1u);
+            atomicAdd(
+                reinterpret_cast<unsigned int *>(
+                    &scratch.phase[kSharedUpGeneration]),
+                1u);
+            atomicAdd(
+                reinterpret_cast<unsigned int *>(
+                    &scratch.phase[kSharedActivationGeneration]),
+                1u);
+        }
     }
 }
 
@@ -223,16 +259,21 @@ static __device__ void wait_for_phase(
 ) {
     __shared__ std::uint32_t consumed_generation;
     if (threadIdx.x == 0) {
-        auto *const published = reinterpret_cast<unsigned int *>(
-            &scratch.phase[published_generation_index]);
-        auto *const consumed = reinterpret_cast<unsigned int *>(
-            &scratch.phase[consumed_generation_index]);
-        consumed_generation = atomicAdd(consumed, 0u);
+        const int *const published =
+            &scratch.phase[published_generation_index];
+        const int *const consumed =
+            &scratch.phase[consumed_generation_index];
+        consumed_generation = load_relaxed_gpu(consumed);
         const std::uint64_t started = clock64();
         while (!generation_advanced(
-            atomicAdd(published, 0u), consumed_generation
+            load_relaxed_gpu(published), consumed_generation
         )) {
             if (wait_timed_out(started, clock64())) {
+                atomicExch(
+                    reinterpret_cast<unsigned int *>(
+                        &scratch.phase[kSharedTimeoutPhase]),
+                    static_cast<unsigned int>(published_generation_index));
+                __threadfence_system();
                 asm volatile("trap;");
             }
             __nanosleep(64);
@@ -345,10 +386,16 @@ static __device__ void gate_up_core(
                 const long long output =
                     static_cast<long long>(row) * kIntermediate
                     + column_base + column;
-                scratch.shared_gate[output] =
+                // Match the BF16 linear-module boundary before FP32 SiTU.
+                const __nv_bfloat16 gate_bf16 =
                     __float2bfloat16(gate_value);
-                scratch.shared_up[output] =
+                const __nv_bfloat16 up_bf16 =
                     __float2bfloat16(up_value);
+                scratch.shared_gate[output] = gate_bf16;
+                scratch.shared_up[output] = up_bf16;
+                scratch.shared_activated[output] = __float2bfloat16(situ(
+                    __bfloat162float(gate_bf16),
+                    __bfloat162float(up_bf16)));
             }
         }
     }
@@ -576,49 +623,75 @@ static __device__ void down_tensor(
 ) {
     using namespace kittens;
     tma_swizzle_allocator allocator(shared_raw);
-    tensor_input_tile (&activation_tile) =
-        allocator.allocate<tensor_input_tile>();
-    tensor_weight_tile (&weight_tile) =
-        allocator.allocate<tensor_weight_tile>();
+    tensor_input_tile (&activation_tiles)[kTensorStages] =
+        allocator.allocate<tensor_input_tile, kTensorStages>();
+    tensor_weight_tile (&weight_tiles)[kTensorStages] =
+        allocator.allocate<tensor_weight_tile, kTensorStages>();
     tensor_result_tile (&result_shared) =
         allocator.allocate<tensor_result_tile>();
 
-    __shared__ semaphore inputs_arrived;
+    __shared__ semaphore inputs_arrived[kTensorStages];
+    __shared__ semaphore inputs_finished[kTensorStages];
     __shared__ semaphore compute_done;
     if (threadIdx.x == 0) {
-        init_semaphore(inputs_arrived, 0, 1);
+        #pragma unroll
+        for (int stage = 0; stage < kTensorStages; ++stage) {
+            init_semaphore(inputs_arrived[stage], 0, 1);
+            init_semaphore(inputs_finished[stage], 1, 0);
+        }
         init_semaphore(compute_done, 0, 1);
     }
     __syncthreads();
 
     tensor_allocator<1, 1> tensor_pool{};
-    tensor_accumulator_tile accumulator =
-        tensor_pool.allocate<tensor_accumulator_tile>(0);
-    for (int iteration = 0; iteration < kTensorDownKIterations; ++iteration) {
-        if (threadIdx.x == 0) {
-            tma::expect_bytes(
-                inputs_arrived,
-                sizeof(tensor_input_tile) + sizeof(tensor_weight_tile));
-            tma::load_async(
-                activation_tile, activated, {0, iteration}, inputs_arrived);
-            tma::load_async(
-                weight_tile, down_weight, {column_block, iteration},
-                inputs_arrived);
-        }
-        wait(inputs_arrived, iteration % 2);
-        if (threadIdx.x == 0) {
-            if (iteration == 0) {
-                mm_ABt(accumulator, activation_tile, weight_tile);
-            } else {
-                mma_ABt(accumulator, activation_tile, weight_tile);
+    if (warpgroup::groupid() == 0) {
+        tensor_accumulator_tile accumulator =
+            tensor_pool.allocate<tensor_accumulator_tile>(0);
+        const int warpgroup_lane = warpgroup::laneid();
+
+        for (int iteration = 0; iteration < kTensorDownKIterations;
+             ++iteration) {
+            const int stage = iteration % kTensorStages;
+            const int round = iteration / kTensorStages;
+            if (warpgroup_lane == 0) {
+                wait(inputs_finished[stage], (round + 1) % 2);
+                tma::expect_bytes(
+                    inputs_arrived[stage],
+                    sizeof(tensor_input_tile) + sizeof(tensor_weight_tile));
+                tma::load_async(
+                    activation_tiles[stage],
+                    activated,
+                    {0, iteration},
+                    inputs_arrived[stage]);
+                tma::load_async(
+                    weight_tiles[stage],
+                    down_weight,
+                    {column_block, iteration},
+                    inputs_arrived[stage]);
             }
+            wait(inputs_arrived[stage], round % 2);
+            if (warpgroup_lane == 0) {
+                if (iteration == 0) {
+                    mm_ABt(
+                        accumulator,
+                        activation_tiles[stage],
+                        weight_tiles[stage],
+                        inputs_finished[stage]);
+                } else {
+                    mma_ABt(
+                        accumulator,
+                        activation_tiles[stage],
+                        weight_tiles[stage],
+                        inputs_finished[stage]);
+                }
+            }
+        }
+
+        if (warpgroup_lane == 0) {
             detail::tcgen05::commit<1>(compute_done);
         }
-        wait(compute_done, iteration % 2);
-        __syncthreads();
-    }
+        wait(compute_done, 0);
 
-    if (warpgroup::groupid() == 0) {
         rt_fl<kTileM / 4, kTileN> result;
         warpgroup::load_async(result, accumulator);
         tensor_load_wait();
@@ -662,33 +735,19 @@ void shared_experts_core_kernel(
     extern __shared__ __align__(16) int shared_raw[];
     const Scratch scratch = scratch_view(scratch_bytes);
     const int block = static_cast<int>(blockIdx.x);
-    if (block < kCoreActivationBegin) {
+    if (block < kCoreDownBegin) {
         gate_up_core<CAPACITY>(
             reinterpret_cast<std::uint8_t *>(shared_raw), hidden_states,
             shared_gate_proj, shared_up_proj, scratch, block,
             active_tokens);
-        publish_gate_and_up(scratch, kCoreGateCtas);
-        return;
-    }
-    if (block < kCoreDownBegin) {
-        wait_for_phase(
-            scratch, kSharedGateGeneration,
-            kSharedActivationGeneration);
-        wait_for_phase(
-            scratch, kSharedUpGeneration,
-            kSharedActivationGeneration);
-        activate_shared_tile(
-            scratch, block - kCoreActivationBegin, active_tokens);
-        publish_phase(
-            scratch,
-            kSharedActivationArrivals,
-            kSharedActivationGeneration,
-            kActivationCtas);
+        publish_core_intermediates(scratch, kCoreGateCtas);
         return;
     }
 
     wait_for_phase(
-        scratch, kSharedActivationGeneration, kSharedDownGeneration);
+        scratch, kSharedGateGeneration, kSharedDownGeneration);
+    wait_for_phase(
+        scratch, kSharedUpGeneration, kSharedDownGeneration);
     down_core<CAPACITY>(
         reinterpret_cast<std::uint8_t *>(shared_raw), scratch,
         shared_down_proj, collective_buffer, block - kCoreDownBegin,
@@ -787,7 +846,8 @@ static __host__ void launch_shared_experts(
     const at::Tensor &shared_down_proj,
     const at::Tensor &scratch,
     const at::Tensor &collective_buffer,
-    const int active_tokens
+    const int active_tokens,
+    const int available_sms
 ) {
     const auto *const hidden =
         reinterpret_cast<const __nv_bfloat16 *>(hidden_states.data_ptr());
@@ -802,10 +862,7 @@ static __host__ void launch_shared_experts(
     auto *const collective =
         reinterpret_cast<__nv_bfloat16 *>(collective_buffer.data_ptr());
     const int tokens = static_cast<int>(hidden_states.size(0));
-    cudaDeviceProp properties{};
-    C10_CUDA_CHECK(cudaGetDeviceProperties(
-        &properties, hidden_states.get_device()));
-    validate_residency(active_tokens, properties.multiProcessorCount);
+    validate_residency(active_tokens, available_sms);
 
     switch (capacity_bucket(active_tokens)) {
         case 1:

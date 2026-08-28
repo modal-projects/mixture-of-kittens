@@ -21,7 +21,10 @@ inline std::int64_t kimi_k3_decode_workspace_bytes() noexcept {
     return SCRATCH_BYTES;
 }
 
-static __host__ void check_sm103(const at::Tensor &hidden_states, const char *name) {
+static __host__ cudaDeviceProp check_sm103(
+    const at::Tensor &hidden_states,
+    const char *name
+) {
     cudaDeviceProp properties{};
     const int device_index = hidden_states.get_device();
     const cudaError_t status = cudaGetDeviceProperties(&properties, device_index);
@@ -31,6 +34,7 @@ static __host__ void check_sm103(const at::Tensor &hidden_states, const char *na
     TORCH_CHECK(properties.major == 10 && properties.minor == 3,
                 "MoK: ", name, " requires SM103, found sm_",
                 properties.major, properties.minor);
+    return properties;
 }
 
 static __host__ void check_tensor_alignment(
@@ -318,12 +322,14 @@ static __host__ at::Tensor shared_experts_entrypoint(
     }
     check_tensor_alignment(scratch, "_kimi_k3_shared_experts", "scratch",
                            SCRATCH_ALIGNMENT);
-    check_sm103(hidden_states, "_kimi_k3_shared_experts");
+    const cudaDeviceProp properties =
+        check_sm103(hidden_states, "_kimi_k3_shared_experts");
 
     const c10::cuda::CUDAGuard device_guard(device);
     shared_experts::launch_shared_experts(
         hidden_states, shared_gate_proj, shared_up_proj, shared_down_proj,
-        scratch, collective_buffer, static_cast<int>(active_tokens));
+        scratch, collective_buffer, static_cast<int>(active_tokens),
+        properties.multiProcessorCount);
     return collective_buffer.narrow(0, 0, active_tokens)
         .narrow(1, kLatentSize, kHiddenSize);
 }
