@@ -806,8 +806,11 @@ Add a private `mok::_kimi_k3_tail` operator across Python, fake, C++, and
 pybind. It consumes the routed/shared partials in the symmetric collective
 buffer, replicated RMSNorm and latent-up weights, output mailbox pointers,
 barrier state, scratch, TP rank, and active token count. It performs the full
-tail in exactly one launch and returns the active contiguous output alias for
-tests. Task 9 invokes the same device implementation from the final grid.
+tail in exactly one launch, mutates the mailbox, and returns `None`; PyTorch
+custom operators must not return a view that aliases a mutated input. The
+Python private helper and final public API return
+`output_mailbox.view(128,7168)[:M]` after the op. Task 9 invokes the same
+device implementation from the final grid.
 
 - [ ] **Step 4: Run collective tests and graph replay**
 

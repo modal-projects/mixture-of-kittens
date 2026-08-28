@@ -260,7 +260,9 @@ activations, counters, and cached pointer lists. The low-level custom op in
 The symmetric output mailbox uses token-major BF16 layout `[128, 8, 896]`.
 After every rank publishes its 896-column shard, the same storage is a
 contiguous `[128, 7168]` view. Returning its active rows therefore requires no
-output allocation or copy.
+output allocation or copy. The low-level mutating custom op returns `None` to
+respect PyTorch's no-output-alias rule; the high-level Python API returns the
+active mailbox view after the op.
 
 The operator is inference-only and registered with a fake implementation that
 returns BF16 `[M, 7168]`.
