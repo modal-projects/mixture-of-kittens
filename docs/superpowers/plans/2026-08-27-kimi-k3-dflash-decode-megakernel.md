@@ -932,6 +932,9 @@ git commit -m "feat: complete persistent Kimi K3 decode megakernel"
 **Files:**
 - Create: `benchmarks/kimi_k3_timing.py`
 - Create: `benchmarks/bench_kimi_k3_decode.py`
+- Create: `tests/test_kimi_k3_timing.py`
+- Modify: `csrc/kimi_k3_decode/persistent_kernel.cuh`
+- Modify: `csrc/kimi_k3_decode/entrypoints.cuh`
 - Modify: `modal_app.py`
 
 **Interfaces:**
@@ -963,15 +966,18 @@ workspace_stats.json
 
 Add `test_kimi_k3_decode()` and `bench_kimi_k3_decode()` with
 `gpu="B300:8"`. Both invoke `torch.distributed.run --nproc-per-node=8`; the
-benchmark function copies rank-0 artifacts to `/opt/cursor/artifacts`.
+benchmark function returns a tar archive of rank-0 JSON/CSV artifacts. The
+local invocation writes that returned archive into `/opt/cursor/artifacts`
+with Modal's `--write-result`; remote containers do not share the local
+artifact filesystem.
 
 - [ ] **Step 4: Run custom benchmark**
 
 Run:
 
 ```bash
-modal run modal_app.py::test_kimi_k3_decode
-modal run modal_app.py::bench_kimi_k3_decode
+modal run --env rahul-dev modal_app.py::test_kimi_k3_decode
+modal run --env rahul-dev --write-result /opt/cursor/artifacts/kimi_k3_decode_benchmark.tar modal_app.py::bench_kimi_k3_decode
 ```
 
 Expected: correctness passes and all three latency tables contain every
@@ -979,15 +985,17 @@ required shape, 1,000 samples, launch count 1, and workspace bytes.
 
 - [ ] **Step 5: Profile and tune fixed candidates**
 
-Compare persistent-grid sizes 64, 96, and 128 CTAs and expert cluster sizes 1
-and 2. Keep the configuration with the lowest block-16 M=16 median that also
-passes all correctness and p99 checks. Record rejected candidates in the
+Compare persistent-grid sizes 64, 96, 128, and the correctness baseline 148
+CTAs. Compare expert cluster sizes 1 and 2 only when the latter preserves the
+mixed-MMA/tensor-memory contract. Keep the configuration with the lowest
+block-16 M=16 median that passes the complete correctness, graph, occupancy,
+and p99 checks. Record every rejected candidate and its reason in the
 benchmark artifact, not source comments.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add benchmarks/kimi_k3_timing.py benchmarks/bench_kimi_k3_decode.py modal_app.py
+git add benchmarks/kimi_k3_timing.py benchmarks/bench_kimi_k3_decode.py tests/test_kimi_k3_timing.py csrc/kimi_k3_decode/persistent_kernel.cuh csrc/kimi_k3_decode/entrypoints.cuh modal_app.py
 git commit -m "bench: measure Kimi K3 decode latency on B300"
 ```
 
