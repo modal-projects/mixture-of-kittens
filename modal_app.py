@@ -128,6 +128,76 @@ def build_image(spec: GPUSpec) -> modal.Image:
 IMAGE = build_image(SPEC)
 B300_IMAGE = build_image(SPECS["B300"])
 
+# Framework comparison images. Each one derives from an official Kimi K3 serving
+# image and compiles this repository's extension against that image's own
+# PyTorch and CUDA ABI, so no wheel ever crosses an ABI boundary. The images ship
+# pip-installed CUDA wheels rather than a full toolkit, so the compile needs
+# CPATH pointed at the nvidia package headers.
+COMPARISON_IMAGES = {
+    "vllm": "vllm/vllm-openai:kimi-k3",
+    "sglang": "lmsysorg/sglang:kimi-k3",
+}
+COMPARISON_ARTIFACT_FILES = (
+    "manifest.json",
+    "versions.json",
+    "transformations.json",
+    "parity.json",
+    "route_occupancy.json",
+    "latency_block8.json",
+    "latency_block8.csv",
+    "latency_block16.json",
+    "latency_block16.csv",
+    "raw_samples.json",
+    "launch_traces.json",
+    "performance_gates.json",
+)
+_NVIDIA_INCLUDE_GLOB = "/usr/local/lib/python3.12/dist-packages/nvidia/*/include"
+_CPATH_SNIPPET = (
+    "import glob;print(':'.join(sorted(glob.glob("
+    f"'{_NVIDIA_INCLUDE_GLOB}'))))"
+)
+_COMPARISON_BUILD_COMMAND = (
+    f'cd {REMOTE_ROOT} && CPATH="$(python -c "{_CPATH_SNIPPET}")" '
+    f"LIBRARY_PATH={CUDA_STUBS} "
+    "pip install -e . --no-build-isolation --no-deps"
+)
+
+
+def framework_comparison_image(registry_tag: str) -> modal.Image:
+    """Derive a comparison image from one official Kimi K3 serving image."""
+    image = (
+        modal.Image.from_registry(
+            registry_tag,
+            setup_dockerfile_commands=[
+                "RUN ln -sf /usr/bin/python3 /usr/local/bin/python "
+                "&& python --version",
+            ],
+        )
+        .entrypoint([])
+        .apt_install("build-essential", "git")
+        .pip_install("setuptools>=80", "wheel")
+        .env({"MOK_ARCH": "SM103"})
+    )
+    for directory in BUILD_DIRS:
+        image = image.add_local_dir(
+            directory,
+            remote_path=f"{REMOTE_ROOT}/{directory}",
+            copy=True,
+            ignore=["**/__pycache__", "**/*.so", "**/*.egg-info", "**/.git"],
+        )
+    for file in BUILD_FILES:
+        image = image.add_local_file(file, remote_path=f"{REMOTE_ROOT}/{file}", copy=True)
+    image = image.add_local_file(
+        "benchmarks/framework_manifest.json",
+        remote_path=f"{REMOTE_ROOT}/benchmarks/framework_manifest.json",
+        copy=True,
+    )
+    return image.run_commands(_COMPARISON_BUILD_COMMAND).workdir(REMOTE_ROOT)
+
+
+VLLM_COMPARISON_IMAGE = framework_comparison_image(COMPARISON_IMAGES["vllm"])
+SGLANG_COMPARISON_IMAGE = framework_comparison_image(COMPARISON_IMAGES["sglang"])
+
 
 @app.function(image=IMAGE, gpu=SPEC.gpu, timeout=1800)
 def gpu_info() -> None:
@@ -278,6 +348,93 @@ def bench_kimi_k3_decode(git_sha: str) -> bytes:
         if first_archive != second_archive:
             raise RuntimeError("normalized benchmark archive is not reproducible")
         return first_archive
+
+
+def _run_framework_comparison(
+    framework: str,
+    git_sha: str,
+    *,
+    warmup_count: int,
+    sample_count: int,
+    modes: str,
+    tokens: str,
+) -> bytes:
+    """Run one framework comparison on 8x B300 and return its artifact archive."""
+    if len(git_sha) != 40:
+        raise ValueError("git_sha must be the full 40-character commit SHA")
+    with tempfile.TemporaryDirectory(prefix=f"kimi-k3-{framework}-") as directory:
+        output_dir = Path(directory) / "artifacts"
+        arguments = [
+            "-m",
+            "benchmarks.compare_kimi_k3_frameworks",
+            "--framework",
+            framework,
+            "--output-dir",
+            str(output_dir),
+            "--warmup-count",
+            str(warmup_count),
+            "--sample-count",
+            str(sample_count),
+            "--modes",
+            modes,
+        ]
+        if tokens:
+            arguments += ["--tokens", tokens]
+        _run_kimi_k3_torchrun(
+            arguments,
+            timeout=79_000,
+            environment={"MOK_GIT_SHA": git_sha},
+        )
+        expected = set(COMPARISON_ARTIFACT_FILES)
+        actual = {path.name for path in output_dir.iterdir()}
+        if actual != expected:
+            raise RuntimeError(
+                f"{framework} comparison artifacts differ: "
+                f"missing={sorted(expected - actual)}, "
+                f"unexpected={sorted(actual - expected)}"
+            )
+        first_archive = reproducible_tar_bytes(output_dir)
+        if first_archive != reproducible_tar_bytes(output_dir):
+            raise RuntimeError("normalized comparison archive is not reproducible")
+        return first_archive
+
+
+@app.function(image=VLLM_COMPARISON_IMAGE, gpu="B300:8", timeout=86_400)
+def compare_vllm(
+    git_sha: str,
+    warmup_count: int = 500,
+    sample_count: int = 1000,
+    modes: str = "block8,block16",
+    tokens: str = "",
+) -> bytes:
+    """Compare the custom kernel with vLLM's native Kimi K3 MoE layer."""
+    return _run_framework_comparison(
+        "vllm",
+        git_sha,
+        warmup_count=warmup_count,
+        sample_count=sample_count,
+        modes=modes,
+        tokens=tokens,
+    )
+
+
+@app.function(image=SGLANG_COMPARISON_IMAGE, gpu="B300:8", timeout=86_400)
+def compare_sglang(
+    git_sha: str,
+    warmup_count: int = 500,
+    sample_count: int = 1000,
+    modes: str = "block8,block16",
+    tokens: str = "",
+) -> bytes:
+    """Compare the custom kernel with SGLang's native Kimi K3 MoE layer."""
+    return _run_framework_comparison(
+        "sglang",
+        git_sha,
+        warmup_count=warmup_count,
+        sample_count=sample_count,
+        modes=modes,
+        tokens=tokens,
+    )
 
 
 @app.local_entrypoint()
