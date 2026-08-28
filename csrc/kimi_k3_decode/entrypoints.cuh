@@ -239,6 +239,95 @@ static __host__ at::Tensor routed_experts_entrypoint(
     return routed_output.narrow(0, 0, active_tokens);
 }
 
+static __host__ at::Tensor shared_experts_entrypoint(
+    const at::Tensor &hidden_states,
+    const at::Tensor &shared_gate_proj,
+    const at::Tensor &shared_up_proj,
+    const at::Tensor &shared_down_proj,
+    const at::Tensor &scratch,
+    const at::Tensor &collective_buffer,
+    std::int64_t active_tokens
+) {
+    CHECK_INPUT(hidden_states);
+    CHECK_INPUT(shared_gate_proj);
+    CHECK_INPUT(shared_up_proj);
+    CHECK_INPUT(shared_down_proj);
+    CHECK_INPUT(scratch);
+    CHECK_INPUT(collective_buffer);
+
+    TORCH_CHECK(hidden_states.dim() == 2
+                    && hidden_states.size(1) == kHiddenSize
+                    && hidden_states.scalar_type() == at::kBFloat16,
+                "MoK: _kimi_k3_shared_experts requires BF16 hidden_states [M, ",
+                kHiddenSize, "]");
+    const std::int64_t tokens = hidden_states.size(0);
+    TORCH_CHECK(tokens >= 1 && tokens <= kMaxTokens,
+                "MoK: _kimi_k3_shared_experts requires hidden_states with 1 to ",
+                kMaxTokens, " rows");
+    TORCH_CHECK(active_tokens >= 1 && active_tokens <= tokens,
+                "MoK: _kimi_k3_shared_experts requires active_tokens in [1, ",
+                tokens, "]");
+    constexpr int intermediate =
+        kSharedIntermediateSize / kTensorParallelSize;
+    TORCH_CHECK(shared_gate_proj.dim() == 2
+                    && shared_gate_proj.size(0) == intermediate
+                    && shared_gate_proj.size(1) == kHiddenSize
+                    && shared_gate_proj.scalar_type() == at::kBFloat16,
+                "MoK: _kimi_k3_shared_experts requires BF16 shared_gate_proj [",
+                intermediate, ", ", kHiddenSize, "]");
+    TORCH_CHECK(shared_up_proj.dim() == 2
+                    && shared_up_proj.size(0) == intermediate
+                    && shared_up_proj.size(1) == kHiddenSize
+                    && shared_up_proj.scalar_type() == at::kBFloat16,
+                "MoK: _kimi_k3_shared_experts requires BF16 shared_up_proj [",
+                intermediate, ", ", kHiddenSize, "]");
+    TORCH_CHECK(shared_down_proj.dim() == 2
+                    && shared_down_proj.size(0) == kHiddenSize
+                    && shared_down_proj.size(1) == intermediate
+                    && shared_down_proj.scalar_type() == at::kBFloat16,
+                "MoK: _kimi_k3_shared_experts requires BF16 shared_down_proj [",
+                kHiddenSize, ", ", intermediate, "]");
+    TORCH_CHECK(scratch.dim() == 1 && scratch.scalar_type() == at::kByte
+                    && scratch.size(0) >= SCRATCH_BYTES,
+                "MoK: _kimi_k3_shared_experts requires a uint8 scratch of at "
+                "least ", SCRATCH_BYTES, " bytes");
+    TORCH_CHECK(collective_buffer.dim() == 2
+                    && collective_buffer.size(0) == tokens
+                    && collective_buffer.size(1) == kLatentSize + kHiddenSize
+                    && collective_buffer.scalar_type() == at::kBFloat16,
+                "MoK: _kimi_k3_shared_experts requires BF16 collective_buffer [M, ",
+                kLatentSize + kHiddenSize, "]");
+
+    const at::Device device = hidden_states.device();
+    for (const auto *tensor : {
+             &shared_gate_proj, &shared_up_proj, &shared_down_proj,
+             &scratch, &collective_buffer}) {
+        TORCH_CHECK(tensor->device() == device,
+                    "MoK: _kimi_k3_shared_experts requires every tensor on ",
+                    device);
+    }
+    for (const auto &item : {
+             std::pair<const at::Tensor *, const char *>{
+                 &hidden_states, "hidden_states"},
+             {&shared_gate_proj, "shared_gate_proj"},
+             {&shared_up_proj, "shared_up_proj"},
+             {&shared_down_proj, "shared_down_proj"},
+             {&collective_buffer, "collective_buffer"}}) {
+        check_tensor_alignment(*item.first, "_kimi_k3_shared_experts",
+                               item.second, VECTOR_ALIGNMENT);
+    }
+    check_tensor_alignment(scratch, "_kimi_k3_shared_experts", "scratch",
+                           SCRATCH_ALIGNMENT);
+    check_sm103(hidden_states, "_kimi_k3_shared_experts");
+
+    const c10::cuda::CUDAGuard device_guard(device);
+    shared_experts::launch_shared_experts(
+        hidden_states, shared_gate_proj, shared_up_proj, shared_down_proj,
+        scratch, collective_buffer, static_cast<int>(active_tokens));
+    return collective_buffer.narrow(0, 0, active_tokens)
+        .narrow(1, kLatentSize, kHiddenSize);
+}
+
 static __host__ at::Tensor kimi_k3_decode_entrypoint(
     const at::Tensor &hidden_states,
     const at::Tensor &router_weight,

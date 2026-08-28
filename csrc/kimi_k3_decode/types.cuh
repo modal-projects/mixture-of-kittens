@@ -66,17 +66,35 @@ inline constexpr int kRoutedAccumulatorBytes =
     + scratch_byte_region_bytes(
         kMaxRoutes
         * (kRoutedIntermediateSize / kTensorParallelSize / 32));
-
-static constexpr int SCRATCH_BYTES =
+inline constexpr int kSharedGateBytes =
     kRoutedAccumulatorBytes
     + scratch_byte_region_bytes(kMaxTokens * kLatentSize * sizeof(float));
+inline constexpr int kSharedUpBytes =
+    kSharedGateBytes
+    + scratch_byte_region_bytes(
+        kMaxTokens * (kSharedIntermediateSize / kTensorParallelSize)
+        * sizeof(__nv_bfloat16));
+inline constexpr int kSharedActivatedBytes =
+    kSharedUpBytes
+    + scratch_byte_region_bytes(
+        kMaxTokens * (kSharedIntermediateSize / kTensorParallelSize)
+        * sizeof(__nv_bfloat16));
+
+static constexpr int SCRATCH_BYTES =
+    kSharedActivatedBytes
+    + scratch_byte_region_bytes(
+        kMaxTokens * (kSharedIntermediateSize / kTensorParallelSize)
+        * sizeof(__nv_bfloat16));
 
 static_assert(kLatentMxfp8Bytes == 40448);
 static_assert(kLatentScaleBytes == 499200);
 static_assert(kSituMxfp8Bytes == 513536);
 static_assert(kSituScaleBytes == 1299968);
 static_assert(kRoutedAccumulatorBytes == 1324544);
-static_assert(SCRATCH_BYTES == 3159552);
+static_assert(kSharedGateBytes == 3159552);
+static_assert(kSharedUpBytes == 3356160);
+static_assert(kSharedActivatedBytes == 3552768);
+static_assert(SCRATCH_BYTES == 3749376);
 
 // Generation-tagged completion counters. Each role's last CTA clears its arrival
 // counter and bumps its generation, so a reused workspace never needs a host reset.
@@ -88,6 +106,10 @@ inline constexpr int kExpertQuantizationArrivals = 4;
 inline constexpr int kExpertQuantizationGeneration = 5;
 inline constexpr int kExpertCompletionArrivals = 7;
 inline constexpr int kExpertCompletionGeneration = 8;
+inline constexpr int kSharedGateUpArrivals = 9;
+inline constexpr int kSharedGateUpGeneration = 10;
+inline constexpr int kSharedDownArrivals = 11;
+inline constexpr int kSharedDownGeneration = 12;
 
 /// Typed device pointers into one decode workspace.
 struct Scratch {
@@ -103,6 +125,9 @@ struct Scratch {
     std::uint8_t *situ_mxfp8;
     std::uint8_t *situ_scale;
     float *routed_accumulator;
+    __nv_bfloat16 *shared_gate;
+    __nv_bfloat16 *shared_up;
+    __nv_bfloat16 *shared_activated;
 };
 
 __host__ __device__ inline Scratch scratch_view(std::uint8_t *base) {
@@ -119,6 +144,9 @@ __host__ __device__ inline Scratch scratch_view(std::uint8_t *base) {
         base + kSituMxfp8Bytes,
         base + kSituScaleBytes,
         reinterpret_cast<float *>(base + kRoutedAccumulatorBytes),
+        reinterpret_cast<__nv_bfloat16 *>(base + kSharedGateBytes),
+        reinterpret_cast<__nv_bfloat16 *>(base + kSharedUpBytes),
+        reinterpret_cast<__nv_bfloat16 *>(base + kSharedActivatedBytes),
     };
 }
 

@@ -240,6 +240,83 @@ def _kimi_k3_routed_experts(
     )
 
 
+_SHARED_EXPERT_ALIGNMENT = (
+    ("hidden_states", 16),
+    ("shared_gate_proj", 16),
+    ("shared_up_proj", 16),
+    ("shared_down_proj", 16),
+    ("scratch", 256),
+    ("collective_buffer", 16),
+)
+
+_SHARED_EXPERT_SCHEMA = (
+    "_kimi_k3_shared_experts("
+    "Tensor hidden_states, Tensor shared_gate_proj, Tensor shared_up_proj, "
+    "Tensor shared_down_proj, Tensor(a!) scratch, "
+    "Tensor(b!) collective_buffer, int active_tokens"
+    ") -> Tensor(b!)"
+)
+_SHARED_EXPERT_LIBRARY = torch.library.Library("mok", "FRAGMENT")
+_SHARED_EXPERT_LIBRARY.define(_SHARED_EXPERT_SCHEMA)
+
+
+@torch.library.impl("mok::_kimi_k3_shared_experts", "cuda")
+def _kimi_k3_shared_experts_cuda(
+    hidden_states: torch.Tensor,
+    shared_gate_proj: torch.Tensor,
+    shared_up_proj: torch.Tensor,
+    shared_down_proj: torch.Tensor,
+    scratch: torch.Tensor,
+    collective_buffer: torch.Tensor,
+    active_tokens: int,
+) -> torch.Tensor:
+    return _C._kimi_k3_shared_experts(
+        hidden_states,
+        shared_gate_proj,
+        shared_up_proj,
+        shared_down_proj,
+        scratch,
+        collective_buffer,
+        active_tokens,
+    )
+
+
+def _kimi_k3_shared_experts(
+    hidden_states: torch.Tensor,
+    shared_gate_proj: torch.Tensor,
+    shared_up_proj: torch.Tensor,
+    shared_down_proj: torch.Tensor,
+    scratch: torch.Tensor,
+    collective_buffer: torch.Tensor,
+    active_tokens: int,
+) -> torch.Tensor:
+    """Run the rank-local Kimi K3 shared-expert stage in one launch.
+
+    The returned active ``[M, 7168]`` view aliases columns ``3584:10752`` of
+    ``collective_buffer``. This is a private testing boundary for the same
+    producer/consumer role graph that the production persistent kernel uses.
+    """
+    arguments = locals()
+    for field, alignment in _SHARED_EXPERT_ALIGNMENT:
+        if is_fake(arguments[field]):
+            continue
+        past = arguments[field].data_ptr() % alignment
+        if past:
+            raise RuntimeError(
+                f"MoK: _kimi_k3_shared_experts requires {field} aligned to "
+                f"{alignment} bytes, got a pointer {past} bytes past one"
+            )
+    return torch.ops.mok._kimi_k3_shared_experts(
+        hidden_states,
+        shared_gate_proj,
+        shared_up_proj,
+        shared_down_proj,
+        scratch,
+        collective_buffer,
+        active_tokens,
+    )
+
+
 @torch.library.custom_op("mok::pack_kimi_k3_mxfp4", mutates_args=())
 def pack_kimi_k3_mxfp4(
     weight: torch.Tensor,

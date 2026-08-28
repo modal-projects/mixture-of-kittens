@@ -44,6 +44,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("routed_output"),
           pybind11::arg("scratch"),
           pybind11::arg("active_tokens"));
+    m.def("_kimi_k3_shared_experts",
+          &kimi_k3_decode::shared_experts_entrypoint, "",
+          pybind11::arg("hidden_states"),
+          pybind11::arg("shared_gate_proj"),
+          pybind11::arg("shared_up_proj"),
+          pybind11::arg("shared_down_proj"),
+          pybind11::arg("scratch"),
+          pybind11::arg("collective_buffer"),
+          pybind11::arg("active_tokens"));
     m.def("pack_kimi_k3_mxfp4", &kimi_k3_decode::mxfp4::pack_entrypoint, "",
           pybind11::arg("weight"), pybind11::arg("padded_k"));
     m.def("dequant_kimi_k3_mxfp4", &kimi_k3_decode::mxfp4::dequant_entrypoint, "",

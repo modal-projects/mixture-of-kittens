@@ -73,6 +73,19 @@ def _kimi_k3_routed_experts_fake(
     return routed_output[:active_tokens]
 
 
+@torch.library.register_fake("mok::_kimi_k3_shared_experts")
+def _kimi_k3_shared_experts_fake(
+    hidden_states: torch.Tensor,
+    shared_gate_proj: torch.Tensor,
+    shared_up_proj: torch.Tensor,
+    shared_down_proj: torch.Tensor,
+    scratch: torch.Tensor,
+    collective_buffer: torch.Tensor,
+    active_tokens: int,
+) -> torch.Tensor:
+    return collective_buffer[:active_tokens, 3584:10752]
+
+
 @torch.library.register_fake("mok::pack_kimi_k3_mxfp4")
 def _pack_kimi_k3_mxfp4_fake(
     weight: torch.Tensor,

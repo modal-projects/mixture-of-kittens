@@ -65,6 +65,9 @@ def _scratch_layout() -> dict[str, tuple[int, int]]:
         ("situ_mxfp8", MAX_ASSIGNMENTS * INTERMEDIATE),
         ("situ_scale", MAX_ASSIGNMENTS * (INTERMEDIATE // GROUP)),
         ("routed_accumulator", MAX_TOKENS * HIDDEN * 4),
+        ("shared_gate", MAX_TOKENS * 768 * 2),
+        ("shared_up", MAX_TOKENS * 768 * 2),
+        ("shared_activated", MAX_TOKENS * 768 * 2),
     )
     layout: dict[str, tuple[int, int]] = {}
     cursor = 0
@@ -424,7 +427,7 @@ def test_workspace_bytes_matches_extended_expert_scratch(
 ) -> None:
     from mok import _C
 
-    assert SCRATCH_BYTES == 3_159_552
+    assert SCRATCH_BYTES == 3_749_376
     assert _C.kimi_k3_decode_workspace_bytes() == SCRATCH_BYTES
     for name, (offset, _) in SCRATCH_LAYOUT.items():
         if name != "total_bytes":
@@ -434,6 +437,9 @@ def test_workspace_bytes_matches_extended_expert_scratch(
     assert SCRATCH_LAYOUT["situ_mxfp8"] == (513_536, 786_432)
     assert SCRATCH_LAYOUT["situ_scale"] == (1_299_968, 24_576)
     assert SCRATCH_LAYOUT["routed_accumulator"] == (1_324_544, 1_835_008)
+    assert SCRATCH_LAYOUT["shared_gate"] == (3_159_552, 196_608)
+    assert SCRATCH_LAYOUT["shared_up"] == (3_356_160, 196_608)
+    assert SCRATCH_LAYOUT["shared_activated"] == (3_552_768, 196_608)
 
 
 def test_down_row_gain_tag_is_nonperiodic_and_exactly_representable(

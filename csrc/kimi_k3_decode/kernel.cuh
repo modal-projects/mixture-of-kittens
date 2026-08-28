@@ -4,6 +4,7 @@
 
 #include "expert_mxfp4.cuh"
 #include "router.cuh"
+#include "shared.cuh"
 #include "skinny_gemm.cuh"
 #include "types.cuh"
 
