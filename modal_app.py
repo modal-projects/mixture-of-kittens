@@ -87,7 +87,6 @@ BUILD_FILES = (
     "Makefile",
     "README.md",
     "LICENSE",
-    "modal_app.py",
 )
 REMOTE_ROOT = "/root/mok"
 
@@ -113,10 +112,17 @@ def build_image(spec: GPUSpec) -> modal.Image:
         )
     for file in BUILD_FILES:
         image = image.add_local_file(file, remote_path=f"{REMOTE_ROOT}/{file}", copy=True)
-    return image.run_commands(
+    compiled = image.run_commands(
         # Build the CUDA extension during image build; stub dir provides libcuda.
         f"cd {REMOTE_ROOT} && LIBRARY_PATH={CUDA_STUBS} pip install -e . --no-build-isolation",
     ).workdir(REMOTE_ROOT)
+    # Runtime-only source contracts read this file. Keep it after compilation
+    # so edits to Modal orchestration cannot invalidate the CUDA build layer.
+    return compiled.add_local_file(
+        "modal_app.py",
+        remote_path=f"{REMOTE_ROOT}/modal_app.py",
+        copy=True,
+    )
 
 
 IMAGE = build_image(SPEC)

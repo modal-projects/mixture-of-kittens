@@ -34,12 +34,13 @@ namespace persistent {
 // The production Kimi K3 decode path: every stage of one TP8 decode step in a
 // single launch of a single kernel.
 //
-// The grid is fixed at one CTA per B300 SM and never varies with the token
-// count, so the logical work -- up to 128 router tasks, 28 latent-column tasks,
-// 2 688 routed gate/up tasks, 25 088 routed down tasks, the shared expert
-// tasks, and the tail's three roles -- is handed out through the device queues
-// in `persistent_sync.cuh` rather than mapped one task to one block. Six
-// generation-tagged grid barriers separate the phases:
+// The public production grid defaults to one CTA per B300 SM. A guarded
+// benchmark may launch a smaller candidate, but a launch's CTA count never
+// varies with the token count. The logical work -- up to 128 router tasks,
+// 28 latent-column tasks, 2 688 routed gate/up tasks, 25 088 routed down
+// tasks, the shared expert tasks, and the tail's three roles -- is handed out
+// through the device queues in `persistent_sync.cuh` rather than mapped one
+// task to one block. Six generation-tagged grid barriers separate the phases:
 //
 //   0. clear this launch's queue counters and the routed accumulator;
 //   1. route every token and project the routed latent;
@@ -88,8 +89,9 @@ inline constexpr int kWidestStageSharedBytes =
     expert_mxfp4::kGateUpUnitSharedBytes;
 
 // Each CTA holds all 512 tensor-memory columns, so the grid is only correct if
-// exactly one CTA lands on each SM. Requesting more than half of an SM's shared
-// memory is what guarantees that, independently of any occupancy heuristic.
+// every launched CTA lands alone on an SM. Requesting more than half of an
+// SM's shared memory guarantees at most one resident CTA per SM,
+// independently of any occupancy heuristic.
 static_assert(2 * kPersistentSharedBytes > kittens::MAX_SHARED_MEMORY,
               "the persistent grid must be one CTA per SM");
 static_assert(kPersistentSharedBytes <= kittens::MAX_SHARED_MEMORY - 1024,
@@ -202,10 +204,10 @@ inline std::tuple<int, int> queue_bound_for_testing() {
 
 /// Select a non-production grid only from an explicitly-enabled benchmark.
 ///
-/// The public decode wrapper has no grid option and this value starts at the
-/// validated production constant. The private binding checks an environment
-/// guard before changing it, so application code cannot accidentally retain a
-/// tuning candidate.
+/// The public decode wrapper has no grid option and unguarded reads always
+/// return the validated production constant. The private binding checks an
+/// environment guard before changing or exposing stored state, so application
+/// code cannot accidentally retain a tuning candidate.
 static __host__ std::atomic<int> &benchmark_grid_ctas_storage() {
     static std::atomic<int> grid{kPersistentCtas};
     return grid;
@@ -651,10 +653,10 @@ static __host__ int resident_blocks_per_sm() {
 
 /// Reject a device that cannot hold the whole grid at once.
 ///
-/// Every phase barrier counts all 148 CTAs, and a CTA that is not resident
-/// cannot arrive, so a grid that only partly fits does not run slowly -- it
-/// deadlocks. The occupancy query is the measurement that matters; the SM count
-/// is what turns it into a whole-grid answer.
+/// Every phase barrier counts all CTAs in the runtime launch grid, and a CTA
+/// that is not resident cannot arrive, so a grid that only partly fits does
+/// not run slowly -- it deadlocks. The occupancy query is the measurement that
+/// matters; the SM count turns it into a whole-grid answer.
 inline void validate_grid_residency(
     const std::int64_t available_sms,
     const std::int64_t blocks_per_sm,

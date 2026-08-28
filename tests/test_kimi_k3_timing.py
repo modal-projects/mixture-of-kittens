@@ -242,12 +242,19 @@ def test_archive_bytes_ignore_source_metadata(tmp_path: Path) -> None:
 
 def test_modal_exposes_exact_tp8_b300_decode_entrypoints() -> None:
     source = (Path(__file__).parents[1] / "modal_app.py").read_text()
+    build_files = source.split("BUILD_FILES =", 1)[1].split(
+        "REMOTE_ROOT =", 1
+    )[0]
+    builder = source.split("def build_image", 1)[1].split("IMAGE =", 1)[0]
 
     assert "def test_kimi_k3_decode(" in source
     assert "def bench_kimi_k3_decode(" in source
     assert source.count('gpu="B300:8"') >= 2
     assert '"--nproc-per-node=8"' in source
-    assert "MOK_GIT_SHA" not in source.split("def build_image", 1)[1].split(
-        "IMAGE =", 1
-    )[0]
+    assert "MOK_GIT_SHA" not in builder
+    assert '"modal_app.py"' not in build_files
+    assert builder.index(".run_commands(") < builder.index(
+        '"modal_app.py"',
+        builder.index(".run_commands("),
+    )
     assert "return first_archive" in source

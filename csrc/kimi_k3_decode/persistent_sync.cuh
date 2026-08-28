@@ -10,18 +10,18 @@ namespace persistent {
 
 // Grid-wide scheduling primitives for the one-launch production kernel.
 //
-// The kernel runs a fixed, fully resident grid and walks the whole decode step
-// inside it, so it needs two things the private stages never did: a barrier
-// that separates one phase from the next across every CTA, and a queue that
-// lets any CTA claim any logical task. Both are generation-tagged and
+// The kernel walks the whole decode step inside one fully resident launch
+// grid, so it needs two things the private stages never did: a barrier that
+// separates one phase from the next across every launched CTA, and a queue
+// that lets any CTA claim any logical task. Both are generation-tagged and
 // wrap-safe, so a reused workspace never needs a host reset between steps.
 
-/// Every CTA of the production grid, one per B300 SM.
+/// The production-default CTA count, one CTA for every B300 SM.
 ///
-/// The grid is fixed rather than derived from the shape because every phase
-/// barrier below counts arrivals against it. The host proves before launching
-/// that this many CTAs really do co-reside; a partially resident grid would
-/// deadlock on the first barrier.
+/// A launch's count is shape-independent because every phase barrier counts
+/// every CTA in that launch. Production uses this default; the guarded
+/// benchmark may launch a smaller candidate. The host proves the selected
+/// count co-resides, and the kernel reads that count from `gridDim.x`.
 inline constexpr int kPersistentCtas = 148;
 
 /// Dynamic shared memory every CTA requests, in bytes.
@@ -108,10 +108,11 @@ struct GridPhase {
 
 /// Latch this CTA's barrier baseline before any CTA can advance it.
 ///
-/// The counter only moves when all `kPersistentCtas` CTAs have arrived, and a
-/// CTA arrives only after latching, so the value read here is always the one
-/// the previous launch left behind. Every CTA then passes the same number of
-/// barriers, so their targets stay in step for the whole launch.
+/// The counter only moves when all CTAs in the runtime launch grid have
+/// arrived, and a CTA arrives only after latching, so the value read here is
+/// always the one the previous launch left behind. Every CTA then passes the
+/// same number of barriers, so their targets stay in step for the whole
+/// launch.
 static __device__ GridPhase latch_grid_phase(
     const Scratch &scratch,
     std::uint32_t *const slot
@@ -183,8 +184,9 @@ static __device__ void grid_barrier(
 /// counter is cleared at kernel entry and then rises to `units` plus exactly
 /// one refused ticket per CTA, because a CTA leaves the loop on its first
 /// refusal. `persistent_kernel.cuh` static-asserts the resulting bound: the
-/// longest queue is the tensor path's 25 150 down units, which with the 148-CTA
-/// overshoot stops at 25 298 -- nowhere near an unsigned wrap.
+/// longest queue is the tensor path's 25 150 down units. The largest accepted
+/// runtime grid is the 148-CTA production default, so its maximum overshoot
+/// stops at 25 298 -- nowhere near an unsigned wrap.
 static __device__ int claim_unit(
     const Scratch &scratch,
     const int queue_index,
