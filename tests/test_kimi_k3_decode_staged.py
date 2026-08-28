@@ -10,9 +10,9 @@ more than one launch.
 That is what this file is. The adapter below drives the four private stages --
 route and latent projection, mixed W4A8 routed experts, shared experts, and the
 fused TP8 tail -- in sequence over the same workspace and the same weights the
-production call uses. It lands on the same rows, and the profiler sees four K3
-kernels rather than one. Nothing in ``mok`` calls it; it exists so the
-one-launch gate has something to be measured against.
+production call uses. It lands on the same rows, and the profiler sees all four
+stage kernels and more than one launch per step. Nothing in ``mok`` calls it;
+it exists so the one-launch gate has something to be measured against.
 
 Eight ranks, so this file runs under ``torchrun --standalone
 --nproc-per-node=8``.
@@ -171,6 +171,23 @@ def test_the_staged_adapter_computes_the_same_step(
     assert_decode_close(actual, expected)
 
 
+def _stage_kernels(names: list[str]) -> set[str]:
+    """The distinct private-stage kernels a trace names."""
+    return {
+        name
+        for name in names
+        if any(stage in name for stage in PRIVATE_STAGE_KERNELS)
+    }
+
+
+# Both paths are profiled over several steps rather than one. Under eight ranks
+# CUPTI occasionally drops a kernel record, which a single-step trace cannot
+# tell apart from a step that never launched it; over repeats a drop changes
+# neither the set of stages named nor which side of "one kernel per step" each
+# path falls on.
+REPEATS = 3
+
+
 @pytest.mark.parametrize("tokens", [CORE_TOKENS, TENSOR_TOKENS])
 def test_one_launch_is_measured_against_a_four_launch_control(
     workspace: KimiK3DecodeWorkspace,
@@ -183,9 +200,12 @@ def test_one_launch_is_measured_against_a_four_launch_control(
 
     Both paths are warmed first, so neither trace carries a shared-memory
     reservation or a lazy initialization. What is left is the difference the
-    gate is meant to catch: the production step is one kernel and names none of
-    the private stages, while the staged control is four kernels and names
-    nothing else.
+    gate is meant to catch: the production path never exceeds one kernel per
+    step and that kernel is always the persistent one, while the control needs
+    strictly more than one per step and names all four private stages and no
+    persistent kernel. The exact "one kernel, once" claim belongs to
+    ``test_the_whole_step_is_exactly_one_persistent_kernel_launch``; this is
+    what shows that claim is capable of failing.
     """
     _, _, device = tp8_context
     hidden = hidden_states(device, tokens)
@@ -197,26 +217,31 @@ def test_one_launch_is_measured_against_a_four_launch_control(
     decode_step(workspace, weights, hidden)
     _synchronize_ranks(workspace)
 
-    staged_names = profiled_kernel_names(
-        lambda: staged_decode(workspace, weights, hidden, routed_staging)
-    )
-    _synchronize_ranks(workspace)
-    production_names = profiled_kernel_names(
-        lambda: decode_step(workspace, weights, hidden)
-    )
+    def staged_steps() -> None:
+        for _ in range(REPEATS):
+            staged_decode(workspace, weights, hidden, routed_staging)
 
-    staged_k3 = [
-        name
-        for name in staged_names
-        if any(stage in name for stage in PRIVATE_STAGE_KERNELS)
-    ]
-    assert len(staged_k3) == 4, staged_names
+    def production_steps() -> None:
+        for _ in range(REPEATS):
+            decode_step(workspace, weights, hidden)
+
+    staged_names = profiled_kernel_names(staged_steps)
+    _synchronize_ranks(workspace)
+    production_names = profiled_kernel_names(production_steps)
+
+    # Route and latent, routed experts, shared experts, tail -- one distinct
+    # kernel each on whichever capacity path this shape takes.
+    assert len(_stage_kernels(staged_names)) == 4, staged_names
     assert all(PERSISTENT_KERNEL not in name for name in staged_names), (
         staged_names
     )
+    assert len(staged_names) > REPEATS, staged_names
 
-    assert len(production_names) == 1, production_names
-    assert PERSISTENT_KERNEL in production_names[0], production_names
+    assert not _stage_kernels(production_names), production_names
+    assert all(PERSISTENT_KERNEL in name for name in production_names), (
+        production_names
+    )
+    assert 0 < len(production_names) <= REPEATS, production_names
 
     # And the control really did land on the same rows, so the difference
     # between the two traces is only how the step was launched.
