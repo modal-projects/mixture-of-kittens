@@ -81,7 +81,10 @@ app = modal.App("mixture-of-kittens")
 # allowlist (instead of the whole repo) keeps the image content-hash stable, so Modal's
 # layer cache is reused across runs and unrelated files (logs, .venv, .cursor, editor
 # state) never invalidate the cached compile.
-BUILD_DIRS = ("csrc", "mok", "benchmarks", "tests", "third_party/ThunderKittens")
+BUILD_DIRS = ("csrc", "mok", "third_party/ThunderKittens")
+# Added after the compile so editing a benchmark or a test reuses the cached
+# CUDA layer instead of recompiling the extension.
+RUNTIME_DIRS = ("benchmarks", "tests")
 BUILD_FILES = (
     "setup.py",
     "pyproject.toml",
@@ -90,6 +93,7 @@ BUILD_FILES = (
     "LICENSE",
 )
 REMOTE_ROOT = "/root/mok"
+_COPY_IGNORE = ["**/__pycache__", "**/*.so", "**/*.egg-info", "**/.git"]
 
 
 def build_image(spec: GPUSpec) -> modal.Image:
@@ -109,7 +113,7 @@ def build_image(spec: GPUSpec) -> modal.Image:
             directory,
             remote_path=f"{REMOTE_ROOT}/{directory}",
             copy=True,
-            ignore=["**/__pycache__", "**/*.so", "**/*.egg-info", "**/.git"],
+            ignore=_COPY_IGNORE,
         )
     for file in BUILD_FILES:
         image = image.add_local_file(file, remote_path=f"{REMOTE_ROOT}/{file}", copy=True)
@@ -117,6 +121,13 @@ def build_image(spec: GPUSpec) -> modal.Image:
         # Build the CUDA extension during image build; stub dir provides libcuda.
         f"cd {REMOTE_ROOT} && LIBRARY_PATH={CUDA_STUBS} pip install -e . --no-build-isolation",
     ).workdir(REMOTE_ROOT)
+    for directory in RUNTIME_DIRS:
+        compiled = compiled.add_local_dir(
+            directory,
+            remote_path=f"{REMOTE_ROOT}/{directory}",
+            copy=True,
+            ignore=_COPY_IGNORE,
+        )
     # Runtime-only source contracts read this file. Keep it after compilation
     # so edits to Modal orchestration cannot invalidate the CUDA build layer.
     return compiled.add_local_file(
@@ -166,9 +177,8 @@ _COMPARISON_BUILD_COMMAND = (
 
 # Only these paths take part in the CUDA compile. The harness packages are added
 # after it so editing a driver or an adapter reuses the cached compile layer.
-COMPARISON_BUILD_DIRS = ("csrc", "mok", "third_party/ThunderKittens")
-COMPARISON_RUNTIME_DIRS = ("benchmarks", "tests")
-_COPY_IGNORE = ["**/__pycache__", "**/*.so", "**/*.egg-info", "**/.git"]
+COMPARISON_BUILD_DIRS = BUILD_DIRS
+COMPARISON_RUNTIME_DIRS = RUNTIME_DIRS
 
 
 def framework_comparison_image(registry_tag: str) -> modal.Image:
