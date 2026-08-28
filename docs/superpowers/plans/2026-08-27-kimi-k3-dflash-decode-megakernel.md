@@ -836,9 +836,18 @@ git commit -m "feat: fuse Kimi K3 TP8 latent MoE tail"
 **Files:**
 - Modify: `csrc/kimi_k3_decode/kernel.cuh`
 - Modify: `csrc/kimi_k3_decode/entrypoints.cuh`
+- Modify: `csrc/kimi_k3_decode/router.cuh`
+- Modify: `csrc/kimi_k3_decode/skinny_gemm.cuh`
+- Modify: `csrc/kimi_k3_decode/expert_mxfp4.cuh`
+- Modify: `csrc/kimi_k3_decode/shared.cuh`
+- Modify: `csrc/kimi_k3_decode/collectives.cuh`
+- Modify: `csrc/bindings.cu`
 - Modify: `mok/kimi_k3.py`
 - Modify: `mok/ops.py`
 - Modify: `mok/_fake_impls.py`
+- Modify: `tests/test_kimi_k3_api.py`
+- Modify: `tests/test_kimi_k3_tail_contract.py`
+- Create: `tests/test_kimi_k3_tail_signature.py`
 - Create: `tests/test_kimi_k3_decode.py`
 
 **Interfaces:**
@@ -860,25 +869,41 @@ router, projection, expert, shared, or tail kernel.
 
 - [ ] **Step 3: Implement role scheduling inside one grid**
 
-Use a fixed SM103 grid with:
+Use a fixed 148-CTA SM103 grid that is residency-checked before launch. Every
+CTA is resident before any grid-wide phase wait. Device task counters let CTAs
+claim work instead of assigning one permanent block to every logical task.
+Phases are:
 
-- router and latent-down producers;
-- assignment histogram/scan workers;
-- expert work-stealing clusters;
-- shared-branch clusters;
-- tail collective clusters.
+1. router and latent-down work, including assignment histogram/scan;
+2. routed-expert work stealing overlapped with shared gate/up work;
+3. remaining routed work overlapped with shared SiTU/down work;
+4. tail routed/shared reduction, RMSNorm, latent-up, and mailbox assembly.
 
-Every role waits on generation-tagged device counters. Expert workers claim
-expert IDs atomically and skip empty ranges. The tail begins only after routed
-and shared completion counts reach their bucket-specific totals. The host
-entrypoint launches only `kimi_k3_decode_persistent_kernel`.
+Every phase uses wrap-safe generation-tagged release/acquire barriers. Expert
+workers claim expert IDs atomically and skip empty ranges; no CTA serially
+sweeps all 896 experts in the production path. The tail begins only after
+routed and shared completion counts reach their bucket-specific totals. The
+host entrypoint launches only `kimi_k3_decode_persistent_kernel`.
+
+Change the low-level production custom op to return `None` and add the
+mailbox-multicast pointer, barrier target, and workspace signature required by
+Task 8. The high-level
+`mok.kimi_k3.kimi_k3_decode(config, workspace, weights, hidden_states)` validates
+workspace/weight rank and device identity, invokes the mutating op, and returns
+`workspace.output_mailbox.view(128,7168)[:M]` without allocating.
+
+Keep all private stage operators as independently testable fallbacks, but the
+public call must not invoke them. Split the signature fixtures/tests out of
+`tests/test_kimi_k3_tail_contract.py` so each test file remains below 1,000
+lines, and make the fake's zero workspace signature semantics explicit.
 
 - [ ] **Step 4: Run full correctness and launch-count tests**
 
 Run:
 
 ```bash
-torchrun --standalone --nproc-per-node=8 -m pytest -q tests/test_kimi_k3_decode.py
+source .venv/bin/activate
+script -qec "modal shell --env rahul-dev modal_app.py::bench --cmd 'cd /root/mok && torchrun --standalone --nproc-per-node=8 -m pytest -q tests/test_kimi_k3_decode.py'" /dev/null
 ```
 
 Expected: all numerical, finite-value, workspace-reuse, graph-replay, and
@@ -889,7 +914,8 @@ single-launch assertions pass.
 Run:
 
 ```bash
-torchrun --standalone --nproc-per-node=8 -m pytest -q tests/test_ops.py tests/test_functional.py
+source .venv/bin/activate
+script -qec "modal shell --env rahul-dev modal_app.py::bench --cmd 'cd /root/mok && torchrun --standalone --nproc-per-node=8 -m pytest -q tests/test_ops.py tests/test_functional.py'" /dev/null
 ```
 
 Expected: existing MoK operations and functional validation remain green.
@@ -897,7 +923,7 @@ Expected: existing MoK operations and functional validation remain green.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add csrc/kimi_k3_decode mok tests/test_kimi_k3_decode.py
+git add csrc/kimi_k3_decode csrc/bindings.cu mok tests/test_kimi_k3_api.py tests/test_kimi_k3_tail_contract.py tests/test_kimi_k3_tail_signature.py tests/test_kimi_k3_decode.py
 git commit -m "feat: complete persistent Kimi K3 decode megakernel"
 ```
 
