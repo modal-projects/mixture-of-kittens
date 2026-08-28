@@ -81,7 +81,14 @@ app = modal.App("mixture-of-kittens")
 # layer cache is reused across runs and unrelated files (logs, .venv, .cursor, editor
 # state) never invalidate the cached compile.
 BUILD_DIRS = ("csrc", "mok", "benchmarks", "tests", "third_party/ThunderKittens")
-BUILD_FILES = ("setup.py", "pyproject.toml", "Makefile", "README.md", "LICENSE")
+BUILD_FILES = (
+    "setup.py",
+    "pyproject.toml",
+    "Makefile",
+    "README.md",
+    "LICENSE",
+    "modal_app.py",
+)
 REMOTE_ROOT = "/root/mok"
 
 
