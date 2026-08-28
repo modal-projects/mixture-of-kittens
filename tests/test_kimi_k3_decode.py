@@ -67,7 +67,9 @@ from .kimi_k3_decode_support import (
     poison_scratch,
     profiled_kernel_names,
     published_routes,
+    published_shared_partial,
     routing,
+    shared_partial_reference,
     weights,  # noqa: F401
     with_routing,
     workspace,  # noqa: F401
@@ -299,6 +301,53 @@ def test_the_router_publishes_the_exact_ids_and_weights(
         assert actual.keys() == reference.keys()
         for expert, weight in reference.items():
             assert actual[expert] == pytest.approx(weight, rel=2e-3, abs=1e-6)
+
+
+@pytest.mark.parametrize("tokens", [CORE_TOKENS, TENSOR_TOKENS])
+def test_the_shared_partial_matches_the_bf16_rounded_boundary(
+    workspace: KimiK3DecodeWorkspace,
+    weights: KimiK3DecodeWeights,
+    tp8_context: tuple[int, int, torch.device],
+    tokens: int,
+) -> None:
+    """SiTU reads BF16 projections, not the FP32 accumulators behind them.
+
+    ``shared.cuh`` stores each gate and up projection to BF16 scratch and reads
+    it back to evaluate the activation, which is the boundary the official
+    model defines. The difference is small -- one BF16 rounding into a
+    saturating nonlinearity -- but it is systematic, so an oracle that fed SiTU
+    the raw FP32 accumulators would sit permanently offset from a *correct*
+    kernel and would have to hide behind a wider tolerance.
+
+    The tail only reads the collective buffer, so this rank's own shared
+    partial survives the launch and can be compared against both formulations
+    directly, unmixed with the routed path or the eight-way reduction.
+    """
+    _, _, device = tp8_context
+    hidden = hidden_states(device, tokens)
+    _decode(workspace, weights, hidden)
+    torch.cuda.synchronize(device)
+
+    actual = published_shared_partial(workspace.collective_buffer, tokens)
+    rounded = shared_partial_reference(hidden, weights).bfloat16()
+    unrounded = shared_partial_reference(
+        hidden, weights, round_projections=False
+    ).bfloat16()
+
+    # One BF16 rounding of the gate is half an output ULP by the time it
+    # reaches the down projection, so the two formulations are compared where
+    # the device leaves its answer -- in BF16 -- and over the whole block. On
+    # a third of the elements they land on different BF16 values, which is the
+    # separation the comparison below needs to be meaningful.
+    disagreement = float((rounded != unrounded).float().mean())
+    rounded_error = float((actual.float() - rounded.float()).abs().mean())
+    unrounded_error = float((actual.float() - unrounded.float()).abs().mean())
+    assert disagreement > 0.05, disagreement
+    assert rounded_error < 0.25 * unrounded_error, (
+        rounded_error,
+        unrounded_error,
+        disagreement,
+    )
 
 
 @pytest.mark.parametrize("tokens", [CORE_TOKENS, TENSOR_TOKENS])

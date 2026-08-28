@@ -537,14 +537,32 @@ def routed_partial_reference(
 
 
 def shared_partial_reference(
-    hidden: torch.Tensor, weights: KimiK3DecodeWeights
+    hidden: torch.Tensor,
+    weights: KimiK3DecodeWeights,
+    *,
+    round_projections: bool = True,
 ) -> torch.Tensor:
-    """This rank's shared-expert contribution, in BF16 where the kernel is."""
+    """This rank's shared-expert contribution, in BF16 where the kernel is.
+
+    The gate and up projections accumulate in FP32 and are then *stored* as
+    BF16 -- ``shared.cuh`` writes ``scratch.shared_gate`` and
+    ``scratch.shared_up`` and reads them back to evaluate SiTU -- so the
+    activation sees rounded inputs, not the accumulator. Rounding here is what
+    makes the two sides agree at the same boundary the official model defines.
+
+    ``round_projections=False`` feeds the raw FP32 accumulators to SiTU
+    instead. Nothing but
+    ``test_the_shared_partial_matches_the_bf16_rounded_boundary`` passes it:
+    it exists so that test can show the device picks the rounded boundary
+    rather than merely being close to both.
+    """
     activations = hidden.float()
-    activated = kimi_k3_situ_reference(
-        activations @ weights.shared_gate_proj.float().T,
-        activations @ weights.shared_up_proj.float().T,
-    )
+    gate = activations @ weights.shared_gate_proj.float().T
+    up = activations @ weights.shared_up_proj.float().T
+    if round_projections:
+        gate = gate.bfloat16()
+        up = up.bfloat16()
+    activated = kimi_k3_situ_reference(gate, up)
     return activated.float() @ weights.shared_down_proj.float().T
 
 
@@ -658,6 +676,18 @@ def profiled_kernel_names(call: Callable[[], object]) -> list[str]:
         for event in trace["traceEvents"]
         if event.get("cat") == "kernel"
     ]
+
+
+def published_shared_partial(
+    collective_buffer: torch.Tensor, active_tokens: int
+) -> torch.Tensor:
+    """This rank's own shared-expert partial, exactly as the launch left it.
+
+    Both of the tail's reductions are multimem loads, so nothing in the step
+    writes the collective buffer after the shared-down units do. The local copy
+    therefore still holds this rank's contribution alone, unsummed.
+    """
+    return collective_buffer[:active_tokens, LATENT:]
 
 
 def published_routes(
