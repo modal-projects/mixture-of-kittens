@@ -26,6 +26,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from mok import _C
 from mok.kimi_k3 import (
     KIMI_K3_HIDDEN_SIZE,
     KIMI_K3_LATENT_SIZE,
@@ -36,8 +37,11 @@ from mok.kimi_k3 import (
     KIMI_K3_TOPK,
     KIMI_K3_TP_SIZE,
     KIMI_K3_W1W3_K,
+    KimiK3DecodeConfig,
     KimiK3DecodeWeights,
+    KimiK3DecodeWorkspace,
     dequant_kimi_k3_mxfp4,
+    kimi_k3_decode,
     kimi_k3_rmsnorm_reference,
     kimi_k3_router_reference,
     kimi_k3_situ_reference,
@@ -97,6 +101,82 @@ PERSISTENT_KERNEL = "kimi_k3_decode_persistent_kernel"
 # Enough experts to keep the oracle's weight traffic bounded without making its
 # Python loop the cost of the suite.
 _DEQUANT_CHUNK = 64
+
+CONFIG = KimiK3DecodeConfig()
+
+PERSISTENT_CTAS = 148
+PERSISTENT_THREADS = 256
+
+# The phase slots the persistent scheduler owns. Only the last four are bound
+# by the extension, and ``persistent_sync.cuh`` static-asserts that the three
+# queue counters sit directly below the activation counter, so deriving them
+# keeps this mirror honest without adding three more bindings.
+(
+    TIMEOUT_PHASE,
+    GRID_GENERATION,
+    ACTIVATION_ARRIVALS,
+    ACTIVE_EXPERT_UNITS,
+) = _C._kimi_k3_decode_timeout_metadata()
+ROUTE_LATENT_QUEUE = ACTIVATION_ARRIVALS - 3
+GATE_UP_QUEUE = ACTIVATION_ARRIVALS - 2
+DOWN_QUEUE = ACTIVATION_ARRIVALS - 1
+
+
+def decode_step(
+    workspace: KimiK3DecodeWorkspace,
+    weights: KimiK3DecodeWeights,
+    hidden: torch.Tensor,
+) -> torch.Tensor:
+    """One production step, with the launch's own error flag checked."""
+    result = kimi_k3_decode(CONFIG, workspace, weights, hidden)
+    assert int(workspace.error_flag.item()) == 0, (
+        f"the persistent kernel timed out waiting on phase counter "
+        f"{int(_phase(workspace.scratch)[TIMEOUT_PHASE].item())}"
+    )
+    return result
+
+
+def low_level_arguments(
+    workspace: KimiK3DecodeWorkspace,
+    weights: KimiK3DecodeWeights,
+    hidden: torch.Tensor,
+    active_tokens: int,
+) -> dict[str, object]:
+    """Exactly what the high-level wrapper forwards, as a mutable mapping."""
+    return {
+        "hidden_states": hidden,
+        "router_weight": weights.router_weight,
+        "router_correction_bias": weights.router_correction_bias,
+        "routed_expert_down_proj": weights.routed_expert_down_proj,
+        "routed_expert_up_proj": weights.routed_expert_up_proj,
+        "routed_latent_rmsnorm_weight": weights.routed_latent_rmsnorm_weight,
+        "expert_w1_packed": weights.expert_w1_packed,
+        "expert_w1_scale": weights.expert_w1_scale,
+        "expert_w3_packed": weights.expert_w3_packed,
+        "expert_w3_scale": weights.expert_w3_scale,
+        "expert_w2_packed": weights.expert_w2_packed,
+        "expert_w2_scale": weights.expert_w2_scale,
+        "shared_gate_proj": weights.shared_gate_proj,
+        "shared_up_proj": weights.shared_up_proj,
+        "shared_down_proj": weights.shared_down_proj,
+        "scratch": workspace.scratch,
+        "collective_buffer": workspace.collective_buffer,
+        "collective_buffer_ptrs": workspace.collective_ptrs,
+        "collective_buffer_multicast_ptr": workspace.collective_multicast_ptr,
+        "output_mailbox": workspace.output_mailbox,
+        "output_mailbox_ptrs": workspace.output_mailbox_ptrs,
+        "output_mailbox_multicast_ptr": (
+            workspace.output_mailbox_multicast_ptr
+        ),
+        "barrier_buffer": workspace.barrier_buffer,
+        "barrier_buffer_ptrs": workspace.barrier_ptrs,
+        "barrier_buffer_multicast_ptr": workspace.barrier_multicast_ptr,
+        "barrier_target": workspace.barrier_target,
+        "error_flag": workspace.error_flag,
+        "tp_rank": workspace.tp_rank,
+        "active_tokens": active_tokens,
+        "workspace_signature": workspace.workspace_signature,
+    }
 
 
 # ---------------------------------------------------------------------------

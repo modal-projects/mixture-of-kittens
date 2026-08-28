@@ -8,8 +8,10 @@ that it really is one launch, that the resident grid it needs is proven rather
 than assumed, and that a reused workspace never carries state between steps.
 
 The fixtures, the routings, and the oracle live in
-``kimi_k3_decode_support.py``. The private stages the production path no longer
-calls keep their own suites in ``test_kimi_k3_router.py``,
+``kimi_k3_decode_support.py``, and the host boundary -- the schema, the
+alignment contract, the timeout diagnostics, and the rejections -- lives in
+``test_kimi_k3_decode_contract.py``. The private stages the production path no
+longer calls keep their own suites in ``test_kimi_k3_router.py``,
 ``test_kimi_k3_expert.py``, ``test_kimi_k3_shared.py``, and
 ``test_kimi_k3_collectives.py``.
 
@@ -19,16 +21,13 @@ Every test here needs all eight ranks, so this file must be launched through
 
 from __future__ import annotations
 
-import dataclasses
-
 import pytest
 import torch
 
-from mok import _C, ops
+from mok import _C
 from mok.kimi_k3 import (
     KIMI_K3_TOPK,
     KIMI_K3_TP_SIZE,
-    KimiK3DecodeConfig,
     KimiK3DecodeWeights,
     KimiK3DecodeWorkspace,
     kimi_k3_decode,
@@ -36,15 +35,23 @@ from mok.kimi_k3 import (
 )
 
 from .kimi_k3_decode_support import (
+    ACTIVE_EXPERT_UNITS,
     BLOCK8_TOKENS,
     BLOCK16_TOKENS,
+    CONFIG,
     CORE_TOKENS,
+    DOWN_QUEUE,
     EXPERTS,
+    GATE_UP_QUEUE,
+    GRID_GENERATION,
     HIDDEN,
     MAX_TOKENS,
+    PERSISTENT_CTAS,
     PERSISTENT_KERNEL,
+    PERSISTENT_THREADS,
     PRIVATE_STAGE_KERNELS,
     RAW_TOKENS,
+    ROUTE_LATENT_QUEUE,
     TENSOR_TOKENS,
     UINT32_MAX,
     _as_int32,
@@ -55,6 +62,7 @@ from .kimi_k3_decode_support import (
     assert_identical_across_ranks,
     assert_replicated,
     decode_reference,
+    decode_step as _decode,
     hidden_states,
     poison_scratch,
     profiled_kernel_names,
@@ -66,8 +74,6 @@ from .kimi_k3_decode_support import (
 )
 from .kimi_k3_tail_support import _prime_barrier_serial, _rotating_skew
 
-
-CONFIG = KimiK3DecodeConfig()
 
 # Fixed stage widths the task plan is built from, mirrored from the headers so
 # that a silent retiling is caught here rather than only by a slow test.
@@ -82,36 +88,6 @@ CORE_SHARED_DOWN_UNITS = 112      # shared_experts::kCoreDownCtas
 TENSOR_SHARED_DOWN_UNITS = 56     # shared_experts::kTensorDownCtas
 CORE_TAIL_UNITS = 1 + 32 + 14     # coordinator + reduce + core shard
 TENSOR_TAIL_UNITS = 1 + 32 + 7    # coordinator + reduce + tensor shard
-PERSISTENT_CTAS = 148
-PERSISTENT_THREADS = 256
-
-# The phase slots the persistent scheduler owns. Only the last four are bound
-# by the extension, and ``persistent_sync.cuh`` static-asserts that the three
-# queue counters sit directly below the activation counter, so deriving them
-# keeps this mirror honest without adding three more bindings.
-(
-    TIMEOUT_PHASE,
-    GRID_GENERATION,
-    ACTIVATION_ARRIVALS,
-    ACTIVE_EXPERT_UNITS,
-) = _C._kimi_k3_decode_timeout_metadata()
-ROUTE_LATENT_QUEUE = ACTIVATION_ARRIVALS - 3
-GATE_UP_QUEUE = ACTIVATION_ARRIVALS - 2
-DOWN_QUEUE = ACTIVATION_ARRIVALS - 1
-
-
-def _decode(
-    workspace: KimiK3DecodeWorkspace,
-    weights: KimiK3DecodeWeights,
-    hidden: torch.Tensor,
-) -> torch.Tensor:
-    """One production step, with the launch's own error flag checked."""
-    result = kimi_k3_decode(CONFIG, workspace, weights, hidden)
-    assert int(workspace.error_flag.item()) == 0, (
-        f"the persistent kernel timed out waiting on phase counter "
-        f"{int(_phase(workspace.scratch)[TIMEOUT_PHASE].item())}"
-    )
-    return result
 
 
 def _expected_distinct_experts(
@@ -745,200 +721,3 @@ def test_the_step_runs_on_the_current_stream(
     torch.cuda.current_stream(device).wait_stream(side)
     torch.cuda.synchronize(device)
     assert_decode_close(captured, expected)
-
-
-# ---------------------------------------------------------------------------
-# The host boundary.
-# ---------------------------------------------------------------------------
-
-
-def test_the_low_level_operator_returns_nothing_and_names_its_mutations() -> (
-    None
-):
-    """The schema is what ``torch.compile`` and functionalization reason from.
-
-    The step writes its result into a mutated input, and a custom operator may
-    not also return a view that aliases one, so the operator returns nothing
-    and the high-level wrapper takes the view afterwards. Every buffer the
-    kernel writes has to be declared, or a graph transform is free to reorder a
-    reader ahead of it.
-    """
-    schema = torch.ops.mok.kimi_k3_decode.default._schema
-    assert len(schema.returns) == 0
-    mutated = {
-        argument.name
-        for argument in schema.arguments
-        if argument.alias_info is not None and argument.alias_info.is_write
-    }
-    assert mutated == {
-        "scratch",
-        "collective_buffer",
-        "output_mailbox",
-        "barrier_buffer",
-        "barrier_target",
-        "error_flag",
-    }
-
-
-@pytest.mark.parametrize(
-    ("field", "alignment"),
-    [("hidden_states", 16), ("shared_gate_proj", 16), ("scratch", 256)],
-)
-def test_the_step_rejects_an_under_aligned_input(
-    workspace: KimiK3DecodeWorkspace,
-    weights: KimiK3DecodeWeights,
-    tp8_context: tuple[int, int, torch.device],
-    field: str,
-    alignment: int,
-) -> None:
-    """A contiguous view at an odd storage offset is otherwise silent.
-
-    It satisfies every shape and dtype rule while faulting a 16-byte vector
-    load or shifting every 256-byte scratch region, so it is rejected by name
-    before any device work is queued.
-    """
-    _, _, device = tp8_context
-    tokens = 4
-    hidden = hidden_states(device, tokens)
-    arguments = _low_level_arguments(workspace, weights, hidden, tokens)
-    original = arguments[field]
-    padding = alignment // original.element_size()
-    wide = torch.empty(
-        original.numel() + padding,
-        dtype=original.dtype,
-        device=original.device,
-    )
-    arguments[field] = wide[1:1 + original.numel()].view(original.shape)
-
-    with pytest.raises(RuntimeError, match=f"requires {field} aligned"):
-        ops.kimi_k3_decode(**arguments)
-
-
-def test_the_step_rejects_metadata_borrowed_from_another_rank(
-    workspace: KimiK3DecodeWorkspace,
-    weights: KimiK3DecodeWeights,
-    tp8_context: tuple[int, int, torch.device],
-) -> None:
-    """A rank mix-up is silent unless it is checked, so it is checked.
-
-    The kernel reaches its peers through pointers and indexes both the
-    replicated latent-up weight and the mailbox by rank, so a workspace, a
-    weight shard, and a ``tp_rank`` that do not describe the same rank produce
-    a plausible wrong answer rather than a failure.
-    """
-    rank, _, device = tp8_context
-    tokens = 4
-    hidden = hidden_states(device, tokens)
-    other = (rank + 1) % KIMI_K3_TP_SIZE
-
-    with pytest.raises(ValueError, match="weights.tp_rank"):
-        kimi_k3_decode(
-            CONFIG,
-            workspace,
-            dataclasses.replace(weights, tp_rank=other),
-            hidden,
-        )
-
-    arguments = _low_level_arguments(workspace, weights, hidden, tokens)
-    with pytest.raises(RuntimeError, match="this rank's own device pointer"):
-        ops.kimi_k3_decode(**{**arguments, "tp_rank": other})
-
-    with pytest.raises(RuntimeError, match="workspace_signature"):
-        ops.kimi_k3_decode(
-            **{
-                **arguments,
-                "workspace_signature": workspace.workspace_signature ^ 1,
-            }
-        )
-
-    if torch.cuda.device_count() > 1:
-        elsewhere = torch.device(
-            "cuda", (device.index + 1) % torch.cuda.device_count()
-        )
-        with pytest.raises(ValueError, match="must be on"):
-            kimi_k3_decode(
-                CONFIG, workspace, weights, hidden.to(elsewhere)
-            )
-
-
-def _low_level_arguments(
-    workspace: KimiK3DecodeWorkspace,
-    weights: KimiK3DecodeWeights,
-    hidden: torch.Tensor,
-    active_tokens: int,
-) -> dict[str, object]:
-    """Exactly what the high-level wrapper forwards, as a mutable mapping."""
-    return {
-        "hidden_states": hidden,
-        "router_weight": weights.router_weight,
-        "router_correction_bias": weights.router_correction_bias,
-        "routed_expert_down_proj": weights.routed_expert_down_proj,
-        "routed_expert_up_proj": weights.routed_expert_up_proj,
-        "routed_latent_rmsnorm_weight": weights.routed_latent_rmsnorm_weight,
-        "expert_w1_packed": weights.expert_w1_packed,
-        "expert_w1_scale": weights.expert_w1_scale,
-        "expert_w3_packed": weights.expert_w3_packed,
-        "expert_w3_scale": weights.expert_w3_scale,
-        "expert_w2_packed": weights.expert_w2_packed,
-        "expert_w2_scale": weights.expert_w2_scale,
-        "shared_gate_proj": weights.shared_gate_proj,
-        "shared_up_proj": weights.shared_up_proj,
-        "shared_down_proj": weights.shared_down_proj,
-        "scratch": workspace.scratch,
-        "collective_buffer": workspace.collective_buffer,
-        "collective_buffer_ptrs": workspace.collective_ptrs,
-        "collective_buffer_multicast_ptr": workspace.collective_multicast_ptr,
-        "output_mailbox": workspace.output_mailbox,
-        "output_mailbox_ptrs": workspace.output_mailbox_ptrs,
-        "output_mailbox_multicast_ptr": (
-            workspace.output_mailbox_multicast_ptr
-        ),
-        "barrier_buffer": workspace.barrier_buffer,
-        "barrier_buffer_ptrs": workspace.barrier_ptrs,
-        "barrier_buffer_multicast_ptr": workspace.barrier_multicast_ptr,
-        "barrier_target": workspace.barrier_target,
-        "error_flag": workspace.error_flag,
-        "tp_rank": workspace.tp_rank,
-        "active_tokens": active_tokens,
-        "workspace_signature": workspace.workspace_signature,
-    }
-
-
-@pytest.mark.parametrize("active_tokens", [0, -1, MAX_TOKENS + 1])
-def test_the_step_rejects_an_impossible_active_token_count(
-    workspace: KimiK3DecodeWorkspace,
-    weights: KimiK3DecodeWeights,
-    tp8_context: tuple[int, int, torch.device],
-    active_tokens: int,
-) -> None:
-    """The count sizes every queue, so an impossible one is refused up front."""
-    _, _, device = tp8_context
-    hidden = hidden_states(device, 4)
-    arguments = _low_level_arguments(workspace, weights, hidden, 4)
-    with pytest.raises(RuntimeError, match="active_tokens"):
-        ops.kimi_k3_decode(**{**arguments, "active_tokens": active_tokens})
-
-
-def test_the_public_call_leaves_the_workspace_usable_after_a_rejection(
-    workspace: KimiK3DecodeWorkspace,
-    weights: KimiK3DecodeWeights,
-    tp8_context: tuple[int, int, torch.device],
-) -> None:
-    """A refused call queues nothing, so the next real call is unaffected.
-
-    Every rejection above is raised on the host before the launch, which is
-    what keeps a rejected call from leaving half a step's worth of generation
-    counters behind for the next one to wait on.
-    """
-    _, _, device = tp8_context
-    tokens = CORE_TOKENS
-    hidden = hidden_states(device, tokens)
-    expected = decode_reference(hidden, weights)
-
-    arguments = _low_level_arguments(workspace, weights, hidden, tokens)
-    with pytest.raises(RuntimeError):
-        ops.kimi_k3_decode(**{**arguments, "active_tokens": 0})
-    _synchronize_ranks(workspace)
-
-    actual = _decode(workspace, weights, hidden)
-    assert_decode_close(actual, expected)
