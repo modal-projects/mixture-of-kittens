@@ -103,7 +103,11 @@ def _kimi_k3_tail_fake(
     scratch: torch.Tensor,
     tp_rank: int,
     active_tokens: int,
+    workspace_signature: int,
 ) -> None:
+    # A trace carries placeholder addresses, so `workspace_signature` is the
+    # documented placeholder zero here rather than a real workspace's value;
+    # `mok.ops` enforces that, and nothing in a trace depends on it.
     return None
 
 

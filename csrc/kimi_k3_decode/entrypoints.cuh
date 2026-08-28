@@ -5,6 +5,7 @@
 #include "kernel.cuh"
 #include "mxfp4.cuh"
 #include "types.cuh"
+#include "workspace_signature.cuh"
 
 #include <ATen/ops/empty.h>
 #include <ATen/ops/empty_like.h>
@@ -495,6 +496,32 @@ static __host__ void check_multicast_pointers_are_disjoint(
     }
 }
 
+/// Compute the signature that binds one rank's view of a workspace together.
+///
+/// Exposed so `create_kimi_k3_decode_workspace` can record the signature of the
+/// workspace it just built, using the same code the tail checks against.
+static __host__ std::int64_t kimi_k3_workspace_signature_entrypoint(
+    const at::Tensor &collective_buffer,
+    const std::vector<std::int64_t> &collective_buffer_ptrs,
+    std::int64_t collective_buffer_multicast_ptr,
+    const at::Tensor &output_mailbox,
+    const std::vector<std::int64_t> &output_mailbox_ptrs,
+    std::int64_t output_mailbox_multicast_ptr,
+    const at::Tensor &barrier_buffer,
+    const std::vector<std::int64_t> &barrier_buffer_ptrs,
+    std::int64_t barrier_buffer_multicast_ptr,
+    std::int64_t tp_rank
+) {
+    CHECK_INPUT(collective_buffer);
+    CHECK_INPUT(output_mailbox);
+    CHECK_INPUT(barrier_buffer);
+    return workspace_signature::compute(
+        collective_buffer, collective_buffer_ptrs,
+        collective_buffer_multicast_ptr, output_mailbox, output_mailbox_ptrs,
+        output_mailbox_multicast_ptr, barrier_buffer, barrier_buffer_ptrs,
+        barrier_buffer_multicast_ptr, tp_rank);
+}
+
 /// Run the fused TP8 latent-MoE tail for one decode step, in one launch.
 ///
 /// Every rank must call this with the same active token count. Both rendezvous
@@ -520,7 +547,8 @@ static __host__ void kimi_k3_tail_entrypoint(
     const at::Tensor &barrier_target,
     const at::Tensor &scratch,
     std::int64_t tp_rank,
-    std::int64_t active_tokens
+    std::int64_t active_tokens,
+    std::int64_t workspace_signature_value
 ) {
     CHECK_INPUT(routed_latent_rmsnorm_weight);
     CHECK_INPUT(latent_up_proj);
@@ -592,6 +620,27 @@ static __host__ void kimi_k3_tail_entrypoint(
     check_multicast_pointers_are_disjoint(
         collective_buffer_multicast_ptr, output_mailbox_multicast_ptr,
         barrier_buffer_multicast_ptr);
+
+    // Every rule above is per allocation, so none of them can see a caller that
+    // took eight of these pointers from one workspace and the ninth from
+    // another. The signature can: it was folded from all of them at once when
+    // the workspace was created, so recomputing it here from the arguments
+    // actually supplied is enough to reject any tuple that was not built
+    // together. It intentionally accepts a complete second workspace passed
+    // with its own signature.
+    const std::int64_t recomputed = workspace_signature::compute(
+        collective_buffer, collective_buffer_ptrs,
+        collective_buffer_multicast_ptr, output_mailbox, output_mailbox_ptrs,
+        output_mailbox_multicast_ptr, barrier_buffer, barrier_buffer_ptrs,
+        barrier_buffer_multicast_ptr, tp_rank);
+    TORCH_CHECK(recomputed == workspace_signature_value,
+                "MoK: _kimi_k3_tail requires workspace_signature to match the "
+                "supplied tensors, pointer lists, multicast aliases, and "
+                "tp_rank, but they hash to ", recomputed, " while the caller "
+                "passed ", workspace_signature_value,
+                ". One of these pointers belongs to a different workspace, or "
+                "the signature does");
+
     const at::Device device = output_mailbox.device();
     for (const auto &item : {
              std::pair<const at::Tensor *, const char *>{

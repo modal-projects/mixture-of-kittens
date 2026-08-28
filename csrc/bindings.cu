@@ -88,7 +88,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("barrier_target"),
           pybind11::arg("scratch"),
           pybind11::arg("tp_rank"),
-          pybind11::arg("active_tokens"));
+          pybind11::arg("active_tokens"),
+          pybind11::arg("workspace_signature"));
+    m.def("_kimi_k3_workspace_signature",
+          &kimi_k3_decode::kimi_k3_workspace_signature_entrypoint, "",
+          pybind11::arg("collective_buffer"),
+          pybind11::arg("collective_buffer_ptrs"),
+          pybind11::arg("collective_buffer_multicast_ptr"),
+          pybind11::arg("output_mailbox"),
+          pybind11::arg("output_mailbox_ptrs"),
+          pybind11::arg("output_mailbox_multicast_ptr"),
+          pybind11::arg("barrier_buffer"),
+          pybind11::arg("barrier_buffer_ptrs"),
+          pybind11::arg("barrier_buffer_multicast_ptr"),
+          pybind11::arg("tp_rank"));
+    m.def("_kimi_k3_tail_shared_memory_reservations",
+          &kimi_k3_decode::tail::shared_memory_reservations_for_testing, "",
+          pybind11::arg("device"));
     m.def("_kimi_k3_tail_role_plan",
           &kimi_k3_decode::tail::role_plan_for_testing, "",
           pybind11::arg("active_tokens"));

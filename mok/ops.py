@@ -328,6 +328,16 @@ _TAIL_ALIGNMENT = (
 # The tail is TP8 only, so every pointer list has exactly eight entries.
 _TAIL_TP_SIZE = 8
 
+# The workspace signature is folded in unsigned 64-bit arithmetic and masked to
+# 63 bits by `csrc/kimi_k3_decode/workspace_signature.cuh`, so every legitimate
+# value is a non-negative integer that fits the schema's `int`.
+_TAIL_SIGNATURE_MAX = (1 << 63) - 1
+
+# A fake trace has no addresses to fold, so there is no signature it could
+# carry. Zero is reserved as its placeholder: it is documented here, accepted
+# only while tracing, and never recomputed against a real workspace.
+_TAIL_TRACE_SIGNATURE = 0
+
 # Each symmetric allocation the tail drives: its local tensor, its peer-pointer
 # list, its multicast alias, and the byte boundary the device dereferences it on.
 # The two BF16 allocations are read with 16-byte multimem octets; the barrier is
@@ -375,6 +385,18 @@ def _check_tail_symmetric_pointers(arguments: dict[str, object]) -> None:
     tracing = any(
         is_fake(arguments[field]) for field, _, _, _ in _TAIL_SYMMETRIC
     )
+    signature = arguments["workspace_signature"]
+    if type(signature) is not int or not 0 <= signature <= _TAIL_SIGNATURE_MAX:
+        raise RuntimeError(
+            f"MoK: _kimi_k3_tail requires workspace_signature to be an "
+            f"integer in [0, {_TAIL_SIGNATURE_MAX}], got {signature!r}"
+        )
+    if tracing and signature != _TAIL_TRACE_SIGNATURE:
+        raise RuntimeError(
+            f"MoK: _kimi_k3_tail requires workspace_signature "
+            f"{_TAIL_TRACE_SIGNATURE} while tracing fake tensors, because a "
+            f"trace has no addresses to fold, got {signature}"
+        )
     for tensor_field, list_field, multicast_field, alignment in (
         _TAIL_SYMMETRIC
     ):
@@ -466,7 +488,8 @@ _TAIL_SCHEMA = (
     "int output_mailbox_multicast_ptr, "
     "Tensor(c!) barrier_buffer, int[] barrier_buffer_ptrs, "
     "int barrier_buffer_multicast_ptr, Tensor(d!) barrier_target, "
-    "Tensor(e!) scratch, int tp_rank, int active_tokens"
+    "Tensor(e!) scratch, int tp_rank, int active_tokens, "
+    "int workspace_signature"
     ") -> ()"
 )
 _TAIL_LIBRARY = torch.library.Library("mok", "FRAGMENT")
@@ -490,6 +513,7 @@ def _kimi_k3_tail_cuda(
     scratch: torch.Tensor,
     tp_rank: int,
     active_tokens: int,
+    workspace_signature: int,
 ) -> None:
     _C._kimi_k3_tail(
         routed_latent_rmsnorm_weight,
@@ -507,6 +531,7 @@ def _kimi_k3_tail_cuda(
         scratch,
         tp_rank,
         active_tokens,
+        workspace_signature,
     )
 
 
@@ -526,6 +551,7 @@ def _kimi_k3_tail(
     scratch: torch.Tensor,
     tp_rank: int,
     active_tokens: int,
+    workspace_signature: int,
 ) -> torch.Tensor:
     """Close one TP8 Kimi K3 decode step and return the assembled output.
 
@@ -536,6 +562,12 @@ def _kimi_k3_tail(
     multicasts that shard into every rank's token-major mailbox slot. Every
     rank returns the identical ``[active_tokens, 7168]`` view of its own
     mailbox storage; nothing is allocated.
+
+    ``workspace_signature`` is the value
+    ``create_kimi_k3_decode_workspace`` recorded for this rank's workspace. The
+    operator recomputes it from the pointers actually passed and refuses to
+    launch on a mismatch, which is what binds all three symmetric allocations to
+    one workspace rather than to each other.
     """
     arguments = locals()
     for field, alignment in _TAIL_ALIGNMENT:
@@ -564,6 +596,7 @@ def _kimi_k3_tail(
         scratch,
         tp_rank,
         active_tokens,
+        workspace_signature,
     )
     tokens, ranks, shard_columns = output_mailbox.shape
     return output_mailbox.view(tokens, ranks * shard_columns)[:active_tokens]

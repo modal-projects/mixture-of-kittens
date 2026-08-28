@@ -74,6 +74,7 @@ _TAIL_ARGUMENTS = (
     "scratch",
     "tp_rank",
     "active_tokens",
+    "workspace_signature",
 )
 
 # Phase-counter slots the tail owns, mirrored from
@@ -284,6 +285,7 @@ def _call(
         workspace.scratch,
         workspace.tp_rank,
         active_tokens,
+        workspace.workspace_signature,
     )
 
 

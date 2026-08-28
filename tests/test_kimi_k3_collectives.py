@@ -527,6 +527,52 @@ def test_graph_replay_needs_no_host_reset(
 _DEVICE_PLACEMENT_ROWS = (5, 20)
 
 
+def test_tail_reserves_tensor_shared_memory_cold_on_the_workspace_device(
+    tp8_context: tuple[int, int, torch.device],
+    workspace: KimiK3DecodeWorkspace,
+    norm_weight: torch.Tensor,
+    latent_up: torch.Tensor,
+) -> None:
+    """The once-per-device reservation must fire on the tensors' device.
+
+    The tcgen05 path raises its dynamic shared-memory cap once per CUDA ordinal,
+    and the ordinal it uses has to be the one the tensors live on rather than
+    whichever device is current. That is only observable on the launch that
+    actually takes the reservation, so this test insists on being the first
+    tensor-path launch in the process and skips otherwise; the evidence run
+    selects it alone into a fresh process, where it is defined before both
+    placement tests so it is collected first.
+    """
+    rank, _, device = tp8_context
+    if torch.cuda.device_count() < 2:
+        pytest.skip("the cold reservation test needs two visible GPUs")
+    if _C._kimi_k3_tail_shared_memory_reservations(device.index):
+        pytest.skip("an earlier tensor-path launch already warmed this device")
+    active_tokens = 20
+    routed, shared = _partials(device, rank, active_tokens, 4150)
+    _load_partials(workspace, routed, shared)
+    _, expected = _reference(routed, shared, norm_weight, latent_up)
+    other = torch.device(
+        "cuda", (device.index + 1) % torch.cuda.device_count()
+    )
+    assert _C._kimi_k3_tail_shared_memory_reservations(device.index) == 0
+    assert _C._kimi_k3_tail_shared_memory_reservations(other.index) == 0
+
+    torch.cuda.set_device(other)
+    try:
+        actual = _call(workspace, norm_weight, latent_up, active_tokens)
+        torch.cuda.synchronize(device)
+        assert torch.cuda.current_device() == other.index
+    finally:
+        torch.cuda.set_device(device)
+    _synchronize_ranks(workspace)
+
+    assert _C._kimi_k3_tail_shared_memory_reservations(device.index) == 1
+    assert _C._kimi_k3_tail_shared_memory_reservations(other.index) == 0
+    assert actual.device == device
+    _assert_tail_close(actual, expected)
+
+
 @pytest.mark.parametrize("active_tokens", _DEVICE_PLACEMENT_ROWS)
 def test_tail_uses_the_tensor_devices_current_stream(
     tp8_context: tuple[int, int, torch.device],
@@ -584,6 +630,11 @@ def test_tail_runs_on_the_workspace_device_when_another_is_current(
         torch.cuda.set_device(device)
     _synchronize_ranks(workspace)
 
+    # Whether or not this launch was the one that took the reservation, the
+    # ambient device must never have been the one reserved.
+    assert _C._kimi_k3_tail_shared_memory_reservations(other.index) == 0
+    if active_tokens > 8:
+        assert _C._kimi_k3_tail_shared_memory_reservations(device.index) == 1
     assert actual.device == device
     _assert_tail_close(actual, expected)
 

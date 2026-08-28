@@ -186,6 +186,10 @@ def test_workspace_create_is_caller_owned_with_canonical_layout(
         assert created.collective_multicast_ptr > 0
         assert created.output_mailbox_multicast_ptr > 0
         assert created.barrier_multicast_ptr > 0
+        # The signature the tail checks against: recorded at creation, folded
+        # from every pointer above, and masked to 63 bits.
+        assert type(created.workspace_signature) is int
+        assert 0 <= created.workspace_signature < (1 << 63)
     finally:
         barrier_all(
             created.barrier_buffer,

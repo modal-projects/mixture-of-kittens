@@ -13,6 +13,7 @@
 #include <cuda_bf16.h>
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -189,6 +190,29 @@ inline void validate_residency(
         available_sms, " SMs");
 }
 
+/// How many times the reservation below actually ran, per CUDA ordinal.
+///
+/// A `std::once_flag` cannot be asked whether it has fired, so the count is
+/// kept alongside it. It exists for one test: that the reservation happens on
+/// the device the tensors live on, cold, even when a different device is
+/// current -- which is only observable if the test can tell a first launch from
+/// a later one.
+static __host__ std::array<std::atomic<int>, kMaxCudaDevices> &
+shared_memory_reservations() {
+    static std::array<std::atomic<int>, kMaxCudaDevices> counts{};
+    return counts;
+}
+
+static __host__ std::int64_t shared_memory_reservations_for_testing(
+    const std::int64_t device
+) {
+    TORCH_CHECK(device >= 0 && device < kMaxCudaDevices,
+                "MoK: _kimi_k3_tail tracks devices 0 through ",
+                kMaxCudaDevices - 1, ", got ", device);
+    return shared_memory_reservations()[static_cast<std::size_t>(device)].load(
+        std::memory_order_relaxed);
+}
+
 /// Raise the tcgen05 kernel's dynamic shared-memory cap once per device.
 ///
 /// The cap is a property of the compiled function, not of a launch, so raising
@@ -200,11 +224,13 @@ static __host__ void reserve_tensor_shared_memory() {
     C10_CUDA_CHECK(cudaGetDevice(&device));
     TORCH_CHECK(device >= 0 && device < kMaxCudaDevices,
                 "MoK: _kimi_k3_tail saw an unexpected device ordinal ", device);
-    std::call_once(reserved[static_cast<std::size_t>(device)], [] {
+    std::call_once(reserved[static_cast<std::size_t>(device)], [device] {
         C10_CUDA_CHECK(cudaFuncSetAttribute(
             kimi_k3_tail_tensor_kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             kTailTensorDynamicBytes));
+        shared_memory_reservations()[static_cast<std::size_t>(device)]
+            .fetch_add(1, std::memory_order_relaxed);
     });
 }
 

@@ -82,6 +82,11 @@ class KimiK3DecodeWorkspace:
     barrier_multicast_ptr: int
     barrier_target: torch.Tensor
     error_flag: torch.Tensor
+    # Binds all three symmetric allocations, their peer lists, their multicast
+    # aliases, and this rank to one number. The tail recomputes it and refuses
+    # to launch on a mismatch, so a pointer borrowed from a second workspace
+    # cannot pass unnoticed.
+    workspace_signature: int
 
 
 _KIMI_K3_DECODE_WORKSPACE_CACHE: dict[
@@ -211,6 +216,18 @@ def create_kimi_k3_decode_workspace(
     barrier_multicast_ptr = int(barrier_handle.multicast_ptr)
     barrier_target = torch.zeros(1, dtype=torch.int32, device=device)
     error_flag = torch.zeros(1, dtype=torch.int32, device=device)
+    workspace_signature = _C._kimi_k3_workspace_signature(
+        collective_buffer,
+        collective_ptrs,
+        collective_multicast_ptr,
+        output_mailbox,
+        output_mailbox_ptrs,
+        output_mailbox_multicast_ptr,
+        barrier_buffer,
+        barrier_ptrs,
+        barrier_multicast_ptr,
+        tp_rank,
+    )
 
     dist.barrier(
         group=group,
@@ -239,6 +256,7 @@ def create_kimi_k3_decode_workspace(
         barrier_multicast_ptr=barrier_multicast_ptr,
         barrier_target=barrier_target,
         error_flag=error_flag,
+        workspace_signature=workspace_signature,
     )
 
 
