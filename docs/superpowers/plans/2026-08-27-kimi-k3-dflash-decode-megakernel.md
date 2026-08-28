@@ -690,11 +690,11 @@ git commit -m "feat: add Kimi K3 MXFP4 routed experts"
 For every capacity bucket, compare the rank-local partial to:
 
 ```python
-gate = hidden.float() @ shared_gate.float().T
-up = hidden.float() @ shared_up.float().T
+gate = (hidden.float() @ shared_gate.float().T).bfloat16()
+up = (hidden.float() @ shared_up.float().T).bfloat16()
 activated = (
-    4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)
-    * 25.0 * torch.tanh(up / 25.0)
+    4.0 * torch.tanh(gate.float() / 4.0) * torch.sigmoid(gate.float())
+    * 25.0 * torch.tanh(up.float() / 25.0)
 ).bfloat16()
 expected = activated.float() @ shared_down.float().T
 ```
@@ -712,7 +712,9 @@ Expected: shared partial does not match.
 
 - [ ] **Step 3: Implement shared gate/up, SiTU, and down**
 
-Reuse capacity-specialized BF16 routines from `skinny_gemm.cuh`. Give the
+Reuse capacity-specialized BF16 routines from `skinny_gemm.cuh`. Gate and up
+GEMMs accumulate in FP32 and round to BF16 before SiTU converts those values
+back to FP32, matching the official BF16 linear-module boundary. Give the
 shared branch independent persistent CTA roles so it overlaps expert work.
 Write its full-width partial into the shared region of
 `collective_buffer[M,3584:10752]`.

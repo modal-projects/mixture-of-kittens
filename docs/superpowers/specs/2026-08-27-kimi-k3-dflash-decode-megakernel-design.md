@@ -125,6 +125,10 @@ shared_h    = SiTU(shared_gate, shared_up)
 shared_y    = shared_h @ shared_down_proj.T
 ```
 
+The BF16 shared linear modules round `shared_gate` and `shared_up` to BF16
+before SiTU converts them to FP32. This matches the official module boundary
+and the serving-framework implementations.
+
 The final result is:
 
 ```text
