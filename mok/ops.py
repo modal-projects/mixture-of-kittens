@@ -370,6 +370,11 @@ def _check_tail_symmetric_pointers(arguments: dict[str, object]) -> None:
             f"MoK: _kimi_k3_tail requires tp_rank in "
             f"[0, {_TAIL_TP_SIZE - 1}], got {tp_rank}"
         )
+    # A trace carries no addresses, so only the shape of the lists can be
+    # checked; a fake trace legitimately passes placeholder pointers.
+    tracing = any(
+        is_fake(arguments[field]) for field, _, _, _ in _TAIL_SYMMETRIC
+    )
     for tensor_field, list_field, multicast_field, alignment in (
         _TAIL_SYMMETRIC
     ):
@@ -387,7 +392,7 @@ def _check_tail_symmetric_pointers(arguments: dict[str, object]) -> None:
                     f"MoK: _kimi_k3_tail requires {list_field} to hold only "
                     f"positive device pointers, but entry {rank} is {pointer}"
                 )
-        if is_fake(tensor):
+        if tracing:
             continue
         # Checked before alignment and distinctness so that a substituted rank
         # or a swapped list is always reported as what it is.
@@ -431,6 +436,8 @@ def _check_tail_symmetric_pointers(arguments: dict[str, object]) -> None:
                 f"per symmetric allocation, but {multicast_field} equals "
                 f"{list_field} entry {pointers.index(multicast)}"
             )
+    if tracing:
+        return
     # A per-allocation check cannot see this: each pointer is individually
     # valid, so only comparing them against each other reveals that the caller
     # pointed two allocations at the same fabric address.
@@ -445,6 +452,7 @@ def _check_tail_symmetric_pointers(arguments: dict[str, object]) -> None:
                     f"pointer per symmetric allocation, but {field} and "
                     f"{other_field} are both {multicast}"
                 )
+
 
 # The tail mutates the mailbox in place and returns nothing: a custom operator
 # may not return a view that aliases one of its own mutated inputs, so the
