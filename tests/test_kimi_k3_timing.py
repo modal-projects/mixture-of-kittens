@@ -2,60 +2,63 @@
 
 from __future__ import annotations
 
+import importlib
+import io
 import json
+import os
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 
 import pytest
 
-from benchmarks.kimi_k3_timing import (
-    geometric_mean,
-    percentile,
-    rank_max_samples,
-    summarize_rank_max,
-)
-
 
 def test_percentile_uses_linear_interpolation() -> None:
+    timing = importlib.import_module("benchmarks.kimi_k3_timing")
     samples = [10.0, 1.0, 4.0, 7.0, 2.0, 9.0, 3.0, 8.0, 6.0, 5.0]
 
-    assert percentile(samples, 0.0) == 1.0
-    assert percentile(samples, 0.5) == 5.5
-    assert percentile(samples, 0.9) == pytest.approx(9.1)
-    assert percentile(samples, 0.99) == pytest.approx(9.91)
-    assert percentile(samples, 1.0) == 10.0
+    assert timing.percentile(samples, 0.0) == 1.0
+    assert timing.percentile(samples, 0.5) == 5.5
+    assert timing.percentile(samples, 0.9) == pytest.approx(9.1)
+    assert timing.percentile(samples, 0.99) == pytest.approx(9.91)
+    assert timing.percentile(samples, 1.0) == 10.0
 
 
 def test_percentile_rejects_empty_samples_and_invalid_quantiles() -> None:
+    timing = importlib.import_module("benchmarks.kimi_k3_timing")
     with pytest.raises(ValueError, match="at least one"):
-        percentile([], 0.5)
+        timing.percentile([], 0.5)
     with pytest.raises(ValueError, match=r"\[0, 1\]"):
-        percentile([1.0], -0.1)
+        timing.percentile([1.0], -0.1)
     with pytest.raises(ValueError, match=r"\[0, 1\]"):
-        percentile([1.0], 1.1)
+        timing.percentile([1.0], 1.1)
 
 
 def test_geometric_mean_is_computed_in_log_space() -> None:
-    assert geometric_mean([1.0, 4.0, 16.0]) == pytest.approx(4.0)
+    timing = importlib.import_module("benchmarks.kimi_k3_timing")
+
+    assert timing.geometric_mean([1.0, 4.0, 16.0]) == pytest.approx(4.0)
     with pytest.raises(ValueError, match="positive"):
-        geometric_mean([1.0, 0.0])
+        timing.geometric_mean([1.0, 0.0])
 
 
 def test_rank_max_samples_preserves_iteration_alignment() -> None:
+    timing = importlib.import_module("benchmarks.kimi_k3_timing")
     rank_samples = [
         [1.0, 9.0, 3.0, 4.0],
         [2.0, 8.0, 5.0, 1.0],
         [0.5, 7.0, 6.0, 10.0],
     ]
 
-    assert rank_max_samples(rank_samples) == [2.0, 9.0, 6.0, 10.0]
+    assert timing.rank_max_samples(rank_samples) == [2.0, 9.0, 6.0, 10.0]
     with pytest.raises(ValueError, match="same number"):
-        rank_max_samples([[1.0], [1.0, 2.0]])
+        timing.rank_max_samples([[1.0], [1.0, 2.0]])
 
 
 def test_summary_is_over_per_iteration_rank_maxima() -> None:
-    summary = summarize_rank_max(
+    timing = importlib.import_module("benchmarks.kimi_k3_timing")
+    summary = timing.summarize_rank_max(
         [
             [1.0, 4.0, 9.0, 16.0],
             [0.5, 5.0, 8.0, 15.0],
@@ -107,6 +110,134 @@ def test_dry_run_emits_the_complete_shape_manifest(tmp_path: Path) -> None:
     }
     assert manifest["launch_count"] == 1
     assert manifest["pool_policy"]["working_set"] == "strictly_greater_than_l2"
+    assert manifest["pool_policy"]["graph_pool_size"] == 4
+    assert manifest["pool_policy"]["routing"] == (
+        "zero-forcing-bias deterministic disjoint 16-expert blocks"
+    )
+
+
+@pytest.mark.parametrize("tokens", [1, 8, 16, 56, 64, 128])
+def test_route_assignments_occupy_the_realistic_expert_bound(
+    tokens: int,
+) -> None:
+    routes = importlib.import_module("benchmarks.kimi_k3_decode_inputs")
+    pools = [
+        routes.route_assignments(tokens, pool_index)
+        for pool_index in range(routes.GRAPH_POOL_SIZE)
+    ]
+
+    expected = min(16 * tokens, 896)
+    for assignments in pools:
+        assert len(assignments) == tokens
+        assert all(len(set(token_routes)) == 16 for token_routes in assignments)
+        assert len({expert for token in assignments for expert in token}) == expected
+    assert pools[0] != pools[1]
+    expected_pool_coverage = min(expected * routes.GRAPH_POOL_SIZE, 896)
+    assert len(
+        {
+            expert
+            for assignments in pools
+            for token in assignments
+            for expert in token
+        }
+    ) == expected_pool_coverage
+
+
+def test_route_metadata_is_explicit_per_replay_and_pool() -> None:
+    routes = importlib.import_module("benchmarks.kimi_k3_decode_inputs")
+    metadata = routes.route_metadata(
+        tokens=16,
+        expert_weight_bytes=2_193_408,
+        l2_cache_bytes=132_644_864,
+    )
+
+    assert metadata["distinct_experts_per_replay"] == 256
+    assert metadata["pool_wide_distinct_experts"] == 896
+    assert metadata["routed_queue_units_per_replay"] == {
+        "gate_up": 768,
+        "down": 7168,
+        "total": 7936,
+    }
+    assert metadata["routed_expert_working_set_bytes_per_replay"] == 561_512_448
+    assert metadata["routed_expert_working_set_exceeds_l2_per_replay"] is True
+    assert len(metadata["route_assignments_by_pool_entry"]) == 4
+
+
+def test_tuning_order_rotates_and_default_wins_inside_dispersion_band() -> None:
+    timing = importlib.import_module("benchmarks.kimi_k3_timing")
+
+    assert timing.rotating_candidate_orders((64, 96, 128, 148), 3) == [
+        (64, 96, 128, 148),
+        (96, 128, 148, 64),
+        (128, 148, 64, 96),
+    ]
+    winner = timing.select_grid_with_effect_band(
+        [
+            {
+                "grid_ctas": 128,
+                "status": "accepted",
+                "median_of_repeat_medians_ms": 1.0000,
+                "median_dispersion_ms": 0.0010,
+            },
+            {
+                "grid_ctas": 148,
+                "status": "accepted",
+                "median_of_repeat_medians_ms": 1.0005,
+                "median_dispersion_ms": 0.0015,
+            },
+        ],
+        production_grid=148,
+    )
+
+    assert winner["winner_grid_ctas"] == 148
+    assert winner["recommended_non_default"] is False
+    assert winner["minimum_effect_band_ms"] == pytest.approx(0.0015)
+    assert winner["reason"] == "non-default improvement is inside effect band"
+
+
+def test_tuning_selects_a_non_default_only_outside_dispersion_band() -> None:
+    timing = importlib.import_module("benchmarks.kimi_k3_timing")
+    winner = timing.select_grid_with_effect_band(
+        [
+            {
+                "grid_ctas": 128,
+                "status": "accepted",
+                "median_of_repeat_medians_ms": 0.990,
+                "median_dispersion_ms": 0.001,
+            },
+            {
+                "grid_ctas": 148,
+                "status": "accepted",
+                "median_of_repeat_medians_ms": 1.000,
+                "median_dispersion_ms": 0.002,
+            },
+        ],
+        production_grid=148,
+    )
+
+    assert winner["winner_grid_ctas"] == 128
+    assert winner["recommended_non_default"] is True
+    assert winner["minimum_effect_band_ms"] == pytest.approx(0.002)
+
+
+def test_archive_bytes_ignore_source_metadata(tmp_path: Path) -> None:
+    artifacts = importlib.import_module("benchmarks.kimi_k3_artifacts")
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "manifest.json").write_text('{"stable": true}\n')
+    first = artifacts.reproducible_tar_bytes(source)
+
+    os.chmod(source / "manifest.json", 0o600)
+    os.utime(source / "manifest.json", (1_800_000_000, 1_800_000_000))
+    second = artifacts.reproducible_tar_bytes(source)
+
+    assert first == second
+    with tarfile.open(fileobj=io.BytesIO(first), mode="r") as archive:
+        member = archive.getmember("manifest.json")
+    assert member.mtime == 0
+    assert member.uid == member.gid == 0
+    assert member.uname == member.gname == ""
+    assert member.mode == 0o644
 
 
 def test_modal_exposes_exact_tp8_b300_decode_entrypoints() -> None:
@@ -116,4 +247,7 @@ def test_modal_exposes_exact_tp8_b300_decode_entrypoints() -> None:
     assert "def bench_kimi_k3_decode(" in source
     assert source.count('gpu="B300:8"') >= 2
     assert '"--nproc-per-node=8"' in source
-    assert "return archive_path.read_bytes()" in source
+    assert "MOK_GIT_SHA" not in source.split("def build_image", 1)[1].split(
+        "IMAGE =", 1
+    )[0]
+    assert "return first_archive" in source

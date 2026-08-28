@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 
 def percentile(samples: Sequence[float], quantile: float) -> float:
@@ -63,9 +64,85 @@ def summarize_rank_max(
     }
 
 
+def rotating_candidate_orders(
+    candidates: Sequence[int],
+    repeats: int,
+) -> list[tuple[int, ...]]:
+    """Rotate candidate order once per repeat to expose temporal drift."""
+    if not candidates:
+        raise ValueError("candidate order requires at least one grid")
+    if repeats < 1:
+        raise ValueError("candidate order requires at least one repeat")
+    values = tuple(int(candidate) for candidate in candidates)
+    return [
+        values[offset:] + values[:offset]
+        for offset in range(repeats)
+    ]
+
+
+def select_grid_with_effect_band(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    production_grid: int,
+) -> dict[str, Any]:
+    """Select a grid only when its gain clears measured median dispersion."""
+    accepted = [
+        candidate
+        for candidate in candidates
+        if candidate.get("status") == "accepted"
+    ]
+    if not accepted:
+        raise ValueError("grid selection requires an accepted candidate")
+    defaults = [
+        candidate
+        for candidate in accepted
+        if int(candidate["grid_ctas"]) == production_grid
+    ]
+    if len(defaults) != 1:
+        raise ValueError("production grid must be accepted exactly once")
+    default = defaults[0]
+    fastest = min(
+        accepted,
+        key=lambda candidate: float(
+            candidate["median_of_repeat_medians_ms"]
+        ),
+    )
+    effect_band = max(
+        float(default["median_dispersion_ms"]),
+        float(fastest["median_dispersion_ms"]),
+    )
+    improvement = (
+        float(default["median_of_repeat_medians_ms"])
+        - float(fastest["median_of_repeat_medians_ms"])
+    )
+    if int(fastest["grid_ctas"]) == production_grid:
+        winner = default
+        reason = "production default has the lowest measured median"
+        recommended_non_default = False
+    elif improvement > effect_band:
+        winner = fastest
+        reason = "non-default improvement exceeds effect band"
+        recommended_non_default = True
+    else:
+        winner = default
+        reason = "non-default improvement is inside effect band"
+        recommended_non_default = False
+    return {
+        "winner_grid_ctas": int(winner["grid_ctas"]),
+        "fastest_measured_grid_ctas": int(fastest["grid_ctas"]),
+        "production_grid_ctas": production_grid,
+        "minimum_effect_band_ms": effect_band,
+        "fastest_improvement_over_production_ms": improvement,
+        "recommended_non_default": recommended_non_default,
+        "reason": reason,
+    }
+
+
 __all__ = [
     "geometric_mean",
     "percentile",
     "rank_max_samples",
+    "rotating_candidate_orders",
+    "select_grid_with_effect_band",
     "summarize_rank_max",
 ]

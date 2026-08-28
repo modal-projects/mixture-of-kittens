@@ -77,6 +77,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("grid_ctas"));
     m.def("_kimi_k3_decode_benchmark_grid",
           &kimi_k3_decode::persistent::benchmark_grid_ctas_for_testing);
+    m.def("_kimi_k3_decode_benchmark_grids", []() {
+        const auto &grids =
+            kimi_k3_decode::persistent::kBenchmarkGridCtas;
+        return std::make_tuple(
+            static_cast<std::int64_t>(grids[0]),
+            static_cast<std::int64_t>(grids[1]),
+            static_cast<std::int64_t>(grids[2]),
+            static_cast<std::int64_t>(grids[3]));
+    });
     m.def("_kimi_k3_route_and_project",
           &kimi_k3_decode::route_and_project_entrypoint, "",
           pybind11::arg("hidden_states"),

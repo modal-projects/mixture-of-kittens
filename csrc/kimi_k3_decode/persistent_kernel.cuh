@@ -56,8 +56,32 @@ namespace persistent {
 // process drives several.
 inline constexpr int kMaxCudaDevices = 32;
 
-/// Largest grid accepted by the benchmark-only runtime tuning hook.
-inline constexpr int kMaximumBenchmarkCtas = 148;
+/// Benchmark grids are rounded above the widest complete tail role set.
+inline constexpr int kBenchmarkGridQuantum = 32;
+inline constexpr int kLargestTailRoleCtas =
+    tail::kCoreRoleCtas > tail::kTensorRoleCtas
+        ? tail::kCoreRoleCtas : tail::kTensorRoleCtas;
+inline constexpr int kMinimumBenchmarkCtas =
+    ((kLargestTailRoleCtas + kBenchmarkGridQuantum - 1)
+        / kBenchmarkGridQuantum) * kBenchmarkGridQuantum;
+inline constexpr int kMaximumBenchmarkCtas = kPersistentCtas;
+inline constexpr int kBenchmarkGridStep = kMinimumBenchmarkCtas / 2;
+inline constexpr std::array<int, 4> kBenchmarkGridCtas{
+    kMinimumBenchmarkCtas,
+    kMinimumBenchmarkCtas + kBenchmarkGridStep,
+    kMinimumBenchmarkCtas + 2 * kBenchmarkGridStep,
+    kMaximumBenchmarkCtas,
+};
+
+static_assert(kMinimumBenchmarkCtas >= tail::kCoordinatorCtas);
+static_assert(kMinimumBenchmarkCtas >= tail::kReduceCtas);
+static_assert(kMinimumBenchmarkCtas >= tail::kCoreShardCtas);
+static_assert(kMinimumBenchmarkCtas >= tail::kTensorShardCtas);
+static_assert(kMinimumBenchmarkCtas >= tail::kCoreRoleCtas);
+static_assert(kMinimumBenchmarkCtas >= tail::kTensorRoleCtas);
+static_assert(kMinimumBenchmarkCtas == 64);
+static_assert(kMaximumBenchmarkCtas == kPersistentCtas);
+static_assert(kBenchmarkGridCtas[2] < kBenchmarkGridCtas[3]);
 
 /// The widest shared-memory footprint any stage this kernel runs asks for.
 inline constexpr int kWidestStageSharedBytes =
@@ -145,6 +169,9 @@ inline constexpr int kLongestQueueTicket =
 static_assert(kLongestQueueUnits == 25150,
               "the widest phase is 6 activation + 56 shared-down + 896 * 28 "
               "routed down units");
+static_assert(kLongestQueueTicket
+                  == kLongestQueueUnits + kPersistentCtas,
+              "the ticket bound must cover the largest production grid");
 static_assert(kLongestQueueTicket == 25298,
               "the widest phase plus one refused ticket for each of 148 CTAs");
 static_assert(static_cast<unsigned int>(kLongestQueueTicket)
@@ -184,20 +211,28 @@ static __host__ std::atomic<int> &benchmark_grid_ctas_storage() {
     return grid;
 }
 
+inline bool benchmark_grid_tuning_enabled() {
+    const char *const enabled =
+        std::getenv("MOK_KIMI_K3_ENABLE_GRID_TUNING");
+    return enabled != nullptr && std::strcmp(enabled, "1") == 0;
+}
+
 inline std::int64_t benchmark_grid_ctas_for_testing() {
+    if (!benchmark_grid_tuning_enabled()) return kPersistentCtas;
     return benchmark_grid_ctas_storage().load(std::memory_order_relaxed);
 }
 
 inline void set_benchmark_grid_ctas_for_testing(const std::int64_t grid_ctas) {
-    const char *const enabled =
-        std::getenv("MOK_KIMI_K3_ENABLE_GRID_TUNING");
     TORCH_CHECK(
-        enabled != nullptr && std::strcmp(enabled, "1") == 0,
+        benchmark_grid_tuning_enabled(),
         "MoK: Kimi K3 grid override is benchmark-only; set "
         "MOK_KIMI_K3_ENABLE_GRID_TUNING=1 in a dedicated benchmark process");
+    bool accepted = false;
+    for (const int candidate : kBenchmarkGridCtas) {
+        accepted = accepted || grid_ctas == candidate;
+    }
     TORCH_CHECK(
-        grid_ctas == 64 || grid_ctas == 96 || grid_ctas == 128
-            || grid_ctas == 148,
+        accepted,
         "MoK: Kimi K3 benchmark grid must be one of 64, 96, 128, or 148, got ",
         grid_ctas);
     benchmark_grid_ctas_storage().store(
@@ -286,8 +321,7 @@ void kimi_k3_decode_persistent_kernel(
     std::uint8_t *__restrict__ scratch_bytes,
     int *__restrict__ error_flag,
     const int tp_rank,
-    const int active_tokens,
-    const int grid_ctas
+    const int active_tokens
 ) {
     extern __shared__ __align__(16) int shared_raw[];
     std::uint8_t *const shared = reinterpret_cast<std::uint8_t *>(shared_raw);
@@ -297,6 +331,7 @@ void kimi_k3_decode_persistent_kernel(
     const Scratch scratch = scratch_view(scratch_bytes);
     const int block = static_cast<int>(blockIdx.x);
     const int thread = static_cast<int>(threadIdx.x);
+    const int grid_ctas = static_cast<int>(gridDim.x);
 
     // The managed allocator barriers the whole CTA and a CTA may allocate
     // tensor memory only once, so the pool is provisioned here, before any
@@ -738,8 +773,7 @@ static __host__ void launch_persistent(
             reinterpret_cast<std::uint8_t *>(arguments.scratch.data_ptr()),
             reinterpret_cast<int *>(arguments.error_flag.data_ptr()),
             arguments.tp_rank,
-            arguments.active_tokens,
-            arguments.grid_ctas);
+            arguments.active_tokens);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

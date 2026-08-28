@@ -28,12 +28,13 @@ Environment overrides:
 
 import os
 import subprocess
-import tarfile
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import modal
+
+from benchmarks.kimi_k3_artifacts import reproducible_tar_bytes
 
 
 @dataclass(frozen=True)
@@ -84,21 +85,6 @@ BUILD_FILES = ("setup.py", "pyproject.toml", "Makefile", "README.md", "LICENSE")
 REMOTE_ROOT = "/root/mok"
 
 
-def _local_git_sha() -> str:
-    try:
-        return subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return "unavailable"
-
-
-GIT_SHA = _local_git_sha()
-
-
 def build_image(spec: GPUSpec) -> modal.Image:
     """Build a MoK image for one architecture. Modal caches each distinct image."""
     image = (
@@ -109,7 +95,7 @@ def build_image(spec: GPUSpec) -> modal.Image:
         .pip_install("setuptools>=80", "wheel")
         .pip_install(spec.torch_spec, index_url=spec.torch_index)
         .pip_install("pytest>=9,<10", "numpy")
-        .env({"MOK_ARCH": spec.mok_arch, "MOK_GIT_SHA": GIT_SHA})
+        .env({"MOK_ARCH": spec.mok_arch})
     )
     for directory in BUILD_DIRS:
         image = image.add_local_dir(
@@ -191,7 +177,12 @@ def bench() -> None:
     _run_bench(BENCH_NPROC)
 
 
-def _run_kimi_k3_torchrun(arguments: list[str], *, timeout: int) -> None:
+def _run_kimi_k3_torchrun(
+    arguments: list[str],
+    *,
+    timeout: int,
+    environment: dict[str, str] | None = None,
+) -> None:
     command = [
         "python",
         "-m",
@@ -204,7 +195,11 @@ def _run_kimi_k3_torchrun(arguments: list[str], *, timeout: int) -> None:
     subprocess.run(
         command,
         cwd=REMOTE_ROOT,
-        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        env={
+            **os.environ,
+            **(environment or {}),
+            "PYTHONUNBUFFERED": "1",
+        },
         check=True,
         timeout=timeout,
     )
@@ -213,21 +208,26 @@ def _run_kimi_k3_torchrun(arguments: list[str], *, timeout: int) -> None:
 @app.function(image=B300_IMAGE, gpu="B300:8", timeout=14_400)
 def test_kimi_k3_decode() -> None:
     """Run TP8 decode correctness plus SM103 resource and launch checks."""
+    test_files = sorted(
+        str(path)
+        for path in Path("tests").glob("test_kimi_k3*.py")
+    )
     _run_kimi_k3_torchrun(
         [
             "-m",
             "pytest",
             "-q",
-            "tests/test_kimi_k3_decode.py",
-            "tests/test_kimi_k3_sm103_binary.py",
+            *test_files,
         ],
         timeout=14_100,
     )
 
 
 @app.function(image=B300_IMAGE, gpu="B300:8", timeout=86_400)
-def bench_kimi_k3_decode() -> bytes:
+def bench_kimi_k3_decode(git_sha: str) -> bytes:
     """Run grid tuning and all decode tables, returning rank-0 artifacts."""
+    if len(git_sha) != 40:
+        raise ValueError("git_sha must be the full 40-character commit SHA")
     with tempfile.TemporaryDirectory(prefix="kimi-k3-decode-") as directory:
         root = Path(directory)
         output_dir = root / "artifacts"
@@ -239,6 +239,7 @@ def bench_kimi_k3_decode() -> bytes:
                 str(output_dir),
             ],
             timeout=86_100,
+            environment={"MOK_GIT_SHA": git_sha},
         )
         expected = {
             "manifest.json",
@@ -259,11 +260,11 @@ def bench_kimi_k3_decode() -> bytes:
                 f"missing={sorted(expected - actual)}, "
                 f"unexpected={sorted(actual - expected)}"
             )
-        archive_path = root / "kimi_k3_decode_benchmark.tar"
-        with tarfile.open(archive_path, "w") as archive:
-            for path in sorted(output_dir.iterdir()):
-                archive.add(path, arcname=path.name)
-        return archive_path.read_bytes()
+        first_archive = reproducible_tar_bytes(output_dir)
+        second_archive = reproducible_tar_bytes(output_dir)
+        if first_archive != second_archive:
+            raise RuntimeError("normalized benchmark archive is not reproducible")
+        return first_archive
 
 
 @app.local_entrypoint()

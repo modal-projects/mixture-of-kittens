@@ -463,6 +463,32 @@ def test_the_persistent_grid_is_proven_resident_before_it_is_launched(
         _C._kimi_k3_decode_validate_residency(PERSISTENT_CTAS - 1, 1)
 
 
+def test_the_benchmark_grid_override_cannot_leak_into_production(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The private tuning hook is finite, guarded, and fail-closed."""
+    production = _C._kimi_k3_decode_grid_shape()[0]
+    candidates = tuple(_C._kimi_k3_decode_benchmark_grids())
+    assert production == PERSISTENT_CTAS == candidates[-1]
+
+    monkeypatch.delenv("MOK_KIMI_K3_ENABLE_GRID_TUNING", raising=False)
+    assert _C._kimi_k3_decode_benchmark_grid() == production
+    with pytest.raises(RuntimeError, match="benchmark-only"):
+        _C._kimi_k3_decode_set_benchmark_grid(candidates[0])
+
+    monkeypatch.setenv("MOK_KIMI_K3_ENABLE_GRID_TUNING", "1")
+    for invalid in (0, candidates[0] - 1, candidates[0] + 1, production + 1):
+        with pytest.raises(RuntimeError, match="benchmark grid must be one of"):
+            _C._kimi_k3_decode_set_benchmark_grid(invalid)
+    for candidate in candidates:
+        _C._kimi_k3_decode_set_benchmark_grid(candidate)
+        assert _C._kimi_k3_decode_benchmark_grid() == candidate
+
+    _C._kimi_k3_decode_set_benchmark_grid(candidates[0])
+    monkeypatch.delenv("MOK_KIMI_K3_ENABLE_GRID_TUNING")
+    assert _C._kimi_k3_decode_benchmark_grid() == production
+
+
 def test_the_shared_memory_reservation_happens_once_per_device(
     tp8_context: tuple[int, int, torch.device],
 ) -> None:
