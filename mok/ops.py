@@ -640,8 +640,8 @@ _TAIL_SCHEMA = (
     "int output_mailbox_multicast_ptr, "
     "Tensor(c!) barrier_buffer, int[] barrier_buffer_ptrs, "
     "int barrier_buffer_multicast_ptr, Tensor(d!) barrier_target, "
-    "Tensor(e!) scratch, int tp_rank, int active_tokens, "
-    "int workspace_signature"
+    "Tensor(e!) scratch, Tensor(f!) error_flag, int tp_rank, "
+    "int active_tokens, int workspace_signature"
     ") -> ()"
 )
 _TAIL_LIBRARY = torch.library.Library("mok", "FRAGMENT")
@@ -663,6 +663,7 @@ def _kimi_k3_tail_cuda(
     barrier_buffer_multicast_ptr: int,
     barrier_target: torch.Tensor,
     scratch: torch.Tensor,
+    error_flag: torch.Tensor,
     tp_rank: int,
     active_tokens: int,
     workspace_signature: int,
@@ -681,6 +682,7 @@ def _kimi_k3_tail_cuda(
         barrier_buffer_multicast_ptr,
         barrier_target,
         scratch,
+        error_flag,
         tp_rank,
         active_tokens,
         workspace_signature,
@@ -701,6 +703,7 @@ def _kimi_k3_tail(
     barrier_buffer_multicast_ptr: int,
     barrier_target: torch.Tensor,
     scratch: torch.Tensor,
+    error_flag: torch.Tensor,
     tp_rank: int,
     active_tokens: int,
     workspace_signature: int,
@@ -720,6 +723,12 @@ def _kimi_k3_tail(
     operator recomputes it from the pointers actually passed and refuses to
     launch on a mismatch, which is what binds all three symmetric allocations to
     one workspace rather than to each other.
+
+    ``error_flag`` is the caller-visible half of the tail's timeout
+    diagnostics. Every bounded wait in the launch writes a site-specific
+    nonzero code into it, and the slot it stalled on into the tail timeout
+    counter in ``scratch``, before it traps; a launch that completes leaves
+    both untouched.
     """
     arguments = locals()
     for field, alignment in _TAIL_ALIGNMENT:
@@ -746,6 +755,7 @@ def _kimi_k3_tail(
         barrier_buffer_multicast_ptr,
         barrier_target,
         scratch,
+        error_flag,
         tp_rank,
         active_tokens,
         workspace_signature,

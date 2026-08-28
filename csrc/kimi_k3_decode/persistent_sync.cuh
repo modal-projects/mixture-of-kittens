@@ -82,18 +82,21 @@ static __device__ __forceinline__ std::uint32_t load_relaxed_gpu(
 /// Record the counter a bounded spin gave up on, then trap this launch.
 ///
 /// `error_flag` is the caller-visible copy: the scratch slot names which
-/// counter stalled, and the flag says a launch stalled at all without the host
-/// having to know the scratch layout.
+/// counter stalled, and the flag carries the site's own code, so a host that
+/// only reads the flag still learns which wait failed without having to know
+/// the scratch layout. Both are nonzero, so zero keeps meaning "no timeout".
 static __device__ __forceinline__ void record_timeout_and_trap(
     const Scratch &scratch,
     int *__restrict__ const error_flag,
-    const int counter_index
+    const int counter_index,
+    const int error_code
 ) {
     atomicExch(
         reinterpret_cast<unsigned int *>(
             &scratch.phase[kPersistentTimeoutPhase]),
         static_cast<unsigned int>(counter_index));
-    atomicExch(reinterpret_cast<unsigned int *>(error_flag), 1u);
+    atomicExch(reinterpret_cast<unsigned int *>(error_flag),
+               static_cast<unsigned int>(error_code));
     __threadfence_system();
     asm volatile("trap;");
 }
@@ -159,7 +162,8 @@ static __device__ void grid_barrier(
             )) {
                 if (wait_timed_out(started, clock64())) {
                     record_timeout_and_trap(
-                        scratch, error_flag, kGridGeneration);
+                        scratch, error_flag, kGridGeneration,
+                        kErrorPersistentGridBarrier);
                 }
                 __nanosleep(64);
             }
@@ -207,14 +211,16 @@ static __device__ void wait_for_count(
     const Scratch &scratch,
     int *__restrict__ const error_flag,
     const int counter_index,
-    const int target
+    const int target,
+    const int error_code
 ) {
     if (threadIdx.x == 0) {
         const std::uint64_t started = clock64();
         while (load_relaxed_gpu(&scratch.phase[counter_index])
                < static_cast<std::uint32_t>(target)) {
             if (wait_timed_out(started, clock64())) {
-                record_timeout_and_trap(scratch, error_flag, counter_index);
+                record_timeout_and_trap(
+                    scratch, error_flag, counter_index, error_code);
             }
             __nanosleep(64);
         }

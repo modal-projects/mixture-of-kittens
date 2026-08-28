@@ -109,6 +109,7 @@ def _kimi_k3_tail_fake(
     barrier_buffer_multicast_ptr: int,
     barrier_target: torch.Tensor,
     scratch: torch.Tensor,
+    error_flag: torch.Tensor,
     tp_rank: int,
     active_tokens: int,
     workspace_signature: int,

@@ -187,6 +187,67 @@ inline constexpr int kActiveExpertUnits = 33;
 inline constexpr int kPersistentTimeoutPhase = 34;
 static_assert(kPersistentTimeoutPhase < NUM_PHASE_COUNTERS);
 
+// ---------------------------------------------------------------------------
+// Timeout diagnostics.
+//
+// A bounded wait that gives up writes two things before it traps: the phase
+// slot it was waiting on, into the timeout counter for its half of the step,
+// and one of the codes below, into the caller-visible `error_flag`. Both are
+// needed. The slot alone cannot name the site, because several sites wait on
+// the same counter -- the entry rendezvous and the reduce role both wait on
+// `kTailEntryGeneration` -- and the flag alone does not survive a workspace
+// whose scratch the caller never reads. Every code is nonzero, so zero keeps
+// its meaning: no wait has ever timed out on this workspace.
+// ---------------------------------------------------------------------------
+
+inline constexpr int kErrorTailEntryRendezvous = 1;
+inline constexpr int kErrorTailExitRendezvous = 2;
+inline constexpr int kErrorTailCoordinatorShard = 3;
+inline constexpr int kErrorTailReduceEntry = 4;
+inline constexpr int kErrorTailShardReduce = 5;
+inline constexpr int kErrorTailDrainExit = 6;
+inline constexpr int kErrorPersistentGridBarrier = 7;
+inline constexpr int kErrorPersistentActivation = 8;
+
+/// One bounded wait, named by the code it reports and the slots it writes.
+struct TimeoutSite {
+    const char *name;
+    int code;
+    int timeout_slot;
+    int counter;
+};
+
+/// Every bounded wait either tail path can give up on, in code order.
+///
+/// The tests walk this table against the sources, so a wait added without a
+/// code, or a code added without a wait, fails rather than silently trapping
+/// with a diagnostic the caller cannot interpret.
+inline constexpr TimeoutSite kTimeoutSites[] = {
+    {"tail_entry_rendezvous", kErrorTailEntryRendezvous,
+     kTailTimeoutPhase, kTailEntryGeneration},
+    {"tail_exit_rendezvous", kErrorTailExitRendezvous,
+     kTailTimeoutPhase, kTailExitGeneration},
+    {"tail_coordinator_shard", kErrorTailCoordinatorShard,
+     kTailTimeoutPhase, kTailShardGeneration},
+    {"tail_reduce_entry", kErrorTailReduceEntry,
+     kTailTimeoutPhase, kTailEntryGeneration},
+    {"tail_shard_reduce", kErrorTailShardReduce,
+     kTailTimeoutPhase, kTailReduceGeneration},
+    {"tail_drain_exit", kErrorTailDrainExit,
+     kTailTimeoutPhase, kTailExitGeneration},
+    {"persistent_grid_barrier", kErrorPersistentGridBarrier,
+     kPersistentTimeoutPhase, kGridGeneration},
+    {"persistent_shared_activation", kErrorPersistentActivation,
+     kPersistentTimeoutPhase, kActivationArrivals},
+};
+
+inline constexpr int kTimeoutSiteCount =
+    static_cast<int>(sizeof(kTimeoutSites) / sizeof(kTimeoutSites[0]));
+
+static_assert(kTimeoutSiteCount == 8);
+static_assert(kTimeoutSites[kTimeoutSiteCount - 1].code == kTimeoutSiteCount,
+              "the timeout codes must be a dense nonzero range");
+
 /// Typed device pointers into one decode workspace.
 struct Scratch {
     int *phase;

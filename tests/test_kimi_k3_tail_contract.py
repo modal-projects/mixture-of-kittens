@@ -142,6 +142,50 @@ def test_generation_and_timeout_helpers_are_wrap_safe(
     assert _C._barrier_all_wait_timeout_clocks() == timeout
 
 
+@pytest.mark.parametrize("active_tokens", [4, 24])
+def test_a_completed_tail_launch_leaves_both_diagnostics_at_zero(
+    tp8_context: tuple[int, int, torch.device],
+    workspace: KimiK3DecodeWorkspace,
+    norm_weight: torch.Tensor,
+    latent_up: torch.Tensor,
+    active_tokens: int,
+) -> None:
+    """Both halves of a timeout report have to stay readable.
+
+    Each of the tail's six bounded waits writes the counter it gave up on into
+    the timeout slot and its own code into ``error_flag`` before trapping. That
+    is only a diagnostic if a launch that completes writes neither, so this
+    runs twice on both the CUDA-core and the tcgen05 path: once with the two
+    slots poisoned, where a completed launch has to leave the poison exactly
+    where it was, and once with them clear, where it has to leave them at zero
+    for the next reader.
+    """
+    rank, _, device = tp8_context
+    routed, shared = _partials(device, rank, active_tokens, 5100)
+    _load_partials(workspace, routed, shared)
+    _, expected = _reference(routed, shared, norm_weight, latent_up)
+    counters = _phase(workspace.scratch)
+
+    try:
+        for poison in (77, 0):
+            counters[TAIL_TIMEOUT_PHASE].fill_(poison)
+            workspace.error_flag.fill_(poison)
+            _synchronize_ranks(workspace)
+
+            actual = _call(workspace, norm_weight, latent_up, active_tokens)
+            torch.cuda.synchronize(device)
+
+            _assert_tail_close(actual, expected)
+            assert int(workspace.error_flag.item()) == poison
+            assert int(counters[TAIL_TIMEOUT_PHASE].item()) == poison
+    finally:
+        # Both slots are shared with every other tail test in this process,
+        # which read them expecting the zero a clean launch leaves behind.
+        counters[TAIL_TIMEOUT_PHASE].zero_()
+        workspace.error_flag.zero_()
+        _synchronize_ranks(workspace)
+
+
 def test_tail_custom_op_returns_none_and_declares_its_mutations() -> None:
     schema = torch.ops.mok._kimi_k3_tail.default._schema
     assert tuple(argument.name for argument in schema.arguments) == (
@@ -159,6 +203,7 @@ def test_tail_custom_op_returns_none_and_declares_its_mutations() -> None:
         "barrier_buffer",
         "barrier_target",
         "scratch",
+        "error_flag",
     }
     # No custom-op return may alias a mutated input, so the schema must not
     # expose an aliasing output at all.
@@ -201,6 +246,7 @@ def test_tail_fake_traces_without_touching_the_device() -> None:
             1,
             torch.empty(1, dtype=torch.int32, device="cuda"),
             torch.empty(SCRATCH_BYTES, dtype=torch.uint8, device="cuda"),
+            torch.empty(1, dtype=torch.int32, device="cuda"),
             0,
             11,
             0,
@@ -244,6 +290,7 @@ def test_tail_helper_aliases_the_mailbox_without_allocating(
             workspace.barrier_multicast_ptr,
             workspace.barrier_target,
             workspace.scratch,
+            workspace.error_flag,
             workspace.tp_rank,
             active_tokens,
             workspace.workspace_signature,
@@ -446,6 +493,13 @@ def test_tail_rejects_invalid_shapes_pointers_and_counts(
             **{
                 **arguments,
                 "barrier_target": workspace.barrier_target.view(torch.uint8),
+            }
+        )
+    with pytest.raises(RuntimeError, match=r"error_flag.*int32 \[1\]"):
+        ops._kimi_k3_tail(
+            **{
+                **arguments,
+                "error_flag": workspace.error_flag.view(torch.uint8),
             }
         )
 

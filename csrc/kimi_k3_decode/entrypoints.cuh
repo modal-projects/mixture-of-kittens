@@ -574,6 +574,7 @@ static __host__ void kimi_k3_tail_entrypoint(
     std::int64_t barrier_buffer_multicast_ptr,
     const at::Tensor &barrier_target,
     const at::Tensor &scratch,
+    const at::Tensor &error_flag,
     std::int64_t tp_rank,
     std::int64_t active_tokens,
     std::int64_t workspace_signature_value
@@ -585,6 +586,7 @@ static __host__ void kimi_k3_tail_entrypoint(
     CHECK_INPUT(barrier_buffer);
     CHECK_INPUT(barrier_target);
     CHECK_INPUT(scratch);
+    CHECK_INPUT(error_flag);
 
     constexpr int shard_columns = kHiddenSize / kTensorParallelSize;
     constexpr int collective_columns = kLatentSize + kHiddenSize;
@@ -620,6 +622,9 @@ static __host__ void kimi_k3_tail_entrypoint(
     TORCH_CHECK(barrier_target.dim() == 1 && barrier_target.size(0) == 1
                     && barrier_target.scalar_type() == at::kInt,
                 "MoK: _kimi_k3_tail requires barrier_target to be int32 [1]");
+    TORCH_CHECK(error_flag.dim() == 1 && error_flag.size(0) == 1
+                    && error_flag.scalar_type() == at::kInt,
+                "MoK: _kimi_k3_tail requires error_flag to be int32 [1]");
     TORCH_CHECK(scratch.dim() == 1 && scratch.scalar_type() == at::kByte
                     && scratch.size(0) >= SCRATCH_BYTES,
                 "MoK: _kimi_k3_tail requires a uint8 scratch of at least ",
@@ -680,6 +685,7 @@ static __host__ void kimi_k3_tail_entrypoint(
              {&collective_buffer, "collective_buffer"},
              {&barrier_buffer, "barrier_buffer"},
              {&barrier_target, "barrier_target"},
+             {&error_flag, "error_flag"},
              {&scratch, "scratch"}}) {
         TORCH_CHECK(item.first->device() == device,
                     "MoK: _kimi_k3_tail requires ", item.second, " on ",
@@ -707,8 +713,8 @@ static __host__ void kimi_k3_tail_entrypoint(
         routed_latent_rmsnorm_weight, latent_up_proj,
         collective_buffer_multicast_ptr, output_mailbox_multicast_ptr,
         barrier_buffer, barrier_buffer_multicast_ptr, barrier_target, scratch,
-        static_cast<int>(tp_rank), static_cast<int>(active_tokens),
-        properties.multiProcessorCount);
+        error_flag, static_cast<int>(tp_rank),
+        static_cast<int>(active_tokens), properties.multiProcessorCount);
 }
 
 /// Run one whole TP8 Kimi K3 decode step in a single persistent launch.

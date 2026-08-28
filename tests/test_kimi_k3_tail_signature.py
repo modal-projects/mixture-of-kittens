@@ -368,6 +368,7 @@ def test_tail_rejects_a_malformed_workspace_signature(
                 1,
                 torch.empty(1, dtype=torch.int32, device="cuda"),
                 torch.empty(SCRATCH_BYTES, dtype=torch.uint8, device="cuda"),
+                torch.empty(1, dtype=torch.int32, device="cuda"),
                 0,
                 11,
                 workspace.workspace_signature,

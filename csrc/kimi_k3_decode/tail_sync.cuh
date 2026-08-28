@@ -218,14 +218,24 @@ static __device__ __forceinline__ std::uint32_t load_relaxed_system(
     return value;
 }
 
-/// Record the slot a bounded wait gave up on, then trap this thread's launch.
+/// Record which wait gave up, and on what, then trap this thread's launch.
+///
+/// The scratch slot names the generation counter the wait was on and
+/// `error_flag` names the site, because the tail has six bounded waits and only
+/// four counters between them. Both writes are released at system scope before
+/// the trap, so a host that reads either one after the launch aborts sees the
+/// value this thread wrote rather than whatever was there before.
 static __device__ __forceinline__ void record_timeout_and_trap(
     const Scratch &scratch,
-    const int generation_index
+    int *__restrict__ const error_flag,
+    const int generation_index,
+    const int error_code
 ) {
     atomicExch(
         reinterpret_cast<unsigned int *>(&scratch.phase[kTailTimeoutPhase]),
         static_cast<unsigned int>(generation_index));
+    atomicExch(reinterpret_cast<unsigned int *>(error_flag),
+               static_cast<unsigned int>(error_code));
     __threadfence_system();
     asm volatile("trap;");
 }
@@ -252,8 +262,10 @@ static __device__ std::uint32_t latch_generation(
 /// Spin until `generation_index` moves past `baseline`, then acquire.
 static __device__ void wait_for_generation(
     const Scratch &scratch,
+    int *__restrict__ const error_flag,
     const int generation_index,
-    const std::uint32_t baseline
+    const std::uint32_t baseline,
+    const int error_code
 ) {
     if (threadIdx.x == 0) {
         const std::uint64_t started = clock64();
@@ -261,7 +273,8 @@ static __device__ void wait_for_generation(
             load_relaxed_gpu(&scratch.phase[generation_index]), baseline
         )) {
             if (wait_timed_out(started, clock64())) {
-                record_timeout_and_trap(scratch, generation_index);
+                record_timeout_and_trap(
+                    scratch, error_flag, generation_index, error_code);
             }
             __nanosleep(64);
         }
@@ -308,10 +321,12 @@ static __device__ void publish_generation(
 /// with the same arithmetic, so the two may be interleaved freely.
 static __device__ void barrier_ranks(
     const Scratch &scratch,
+    int *__restrict__ const error_flag,
     std::uint32_t *const barrier_multicast,
     const std::uint32_t *const barrier_local,
     unsigned int *const barrier_target,
-    const int generation_index
+    const int generation_index,
+    const int error_code
 ) {
     const std::uint32_t target =
         static_cast<std::uint32_t>(
@@ -329,7 +344,8 @@ static __device__ void barrier_ranks(
     const std::uint64_t started = clock64();
     while (!barrier_reached(load_relaxed_system(barrier_local), target)) {
         if (wait_timed_out(started, clock64())) {
-            record_timeout_and_trap(scratch, generation_index);
+            record_timeout_and_trap(
+                scratch, error_flag, generation_index, error_code);
         }
         __nanosleep(64);
     }
@@ -339,6 +355,7 @@ static __device__ void barrier_ranks(
 /// Drive both cross-rank edges of one tail launch from a single thread.
 static __device__ void coordinate_ranks(
     const Scratch &scratch,
+    int *__restrict__ const error_flag,
     std::uint32_t *const barrier_multicast,
     const std::uint32_t *const barrier_local,
     unsigned int *const barrier_target
@@ -347,8 +364,9 @@ static __device__ void coordinate_ranks(
 
     // Entry: every rank has finished writing its routed and shared partials
     // into its own copy of the collective buffer.
-    barrier_ranks(scratch, barrier_multicast, barrier_local, barrier_target,
-                  kTailEntryGeneration);
+    barrier_ranks(scratch, error_flag, barrier_multicast, barrier_local,
+                  barrier_target, kTailEntryGeneration,
+                  kErrorTailEntryRendezvous);
     __threadfence_system();
     atomicAdd(
         reinterpret_cast<unsigned int *>(&scratch.phase[kTailEntryGeneration]),
@@ -361,15 +379,18 @@ static __device__ void coordinate_ranks(
         load_relaxed_gpu(&scratch.phase[kTailShardGeneration]), baseline
     )) {
         if (wait_timed_out(started, clock64())) {
-            record_timeout_and_trap(scratch, kTailShardGeneration);
+            record_timeout_and_trap(
+                scratch, error_flag, kTailShardGeneration,
+                kErrorTailCoordinatorShard);
         }
         __nanosleep(64);
     }
 
     // Exit: every rank has multicast its own shard, so after this rendezvous
     // all eight mailbox slots on this rank hold the current launch's data.
-    barrier_ranks(scratch, barrier_multicast, barrier_local, barrier_target,
-                  kTailExitGeneration);
+    barrier_ranks(scratch, error_flag, barrier_multicast, barrier_local,
+                  barrier_target, kTailExitGeneration,
+                  kErrorTailExitRendezvous);
     __threadfence_system();
     atomicAdd(
         reinterpret_cast<unsigned int *>(&scratch.phase[kTailExitGeneration]),
@@ -382,12 +403,14 @@ static __device__ void coordinate_ranks(
 /// kernel, read a mailbox slot a peer has not filled yet.
 static __device__ void drain_ranks(
     const Scratch &scratch,
+    int *__restrict__ const error_flag,
     std::uint32_t *const baseline_slot,
     const int consumer_ctas
 ) {
     const std::uint32_t baseline =
         latch_generation(scratch, kTailDrainGeneration, baseline_slot);
-    wait_for_generation(scratch, kTailExitGeneration, baseline);
+    wait_for_generation(scratch, error_flag, kTailExitGeneration, baseline,
+                        kErrorTailDrainExit);
     publish_generation(
         scratch, kTailDrainArrivals, kTailDrainGeneration, consumer_ctas);
 }

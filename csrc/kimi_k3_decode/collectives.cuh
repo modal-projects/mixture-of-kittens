@@ -48,6 +48,7 @@ void kimi_k3_tail_core_kernel(
     const std::uint32_t *__restrict__ barrier_local,
     unsigned int *__restrict__ barrier_target,
     std::uint8_t *__restrict__ scratch_bytes,
+    int *__restrict__ error_flag,
     const int tp_rank,
     const int active_tokens
 ) {
@@ -57,15 +58,16 @@ void kimi_k3_tail_core_kernel(
     const int block = static_cast<int>(blockIdx.x);
 
     if (block < kReduceBegin) {
-        coordinate_ranks(
-            scratch, barrier_multicast, barrier_local, barrier_target);
+        coordinate_ranks(scratch, error_flag, barrier_multicast, barrier_local,
+                         barrier_target);
         return;
     }
 
     if (block < kShardBegin) {
         const std::uint32_t baseline = latch_generation(
             scratch, kTailReduceGeneration, &baseline_slot);
-        wait_for_generation(scratch, kTailEntryGeneration, baseline);
+        wait_for_generation(scratch, error_flag, kTailEntryGeneration,
+                            baseline, kErrorTailReduceEntry);
         reduce_rows(
             collective_multicast, routed_latent_rmsnorm_weight, scratch,
             block - kReduceBegin, tp_rank, active_tokens);
@@ -74,7 +76,8 @@ void kimi_k3_tail_core_kernel(
     } else {
         const std::uint32_t baseline = latch_generation(
             scratch, kTailShardGeneration, &baseline_slot);
-        wait_for_generation(scratch, kTailReduceGeneration, baseline);
+        wait_for_generation(scratch, error_flag, kTailReduceGeneration,
+                            baseline, kErrorTailShardReduce);
         shard_core<CAPACITY>(
             reinterpret_cast<std::uint8_t *>(shared_raw), scratch,
             latent_up_proj, mailbox_multicast, block - kShardBegin, tp_rank,
@@ -83,7 +86,8 @@ void kimi_k3_tail_core_kernel(
             scratch, kTailShardArrivals, kTailShardGeneration, kCoreShardCtas);
     }
 
-    drain_ranks(scratch, &baseline_slot, kReduceCtas + kCoreShardCtas);
+    drain_ranks(scratch, error_flag, &baseline_slot,
+                kReduceCtas + kCoreShardCtas);
 }
 
 __global__ __launch_bounds__(kDecodeCtaThreads, 1)
@@ -97,6 +101,7 @@ void kimi_k3_tail_tensor_kernel(
     const std::uint32_t *__restrict__ barrier_local,
     unsigned int *__restrict__ barrier_target,
     std::uint8_t *__restrict__ scratch_bytes,
+    int *__restrict__ error_flag,
     const int tp_rank,
     const int active_tokens
 ) {
@@ -110,15 +115,16 @@ void kimi_k3_tail_tensor_kernel(
     kittens::tensor_allocator<1, 1> tensor_pool{};
 
     if (block < kReduceBegin) {
-        coordinate_ranks(
-            scratch, barrier_multicast, barrier_local, barrier_target);
+        coordinate_ranks(scratch, error_flag, barrier_multicast, barrier_local,
+                         barrier_target);
         return;
     }
 
     if (block < kShardBegin) {
         const std::uint32_t baseline = latch_generation(
             scratch, kTailReduceGeneration, &baseline_slot);
-        wait_for_generation(scratch, kTailEntryGeneration, baseline);
+        wait_for_generation(scratch, error_flag, kTailEntryGeneration,
+                            baseline, kErrorTailReduceEntry);
         reduce_rows(
             collective_multicast, routed_latent_rmsnorm_weight, scratch,
             block - kReduceBegin, tp_rank, active_tokens);
@@ -127,7 +133,8 @@ void kimi_k3_tail_tensor_kernel(
     } else {
         const std::uint32_t baseline = latch_generation(
             scratch, kTailShardGeneration, &baseline_slot);
-        wait_for_generation(scratch, kTailReduceGeneration, baseline);
+        wait_for_generation(scratch, error_flag, kTailReduceGeneration,
+                            baseline, kErrorTailShardReduce);
         shard_tensor(
             shared_raw, tensor_pool, normalized, latent_up_proj, scratch,
             mailbox_multicast, block - kShardBegin, tp_rank, active_tokens);
@@ -136,7 +143,8 @@ void kimi_k3_tail_tensor_kernel(
             kTensorShardCtas);
     }
 
-    drain_ranks(scratch, &baseline_slot, kReduceCtas + kTensorShardCtas);
+    drain_ranks(scratch, error_flag, &baseline_slot,
+                kReduceCtas + kTensorShardCtas);
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +256,7 @@ static __host__ void launch_core(
     const std::uint32_t *barrier_local,
     unsigned int *barrier_target,
     std::uint8_t *scratch_bytes,
+    int *error_flag,
     const int tp_rank,
     const int active_tokens
 ) {
@@ -256,7 +265,7 @@ static __host__ void launch_core(
            at::cuda::getCurrentCUDAStream()>>>(
             routed_latent_rmsnorm_weight, latent_up_proj, collective_multicast,
             mailbox_multicast, barrier_multicast, barrier_local, barrier_target,
-            scratch_bytes, tp_rank, active_tokens);
+            scratch_bytes, error_flag, tp_rank, active_tokens);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -269,6 +278,7 @@ static __host__ void launch_tail(
     std::int64_t barrier_buffer_multicast_ptr,
     const at::Tensor &barrier_target,
     const at::Tensor &scratch,
+    const at::Tensor &error_flag,
     const int tp_rank,
     const int active_tokens,
     const int available_sms
@@ -291,27 +301,32 @@ static __host__ void launch_tail(
         reinterpret_cast<unsigned int *>(barrier_target.data_ptr());
     auto *const scratch_bytes =
         reinterpret_cast<std::uint8_t *>(scratch.data_ptr());
+    auto *const error = reinterpret_cast<int *>(error_flag.data_ptr());
 
     switch (capacity_bucket(active_tokens)) {
         case 1:
             launch_core<1>(norm_weight, latent_up, collective_multicast,
                            mailbox_multicast, barrier_multicast, barrier_local,
-                           target, scratch_bytes, tp_rank, active_tokens);
+                           target, scratch_bytes, error, tp_rank,
+                           active_tokens);
             return;
         case 2:
             launch_core<2>(norm_weight, latent_up, collective_multicast,
                            mailbox_multicast, barrier_multicast, barrier_local,
-                           target, scratch_bytes, tp_rank, active_tokens);
+                           target, scratch_bytes, error, tp_rank,
+                           active_tokens);
             return;
         case 4:
             launch_core<4>(norm_weight, latent_up, collective_multicast,
                            mailbox_multicast, barrier_multicast, barrier_local,
-                           target, scratch_bytes, tp_rank, active_tokens);
+                           target, scratch_bytes, error, tp_rank,
+                           active_tokens);
             return;
         case 8:
             launch_core<8>(norm_weight, latent_up, collective_multicast,
                            mailbox_multicast, barrier_multicast, barrier_local,
-                           target, scratch_bytes, tp_rank, active_tokens);
+                           target, scratch_bytes, error, tp_rank,
+                           active_tokens);
             return;
         default:
             break;
@@ -339,7 +354,7 @@ static __host__ void launch_tail(
            at::cuda::getCurrentCUDAStream()>>>(
             norm_weight, normalized_view, latent_up_view, collective_multicast,
             mailbox_multicast, barrier_multicast, barrier_local, target,
-            scratch_bytes, tp_rank, active_tokens);
+            scratch_bytes, error, tp_rank, active_tokens);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

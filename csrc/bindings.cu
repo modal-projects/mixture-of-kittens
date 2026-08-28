@@ -5,6 +5,11 @@
 #include "scheduler.cuh"
 #include "utils.cuh"
 
+#include <cstdint>
+#include <string>
+#include <tuple>
+#include <vector>
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("kimi_k3_decode", &kimi_k3_decode::kimi_k3_decode_entrypoint, "",
           pybind11::arg("hidden_states"),
@@ -44,6 +49,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "", pybind11::arg("device"));
     m.def("_kimi_k3_decode_timeout_metadata",
           &kimi_k3_decode::persistent::timeout_metadata_for_testing);
+    m.def("_kimi_k3_decode_wait_timeout_clocks", []() {
+        return kimi_k3_decode::persistent::kWaitTimeoutClocks;
+    });
+    m.def("_kimi_k3_timeout_sites", []() {
+        std::vector<std::tuple<std::string, std::int64_t, std::int64_t,
+                               std::int64_t>> sites;
+        for (const auto &site : kimi_k3_decode::kTimeoutSites) {
+            sites.emplace_back(
+                site.name, static_cast<std::int64_t>(site.code),
+                static_cast<std::int64_t>(site.timeout_slot),
+                static_cast<std::int64_t>(site.counter));
+        }
+        return sites;
+    });
     m.def("_kimi_k3_decode_grid_shape", []() {
         return std::make_tuple(
             static_cast<std::int64_t>(kimi_k3_decode::persistent::kPersistentCtas),
@@ -112,6 +131,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("barrier_buffer_multicast_ptr"),
           pybind11::arg("barrier_target"),
           pybind11::arg("scratch"),
+          pybind11::arg("error_flag"),
           pybind11::arg("tp_rank"),
           pybind11::arg("active_tokens"),
           pybind11::arg("workspace_signature"));

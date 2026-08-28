@@ -384,7 +384,7 @@ void kimi_k3_decode_persistent_kernel(
                 if constexpr (TENSOR_PATH) {
                     wait_for_count(
                         scratch, error_flag, kActivationArrivals,
-                        activation_units);
+                        activation_units, kErrorPersistentActivation);
                     shared_experts::down_tensor(
                         shared_raw, tensor_pool, layouts.activated,
                         layouts.shared_down, collective_buffer, column_block,
@@ -436,8 +436,8 @@ void kimi_k3_decode_persistent_kernel(
     constexpr int shard_ctas =
         TENSOR_PATH ? tail::kTensorShardCtas : tail::kCoreShardCtas;
     if (block < tail::kReduceBegin) {
-        tail::coordinate_ranks(
-            scratch, barrier_multicast, barrier_local, barrier_target);
+        tail::coordinate_ranks(scratch, error_flag, barrier_multicast,
+                               barrier_local, barrier_target);
         return;
     }
     if (block >= tail::kShardBegin + shard_ctas) return;
@@ -445,7 +445,8 @@ void kimi_k3_decode_persistent_kernel(
     if (block < tail::kShardBegin) {
         const std::uint32_t baseline = tail::latch_generation(
             scratch, kTailReduceGeneration, &latch_slot);
-        tail::wait_for_generation(scratch, kTailEntryGeneration, baseline);
+        tail::wait_for_generation(scratch, error_flag, kTailEntryGeneration,
+                                  baseline, kErrorTailReduceEntry);
         tail::reduce_rows(
             collective_multicast, routed_latent_rmsnorm_weight, scratch,
             block - tail::kReduceBegin, tp_rank, active_tokens);
@@ -455,7 +456,8 @@ void kimi_k3_decode_persistent_kernel(
     } else {
         const std::uint32_t baseline = tail::latch_generation(
             scratch, kTailShardGeneration, &latch_slot);
-        tail::wait_for_generation(scratch, kTailReduceGeneration, baseline);
+        tail::wait_for_generation(scratch, error_flag, kTailReduceGeneration,
+                                  baseline, kErrorTailShardReduce);
         if constexpr (TENSOR_PATH) {
             tail::shard_tensor(
                 shared_raw, tensor_pool, layouts.normalized, layouts.latent_up,
@@ -470,7 +472,8 @@ void kimi_k3_decode_persistent_kernel(
             scratch, kTailShardArrivals, kTailShardGeneration, shard_ctas);
     }
 
-    tail::drain_ranks(scratch, &latch_slot, tail::kReduceCtas + shard_ctas);
+    tail::drain_ranks(scratch, error_flag, &latch_slot,
+                      tail::kReduceCtas + shard_ctas);
 }
 
 // ---------------------------------------------------------------------------
