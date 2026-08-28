@@ -325,6 +325,127 @@ _TAIL_ALIGNMENT = (
     ("scratch", 256),
 )
 
+# The tail is TP8 only, so every pointer list has exactly eight entries.
+_TAIL_TP_SIZE = 8
+
+# Each symmetric allocation the tail drives: its local tensor, its peer-pointer
+# list, its multicast alias, and the byte boundary the device dereferences it on.
+# The two BF16 allocations are read with 16-byte multimem octets; the barrier is
+# a single int32 word.
+_TAIL_SYMMETRIC = (
+    (
+        "collective_buffer",
+        "collective_buffer_ptrs",
+        "collective_buffer_multicast_ptr",
+        16,
+    ),
+    (
+        "output_mailbox",
+        "output_mailbox_ptrs",
+        "output_mailbox_multicast_ptr",
+        16,
+    ),
+    (
+        "barrier_buffer",
+        "barrier_buffer_ptrs",
+        "barrier_buffer_multicast_ptr",
+        4,
+    ),
+)
+
+
+def _check_tail_symmetric_pointers(arguments: dict[str, object]) -> None:
+    """Reject a pointer list that does not describe this rank's own allocation.
+
+    The kernel only dereferences the multicast alias, so these lists are the
+    one place a caller can reveal that it mixed up a rank, an allocation, or a
+    whole workspace -- otherwise a mix-up is silent and the launch just reduces
+    the wrong columns or fills the wrong mailbox slot. The rules mirror
+    ``check_symmetric_pointers`` in ``csrc/kimi_k3_decode/entrypoints.cuh``, and
+    each one is already satisfied by any valid PyTorch symmetric-memory handle.
+    """
+    tp_rank = arguments["tp_rank"]
+    if type(tp_rank) is not int or not 0 <= tp_rank < _TAIL_TP_SIZE:
+        raise RuntimeError(
+            f"MoK: _kimi_k3_tail requires tp_rank in "
+            f"[0, {_TAIL_TP_SIZE - 1}], got {tp_rank}"
+        )
+    for tensor_field, list_field, multicast_field, alignment in (
+        _TAIL_SYMMETRIC
+    ):
+        tensor = arguments[tensor_field]
+        pointers = arguments[list_field]
+        multicast = arguments[multicast_field]
+        if len(pointers) != _TAIL_TP_SIZE:
+            raise RuntimeError(
+                f"MoK: _kimi_k3_tail requires {list_field} with exactly "
+                f"{_TAIL_TP_SIZE} pointers, got {len(pointers)}"
+            )
+        for rank, pointer in enumerate(pointers):
+            if type(pointer) is not int or pointer <= 0:
+                raise RuntimeError(
+                    f"MoK: _kimi_k3_tail requires {list_field} to hold only "
+                    f"positive device pointers, but entry {rank} is {pointer}"
+                )
+        if is_fake(tensor):
+            continue
+        # Checked before alignment and distinctness so that a substituted rank
+        # or a swapped list is always reported as what it is.
+        local = tensor.data_ptr()
+        if pointers[tp_rank] != local:
+            raise RuntimeError(
+                f"MoK: _kimi_k3_tail requires {list_field}[tp_rank] to be "
+                f"this rank's own device pointer, but entry {tp_rank} is "
+                f"{pointers[tp_rank]} while the matching tensor is at {local}. "
+                f"The pointer list, the tensor, or tp_rank came from a "
+                f"different rank or a different workspace"
+            )
+        for rank, pointer in enumerate(pointers):
+            past = pointer % alignment
+            if past:
+                raise RuntimeError(
+                    f"MoK: _kimi_k3_tail requires every {list_field} entry "
+                    f"aligned to {alignment} bytes, but entry {rank} is "
+                    f"{past} bytes past one"
+                )
+        if len(set(pointers)) != _TAIL_TP_SIZE:
+            raise RuntimeError(
+                f"MoK: _kimi_k3_tail requires {list_field} to hold one "
+                f"distinct pointer per rank, but it holds "
+                f"{_TAIL_TP_SIZE - len(set(pointers))} repeated entries"
+            )
+        if type(multicast) is not int or multicast <= 0:
+            raise RuntimeError(
+                f"MoK: _kimi_k3_tail requires {multicast_field} to be a "
+                f"positive device pointer, got {multicast}"
+            )
+        past = multicast % alignment
+        if past:
+            raise RuntimeError(
+                f"MoK: _kimi_k3_tail requires {multicast_field} aligned to "
+                f"{alignment} bytes, but it is {past} bytes past one"
+            )
+        if multicast in pointers:
+            raise RuntimeError(
+                f"MoK: _kimi_k3_tail requires one distinct multicast pointer "
+                f"per symmetric allocation, but {multicast_field} equals "
+                f"{list_field} entry {pointers.index(multicast)}"
+            )
+    # A per-allocation check cannot see this: each pointer is individually
+    # valid, so only comparing them against each other reveals that the caller
+    # pointed two allocations at the same fabric address.
+    multicasts = [
+        (field, arguments[field]) for _, _, field, _ in _TAIL_SYMMETRIC
+    ]
+    for index, (field, multicast) in enumerate(multicasts):
+        for other_field, other in multicasts[index + 1:]:
+            if multicast == other:
+                raise RuntimeError(
+                    f"MoK: _kimi_k3_tail requires one distinct multicast "
+                    f"pointer per symmetric allocation, but {field} and "
+                    f"{other_field} are both {multicast}"
+                )
+
 # The tail mutates the mailbox in place and returns nothing: a custom operator
 # may not return a view that aliases one of its own mutated inputs, so the
 # active-row view is taken by the Python helper after the operator returns.
@@ -418,6 +539,7 @@ def _kimi_k3_tail(
                 f"MoK: _kimi_k3_tail requires {field} aligned to "
                 f"{alignment} bytes, got a pointer {past} bytes past one"
             )
+    _check_tail_symmetric_pointers(arguments)
     torch.ops.mok._kimi_k3_tail(
         routed_latent_rmsnorm_weight,
         latent_up_proj,

@@ -2,6 +2,7 @@
 
 #include "kittens.cuh"
 #include "pyutils/torchutils.cuh"
+#include "serial_sync.cuh"
 
 #include <ATen/ops/empty_like.h>
 
@@ -271,11 +272,27 @@ __device__ __forceinline__ void barrier_all_kernel(const globals &G) {
     // The counter is updated through its multicast alias and polled through its unicast alias
     asm volatile("{fence.proxy.alias;}" ::: "memory");
 
+    // The arrival counter is a serial number that the host never resets, so it
+    // wraps. `value < target` is therefore wrong for one round every 2^32
+    // arrivals, and wrong in the dangerous direction: once the target has
+    // wrapped past the counter the comparison is already false, so the barrier
+    // returns without waiting for anybody. Compare unsigned differences
+    // instead, and bound the spin so a rank that never arrives traps here
+    // rather than wedging the device.
+    const uint64_t started = clock64();
     uint32_t value;
-    do {
+    while (true) {
         asm volatile("{ld.relaxed.sys.global.u32 %0, [%1];}" : "=r"(value) : "l"(G.local_ptr) : "memory");
-    } while (value < target);
+        if (serial_sync::barrier_reached(value, target)) break;
+        if (serial_sync::wait_timed_out(started, clock64())) asm volatile("trap;");
+    }
     asm volatile("{fence.acquire.sys;}" ::: "memory");
+}
+
+/// The clock budget `barrier_all_kernel` holds its rendezvous to, exposed so a
+/// test can confirm it is the same bound the Kimi K3 tail spins under.
+static __host__ int64_t barrier_all_wait_timeout_clocks() {
+    return static_cast<int64_t>(serial_sync::kWaitTimeoutClocks);
 }
 
 static __host__ void barrier_all_entrypoint(

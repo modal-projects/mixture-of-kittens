@@ -125,6 +125,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("barrier_all", &utils::barrier_all::barrier_all_entrypoint, "",
           pybind11::arg("barrier_buffer"), pybind11::arg("barrier_buffer_ptrs"),
           pybind11::arg("barrier_buffer_multicast_ptr"), pybind11::arg("target"));
+    m.def("_barrier_all_wait_timeout_clocks",
+          &utils::barrier_all::barrier_all_wait_timeout_clocks, "");
     m.def("schedule", &scheduler::schedule_entrypoint, "",
           pybind11::arg("topk_all"), pybind11::arg("num_local_experts"), pybind11::arg("schedule_capacity"), pybind11::arg("rank"));
     m.def("mxfp8_quantize", &mxfp8::quantize_entrypoint, "",

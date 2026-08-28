@@ -41,8 +41,16 @@ SHARD = HIDDEN // KIMI_K3_TP_SIZE
 MAX_TOKENS = KIMI_K3_MAX_TOKENS
 ALIGNMENT = 256
 NUM_PHASE_COUNTERS = 32
-UINT32_MAX = (1 << 32) - 1
+UINT32 = 1 << 32
+UINT32_MAX = UINT32 - 1
 UINT64_MAX = (1 << 64) - 1
+
+# Rank-and-column coding for the bit-exact reduction probe. Each rank raises one
+# contiguous band of columns, so omitting or substituting a rank changes the
+# *shape* of the reduced row and not only its scale -- which matters because
+# RMSNorm divides any uniform scale change straight back out.
+LATENT_BAND = LATENT // KIMI_K3_TP_SIZE
+SHARED_BAND = SHARD // KIMI_K3_TP_SIZE
 
 # Every capacity bucket, plus off-bucket counts that exercise partially filled
 # reduce CTAs and the top of each bucket.
@@ -323,6 +331,94 @@ def _assert_identical_across_ranks(mailbox_view: torch.Tensor) -> None:
     assert torch.equal(minimum, values)
 
 
+def _as_int32(value: int) -> int:
+    """Reinterpret an unsigned 32-bit serial number as int32 for `fill_`."""
+    value &= UINT32_MAX
+    return value - UINT32 if value >= (1 << 31) else value
+
+
+def _as_uint32(value: int) -> int:
+    return value & UINT32_MAX
+
+
+def _serial_reached(observed: int, target: int) -> bool:
+    """Mirror the device's wrap-safe monotonic-counter comparison."""
+    return (_as_uint32(observed) - _as_uint32(target)) % UINT32 < (1 << 31)
+
+
+def _barrier_all(workspace: KimiK3DecodeWorkspace) -> None:
+    ops.barrier_all(
+        workspace.barrier_buffer,
+        workspace.barrier_ptrs,
+        workspace.barrier_multicast_ptr,
+        workspace.barrier_target,
+    )
+
+
+def _prime_barrier_serial(
+    workspace: KimiK3DecodeWorkspace, start: int
+) -> None:
+    """Park the shared barrier pair on `start` on every rank.
+
+    The pair's only invariant is that a rank's private target equals the number
+    of arrivals its symmetric counter has seen, so presetting both to the same
+    value on every rank is consistent -- and putting that value just below the
+    unsigned wrap makes the very next rendezvous cross it.
+
+    Two rendezvous precede the write because a rank may have left an earlier
+    barrier before its peers' increments landed in its counter; the write has to
+    happen after every one of those increments, or it would be overwritten.
+    """
+    _synchronize_ranks(workspace)
+    _synchronize_ranks(workspace)
+    workspace.barrier_buffer.fill_(_as_int32(start))
+    workspace.barrier_target.fill_(_as_int32(start))
+    _synchronize_ranks(workspace)
+
+
+def _rotating_skew(rank: int, step: int, clocks: int = 1 << 22) -> None:
+    """Delay this rank's stream so every rank leads and trails in turn."""
+    lag = ((rank + step) % KIMI_K3_TP_SIZE) * clocks
+    if lag:
+        torch.cuda._sleep(lag)
+
+
+def _coded_partials(
+    device: torch.device, tp_rank: int, rows: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rank-and-column-coded partials whose eight-way sum is exact in BF16.
+
+    Rank ``r`` contributes ``(1 + r)`` to every column and doubles that on the
+    one band of columns it owns. Every addend is an integer multiple of a power
+    of two and the running sum never exceeds 44, so all eight partial sums are
+    exact in BF16 with room to spare.
+    """
+    latent_band = (
+        torch.arange(LATENT, device=device) // LATENT_BAND
+    ) == tp_rank
+    routed = (
+        (1 + tp_rank) * (1 + latent_band.float()) / 64.0
+    ).bfloat16().expand(rows, LATENT).contiguous()
+    shared_band = (
+        (torch.arange(HIDDEN, device=device) // SHARED_BAND)
+        % KIMI_K3_TP_SIZE
+    ) == tp_rank
+    shared = (
+        (1 + tp_rank) * (1 + shared_band.float()) / 128.0
+    ).bfloat16().expand(rows, HIDDEN).contiguous()
+    return routed, shared
+
+
+def _coded_reduction(
+    device: torch.device, columns: int, band: int, scale: float
+) -> torch.Tensor:
+    """The exact eight-way sum of `_coded_partials` for one column extent."""
+    index = (torch.arange(columns, device=device) // band) % KIMI_K3_TP_SIZE
+    ranks = torch.arange(KIMI_K3_TP_SIZE, device=device)
+    total = float((1 + ranks).sum())
+    return ((total + 1 + index.float()) / scale).bfloat16()
+
+
 def test_tail_scratch_layout_matches_the_compiled_source_of_truth(
     workspace: KimiK3DecodeWorkspace,
 ) -> None:
@@ -534,50 +630,94 @@ def test_zero_and_large_partials_stay_exact_and_finite(
     _assert_identical_across_ranks(actual)
 
 
-def test_exactly_representable_partials_reduce_without_drift(
+def _normalized_direction(bands: torch.Tensor) -> torch.Tensor:
+    """RMS-normalize one expanded latent row, dropping any uniform scale."""
+    row = bands.float()
+    return row * torch.rsqrt(row.square().mean() + KIMI_K3_RMS_EPS)
+
+
+def test_rank_coded_partials_reduce_exactly_and_pin_the_rank_set(
     tp8_context: tuple[int, int, torch.device],
     workspace: KimiK3DecodeWorkspace,
     norm_weight: torch.Tensor,
     latent_up: torch.Tensor,
 ) -> None:
-    """Pin the collective itself with values BF16 sums represent exactly.
+    """Pin the collective with values whose BF16 sums are exact.
 
-    Every partial is ``rank + 1`` scaled by a power of two, so the eight-way sum
-    is exact in BF16 and the reduced latent must match bit for bit. This
-    separates a reduction-order or missing-rank bug from BF16 rounding noise.
+    A rank-uniform probe cannot detect a missing or duplicated rank downstream
+    of RMSNorm, because dropping one rank only rescales the row and RMSNorm
+    divides that back out. These partials give every rank its own band of
+    columns, so the rank set is recoverable from the *direction* of the reduced
+    row. The first half of the test proves the coding really is
+    direction-sensitive; the second half then requires the device to reproduce
+    that direction, and the shared shard bit for bit.
     """
     rank, _, device = tp8_context
     active_tokens = 32
-    routed = torch.full(
-        (active_tokens, LATENT),
-        float(rank + 1) * 0.03125,
-        dtype=torch.bfloat16,
-        device=device,
+    ranks = torch.arange(KIMI_K3_TP_SIZE, device=device)
+    contribution = (1 + ranks).float()
+    band_index = (
+        torch.arange(LATENT, device=device) // LATENT_BAND
     )
-    shared = torch.full(
-        (active_tokens, HIDDEN),
-        float(rank + 1) * 0.0625,
-        dtype=torch.bfloat16,
-        device=device,
-    )
+    true_bands = contribution.sum() + 1.0 + band_index.float()
+    truth = _normalized_direction(true_bands)
+
+    for dropped in range(KIMI_K3_TP_SIZE):
+        omitted = (
+            contribution.sum()
+            - contribution[dropped]
+            + 1.0
+            + band_index.float()
+            - torch.where(
+                band_index == dropped, contribution[dropped], 0.0
+            )
+        )
+        assert float((truth - _normalized_direction(omitted)).abs().max()) > (
+            0.01
+        ), dropped
+        substituted = (
+            contribution.sum()
+            - contribution[dropped]
+            + contribution[(dropped + 1) % KIMI_K3_TP_SIZE]
+            + 1.0
+            + band_index.float()
+            - torch.where(
+                band_index == dropped, contribution[dropped], 0.0
+            )
+            + torch.where(
+                band_index == (dropped + 1) % KIMI_K3_TP_SIZE,
+                contribution[(dropped + 1) % KIMI_K3_TP_SIZE],
+                0.0,
+            )
+        )
+        assert float(
+            (truth - _normalized_direction(substituted)).abs().max()
+        ) > 0.01, dropped
+
+    routed, shared = _coded_partials(device, rank, active_tokens)
     _load_partials(workspace, routed, shared)
 
     _call(workspace, norm_weight, latent_up, active_tokens)
 
+    # The shard is a plain eight-way sum with no normalization, so it must be
+    # bit-identical to the exact expected value.
     reduced_shard = _region(
         workspace.scratch, "tail_shared_shard", torch.bfloat16
     ).view(MAX_TOKENS, SHARD)[:active_tokens]
-    assert torch.equal(
-        reduced_shard,
-        torch.full_like(reduced_shard, 36.0 * 0.0625),
-    )
+    expected_shard = _coded_reduction(
+        device, HIDDEN, SHARED_BAND, 128.0
+    )[rank * SHARD:(rank + 1) * SHARD].expand(active_tokens, SHARD)
+    assert torch.equal(reduced_shard, expected_shard)
+    # Eight distinct plateaus inside this rank's own 896 columns, so a shifted
+    # or wrong-shard read cannot coincide with the expected values.
+    assert len(set(expected_shard[0].tolist())) == KIMI_K3_TP_SIZE
+
     normalized = _region(
         workspace.scratch, "tail_normalized", torch.bfloat16
     ).view(MAX_TOKENS, LATENT)[:active_tokens]
-    reduced_routed = torch.full(
-        (active_tokens, LATENT), 36.0 * 0.03125, dtype=torch.bfloat16,
-        device=device,
-    )
+    reduced_routed = _coded_reduction(
+        device, LATENT, LATENT_BAND, 64.0
+    ).expand(active_tokens, LATENT)
     # The reduced latent is exact here, so only the FP32 reciprocal square root
     # can still differ; allow the two BF16 units in the last place that costs.
     torch.testing.assert_close(
@@ -734,14 +874,22 @@ def test_graph_replay_needs_no_host_reset(
     _synchronize_ranks(workspace)
 
 
+# The core path needs no launch-time device state, but the tcgen05 path raises a
+# per-device dynamic shared-memory cap on first use. Both device-placement tests
+# therefore run at a tensor-path capacity as well, and the evidence run selects
+# them into a fresh process so that first use happens here.
+_DEVICE_PLACEMENT_ROWS = (5, 20)
+
+
+@pytest.mark.parametrize("active_tokens", _DEVICE_PLACEMENT_ROWS)
 def test_tail_uses_the_tensor_devices_current_stream(
     tp8_context: tuple[int, int, torch.device],
     workspace: KimiK3DecodeWorkspace,
     norm_weight: torch.Tensor,
     latent_up: torch.Tensor,
+    active_tokens: int,
 ) -> None:
     rank, _, device = tp8_context
-    active_tokens = 5
     routed, shared = _partials(device, rank, active_tokens, 4000)
     _, expected = _reference(routed, shared, norm_weight, latent_up)
     side_stream = torch.cuda.Stream(device=device)
@@ -757,17 +905,23 @@ def test_tail_uses_the_tensor_devices_current_stream(
     _assert_tail_close(actual, expected)
 
 
+@pytest.mark.parametrize("active_tokens", _DEVICE_PLACEMENT_ROWS)
 def test_tail_runs_on_the_workspace_device_when_another_is_current(
     tp8_context: tuple[int, int, torch.device],
     workspace: KimiK3DecodeWorkspace,
     norm_weight: torch.Tensor,
     latent_up: torch.Tensor,
+    active_tokens: int,
 ) -> None:
-    """CUDAGuard must follow the tensors, not the ambient current device."""
+    """CUDAGuard must follow the tensors, not the ambient current device.
+
+    At a tensor-path capacity this also pins the per-device shared-memory
+    reservation: it has to be taken on the workspace's device, not on whichever
+    device happened to be current when the operator was called.
+    """
     rank, _, device = tp8_context
     if torch.cuda.device_count() < 2:
         pytest.skip("the current-device guard test needs two visible GPUs")
-    active_tokens = 8
     routed, shared = _partials(device, rank, active_tokens, 4100)
     _load_partials(workspace, routed, shared)
     _, expected = _reference(routed, shared, norm_weight, latent_up)
@@ -853,6 +1007,11 @@ def test_generation_and_timeout_helpers_are_wrap_safe(
         TAIL_SHARD_GENERATION,
         TAIL_EXIT_GENERATION,
     )
+    # `barrier_all` drives the very same counter pair as the tail's two
+    # cross-rank edges, so it has to hold its rendezvous to the same bound and
+    # read the counter with the same wrap-safe comparison. Sharing the timeout
+    # constant is the observable half of sharing the implementation.
+    assert _C._barrier_all_wait_timeout_clocks() == timeout
 
 
 def test_tail_custom_op_returns_none_and_declares_its_mutations() -> None:
@@ -1186,6 +1345,358 @@ def test_tail_rejects_invalid_shapes_pointers_and_counts(
                 "barrier_target": workspace.barrier_target.view(torch.uint8),
             }
         )
+
+
+# One row per symmetric allocation: the operator's tensor argument, its
+# peer-pointer list, its multicast pointer, the matching workspace attribute
+# names, and the byte boundary the device dereferences it on. The two BF16
+# allocations are read with 16-byte multimem octets; the barrier is one int32.
+_SYMMETRIC_FIELDS = (
+    (
+        "collective_buffer",
+        "collective_buffer_ptrs",
+        "collective_buffer_multicast_ptr",
+        "collective_buffer",
+        "collective_ptrs",
+        "collective_multicast_ptr",
+        16,
+    ),
+    (
+        "output_mailbox",
+        "output_mailbox_ptrs",
+        "output_mailbox_multicast_ptr",
+        "output_mailbox",
+        "output_mailbox_ptrs",
+        "output_mailbox_multicast_ptr",
+        16,
+    ),
+    (
+        "barrier_buffer",
+        "barrier_buffer_ptrs",
+        "barrier_buffer_multicast_ptr",
+        "barrier_buffer",
+        "barrier_ptrs",
+        "barrier_multicast_ptr",
+        4,
+    ),
+)
+
+
+def _symmetric_facts(
+    workspace: KimiK3DecodeWorkspace,
+) -> list[tuple[str, str, torch.Tensor, list[int], int, int]]:
+    """(list argument, multicast argument, tensor, ptrs, multicast, boundary)."""
+    facts = []
+    for (
+        _,
+        list_field,
+        multicast_field,
+        tensor_attribute,
+        list_attribute,
+        multicast_attribute,
+        alignment,
+    ) in _SYMMETRIC_FIELDS:
+        facts.append((
+            list_field,
+            multicast_field,
+            getattr(workspace, tensor_attribute),
+            list(getattr(workspace, list_attribute)),
+            int(getattr(workspace, multicast_attribute)),
+            alignment,
+        ))
+    return facts
+
+
+def test_symmetric_pointer_lists_match_the_live_handles(
+    tp8_context: tuple[int, int, torch.device],
+    workspace: KimiK3DecodeWorkspace,
+    norm_weight: torch.Tensor,
+    latent_up: torch.Tensor,
+) -> None:
+    """Positive validation of the real symmetric-memory handles.
+
+    Everything the entry point enforces is asserted here against the pointers
+    PyTorch actually handed back, so a check can never end up stricter than the
+    API it guards.
+    """
+    rank, _, _ = tp8_context
+    assert workspace.tp_rank == rank
+    for (
+        list_field,
+        multicast_field,
+        tensor,
+        pointers,
+        multicast,
+        alignment,
+    ) in _symmetric_facts(workspace):
+        assert len(pointers) == KIMI_K3_TP_SIZE, list_field
+        assert all(pointer > 0 for pointer in pointers), list_field
+        assert pointers[rank] == tensor.data_ptr(), list_field
+        assert len(set(pointers)) == KIMI_K3_TP_SIZE, list_field
+        assert all(
+            pointer % alignment == 0 for pointer in pointers
+        ), list_field
+        assert multicast > 0 and multicast % alignment == 0, multicast_field
+        assert multicast not in pointers, multicast_field
+    # The three allocations are distinct objects, so no pointer is shared
+    # between them. That is exactly what makes a swapped list detectable.
+    every_pointer = [
+        pointer for _, _, _, pointers, _, _ in _symmetric_facts(workspace)
+        for pointer in pointers
+    ] + [
+        multicast
+        for _, _, _, _, multicast, _ in _symmetric_facts(workspace)
+    ]
+    assert len(set(every_pointer)) == len(every_pointer)
+    # These pointers are what the entry point is about to be handed, so the
+    # launch that follows is the positive half: the checks accept the live
+    # handles and the tail still produces its normal result.
+    ops._kimi_k3_tail(**_valid_arguments(workspace, norm_weight, latent_up, 1))
+    _synchronize_ranks(workspace)
+
+
+def _symmetric_rejection_cases(
+    workspace: KimiK3DecodeWorkspace, rank: int
+) -> list[tuple[str, dict[str, object], str]]:
+    """Every pointer/topology substitution the entry point must reject."""
+    facts = _symmetric_facts(workspace)
+    arguments = {
+        field: value
+        for list_field, multicast_field, _, pointers, multicast, _ in facts
+        for field, value in (
+            (list_field, pointers), (multicast_field, multicast)
+        )
+    }
+    peer = (rank + 1) % KIMI_K3_TP_SIZE
+    cases: list[tuple[str, dict[str, object], str]] = [
+        (
+            "tp_rank is not this rank",
+            {"tp_rank": peer},
+            r"collective_buffer_ptrs\[tp_rank\]",
+        ),
+    ]
+    for list_field, multicast_field, _, pointers, _, alignment in facts:
+        substituted = list(pointers)
+        substituted[rank] = pointers[peer]
+        cases.append((
+            f"{list_field} local entry replaced by a peer",
+            {list_field: substituted},
+            rf"{list_field}\[tp_rank\]",
+        ))
+        misaligned = list(pointers)
+        # Perturb a *peer* slot, so the local-ownership check cannot mask the
+        # alignment check.
+        misaligned[peer] = pointers[peer] + 2
+        cases.append((
+            f"{list_field} peer entry misaligned",
+            {list_field: misaligned},
+            rf"{list_field} entry aligned to {alignment} bytes",
+        ))
+        cases.append((
+            f"{multicast_field} misaligned",
+            {multicast_field: arguments[multicast_field] + 2},
+            rf"{multicast_field} aligned to {alignment} bytes",
+        ))
+        aliased = list(pointers)
+        aliased[peer] = pointers[(peer + 1) % KIMI_K3_TP_SIZE]
+        cases.append((
+            f"{list_field} duplicates a peer entry",
+            {list_field: aliased},
+            rf"{list_field} to hold one distinct pointer per rank",
+        ))
+    # Distinct addresses that nonetheless name the same GPU. Only the driver's
+    # pointer attributes can tell these apart, and only the collective buffer is
+    # large enough that a 16-byte bump is unambiguously inside it.
+    collective = list(arguments["collective_buffer_ptrs"])
+    same_device = list(collective)
+    same_device[(peer + 1) % KIMI_K3_TP_SIZE] = collective[peer] + 16
+    if same_device[rank] == collective[rank]:
+        cases.append((
+            "collective_buffer_ptrs points two ranks at one device",
+            {"collective_buffer_ptrs": same_device},
+            r"collective_buffer_ptrs to hold one distinct device per rank",
+        ))
+    cases.append((
+        "collective and mailbox lists swapped",
+        {
+            "collective_buffer_ptrs": list(arguments["output_mailbox_ptrs"]),
+            "output_mailbox_ptrs": list(
+                arguments["collective_buffer_ptrs"]
+            ),
+        },
+        r"collective_buffer_ptrs\[tp_rank\]",
+    ))
+    cases.append((
+        "barrier list substituted for the collective list",
+        {"collective_buffer_ptrs": list(arguments["barrier_buffer_ptrs"])},
+        r"collective_buffer_ptrs\[tp_rank\]",
+    ))
+    cases.append((
+        "collective multicast reused as the mailbox multicast",
+        {
+            "output_mailbox_multicast_ptr": arguments[
+                "collective_buffer_multicast_ptr"
+            ]
+        },
+        r"one distinct multicast pointer per symmetric allocation",
+    ))
+    cases.append((
+        "mailbox multicast reused as a mailbox unicast entry",
+        {
+            "output_mailbox_multicast_ptr": arguments[
+                "output_mailbox_ptrs"
+            ][peer]
+        },
+        r"one distinct multicast pointer per symmetric allocation",
+    ))
+    return cases
+
+
+def _expect_rejection(
+    label: str, pattern: str, call: Callable[[], object]
+) -> None:
+    """Require one rejection, naming the substitution that was not caught."""
+    try:
+        with pytest.raises(RuntimeError, match=pattern):
+            call()
+    except BaseException as failure:
+        raise AssertionError(
+            f"{label}: expected a RuntimeError matching /{pattern}/"
+        ) from failure
+
+
+def test_tail_rejects_substituted_symmetric_pointers(
+    tp8_context: tuple[int, int, torch.device],
+    workspace: KimiK3DecodeWorkspace,
+    norm_weight: torch.Tensor,
+    latent_up: torch.Tensor,
+) -> None:
+    rank, _, _ = tp8_context
+    valid = _valid_arguments(workspace, norm_weight, latent_up, 4)
+    for label, overrides, pattern in _symmetric_rejection_cases(
+        workspace, rank
+    ):
+        arguments = {**valid, **overrides}
+        _expect_rejection(
+            f"python: {label}",
+            pattern,
+            lambda arguments=arguments: ops._kimi_k3_tail(**arguments),
+        )
+
+
+def test_tail_c_entrypoint_rejects_substituted_symmetric_pointers(
+    tp8_context: tuple[int, int, torch.device],
+    workspace: KimiK3DecodeWorkspace,
+    norm_weight: torch.Tensor,
+    latent_up: torch.Tensor,
+) -> None:
+    rank, _, _ = tp8_context
+    valid = _valid_arguments(workspace, norm_weight, latent_up, 4)
+    for label, overrides, pattern in _symmetric_rejection_cases(
+        workspace, rank
+    ):
+        arguments = {**valid, **overrides}
+        _expect_rejection(
+            f"pybind: {label}",
+            pattern,
+            lambda arguments=arguments: _C._kimi_k3_tail(
+                *(arguments[name] for name in _TAIL_ARGUMENTS)
+            ),
+        )
+
+
+def test_barrier_all_stays_ordered_across_the_uint32_wrap(
+    tp8_context: tuple[int, int, torch.device],
+    workspace: KimiK3DecodeWorkspace,
+) -> None:
+    """`barrier_all` must still rendezvous when its serial number wraps.
+
+    The pair is re-parked before every round so that each rendezvous lands its
+    target exactly on the wrap. A plain ``value < target`` poll cannot be
+    satisfied by any counter at that point, so it falls straight through and the
+    barrier silently stops synchronizing. The skew rotates so that every rank
+    leads one round: only a rank that arrives first can tell the difference,
+    because a rank that arrives last sees a full counter either way.
+
+    The snapshot is enqueued on the same stream immediately after the barrier,
+    so a barrier that returned early is caught holding a counter that had not
+    yet reached its target.
+    """
+    rank, _, device = tp8_context
+    start = UINT32 - KIMI_K3_TP_SIZE
+
+    for step in range(KIMI_K3_TP_SIZE):
+        _prime_barrier_serial(workspace, start)
+        _rotating_skew(rank, step)
+        _barrier_all(workspace)
+        snapshot = workspace.barrier_buffer.clone()
+        torch.cuda.synchronize(device)
+        # start + 8 is exactly 2**32, so this round's target is zero.
+        observed = int(snapshot.item())
+        assert _serial_reached(observed, 0), (
+            step, rank, _as_uint32(observed)
+        )
+        assert _as_uint32(int(workspace.barrier_target.item())) == 0
+    _synchronize_ranks(workspace)
+
+
+def test_barrier_all_and_tail_interleave_across_the_uint32_wrap(
+    tp8_context: tuple[int, int, torch.device],
+    workspace: KimiK3DecodeWorkspace,
+    norm_weight: torch.Tensor,
+    latent_up: torch.Tensor,
+) -> None:
+    """The tail and `barrier_all` share one counter pair across the wrap.
+
+    Each step takes three rendezvous off the shared pair -- one for
+    `barrier_all` and two for the tail's entry and exit edges -- so the pair
+    crosses the unsigned wrap partway through the loop while both users are
+    active. Every step then requires a fresh, correct, cross-rank-identical
+    tail result and an exactly-advanced generation for each tail phase.
+    """
+    rank, _, device = tp8_context
+    active_tokens = 20
+    steps = 8
+    per_step = 3 * KIMI_K3_TP_SIZE
+    # Park the pair so the wrap happens inside the loop rather than at its edge.
+    start = UINT32 - 2 * per_step - KIMI_K3_TP_SIZE
+    _prime_barrier_serial(workspace, start)
+    phase = _phase(workspace.scratch)
+    previous = [int(phase[slot]) for slot in TAIL_GENERATIONS]
+
+    for step in range(steps):
+        poison = 96.0 if step % 2 == 0 else -96.0
+        workspace.output_mailbox.fill_(poison)
+        routed, shared = _partials(device, rank, active_tokens, 4700 + step)
+        _load_partials(workspace, routed, shared)
+        _, expected = _reference(routed, shared, norm_weight, latent_up)
+
+        _rotating_skew(rank, step)
+        _barrier_all(workspace)
+        snapshot = workspace.barrier_buffer.clone()
+        actual = _call(workspace, norm_weight, latent_up, active_tokens)
+        torch.cuda.synchronize(device)
+
+        target = start + step * per_step + KIMI_K3_TP_SIZE
+        assert _serial_reached(int(snapshot.item()), target), (
+            step, _as_uint32(int(snapshot.item())), _as_uint32(target)
+        )
+        _assert_tail_close(actual, expected)
+        _assert_identical_across_ranks(actual)
+        inactive = workspace.output_mailbox[active_tokens:]
+        assert torch.equal(inactive, torch.full_like(inactive, poison))
+        assert int(phase[TAIL_TIMEOUT_PHASE]) == 0
+        for arrivals in TAIL_ARRIVALS:
+            assert int(phase[arrivals]) == 0
+        current = [int(phase[slot]) for slot in TAIL_GENERATIONS]
+        for slot, (before, after) in enumerate(zip(previous, current)):
+            assert _as_uint32(after) == _as_uint32(before + 1), (step, slot)
+        previous = current
+
+    assert _as_uint32(int(workspace.barrier_target.item())) == _as_uint32(
+        start + steps * per_step
+    )
+    _synchronize_ranks(workspace)
 
 
 def _profiled_kernel_names(call: Callable[[], object]) -> list[str]:

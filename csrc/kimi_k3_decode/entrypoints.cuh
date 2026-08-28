@@ -335,35 +335,176 @@ static __host__ at::Tensor shared_experts_entrypoint(
 }
 
 /// Reject a peer-pointer list that is not exactly one positive pointer per rank.
-static __host__ void check_peer_pointers(
+/// Reject a peer-pointer list that does not describe this rank's own allocation.
+///
+/// The kernel only ever dereferences the multicast alias, so these lists are the
+/// one place a caller can reveal that it mixed up a rank, an allocation, or a
+/// whole workspace -- and a mix-up is silent otherwise: the launch simply
+/// reduces the wrong columns or fills the wrong mailbox slot. Every rule below
+/// is one that PyTorch's symmetric memory already satisfies for a valid handle:
+/// exactly one positive, distinct, suitably aligned pointer per rank, with this
+/// rank's slot holding the local tensor's own address, plus a multicast alias
+/// that aliases none of them.
+static __host__ void check_symmetric_pointers(
     const std::vector<std::int64_t> &pointers,
-    const char *field
+    const std::int64_t multicast_pointer,
+    const at::Tensor &tensor,
+    const std::int64_t tp_rank,
+    const char *list_field,
+    const char *multicast_field,
+    const std::int64_t alignment
 ) {
     TORCH_CHECK(pointers.size() == static_cast<std::size_t>(kTensorParallelSize),
-                "MoK: _kimi_k3_tail requires ", field, " with exactly ",
+                "MoK: _kimi_k3_tail requires ", list_field, " with exactly ",
                 kTensorParallelSize, " pointers, got ", pointers.size());
     for (int rank = 0; rank < kTensorParallelSize; ++rank) {
         TORCH_CHECK(pointers[rank] > 0,
-                    "MoK: _kimi_k3_tail requires ", field,
+                    "MoK: _kimi_k3_tail requires ", list_field,
                     " to hold only positive device pointers, but entry ", rank,
                     " is ", pointers[rank]);
     }
+
+    // Checked before alignment and distinctness so that a substituted rank or a
+    // swapped list is always reported as what it is.
+    const auto local = reinterpret_cast<std::int64_t>(tensor.data_ptr());
+    TORCH_CHECK(
+        pointers[static_cast<std::size_t>(tp_rank)] == local,
+        "MoK: _kimi_k3_tail requires ", list_field,
+        "[tp_rank] to be this rank's own device pointer, but entry ", tp_rank,
+        " is ", pointers[static_cast<std::size_t>(tp_rank)],
+        " while the matching tensor is at ", local,
+        ". The pointer list, the tensor, or tp_rank came from a different rank "
+        "or a different workspace");
+
+    for (int rank = 0; rank < kTensorParallelSize; ++rank) {
+        TORCH_CHECK(pointers[rank] % alignment == 0,
+                    "MoK: _kimi_k3_tail requires every ", list_field,
+                    " entry aligned to ", alignment, " bytes, but entry ", rank,
+                    " is ", pointers[rank] % alignment, " bytes past one");
+    }
+    for (int rank = 0; rank < kTensorParallelSize; ++rank) {
+        for (int peer = rank + 1; peer < kTensorParallelSize; ++peer) {
+            TORCH_CHECK(pointers[rank] != pointers[peer],
+                        "MoK: _kimi_k3_tail requires ", list_field,
+                        " to hold one distinct pointer per rank, but entries ",
+                        rank, " and ", peer, " are both ", pointers[rank]);
+        }
+    }
+
+    // Ask the driver who owns each address. On a live symmetric handle every
+    // entry resolves to device memory on the peer that allocated it, so the
+    // eight entries name eight distinct devices and this rank's entry names the
+    // device its own tensor lives on. That catches a list stitched together
+    // from two workspaces even when its addresses happen to be distinct.
+    //
+    // A failed lookup is never treated as a rejection: an address the driver
+    // declines to describe is left to the launch, so a valid mapping on a setup
+    // that does not expose peer attributes still works.
+    int owner[kTensorParallelSize] = {};
+    bool owner_known[kTensorParallelSize] = {};
+    for (int rank = 0; rank < kTensorParallelSize; ++rank) {
+        cudaPointerAttributes attributes{};
+        const cudaError_t status = cudaPointerGetAttributes(
+            &attributes, reinterpret_cast<void *>(pointers[rank]));
+        owner_known[rank] = status == cudaSuccess;
+        if (!owner_known[rank]) {
+            cudaGetLastError();
+            continue;
+        }
+        owner[rank] = attributes.device;
+        TORCH_CHECK(attributes.type == cudaMemoryTypeDevice,
+                    "MoK: _kimi_k3_tail requires every ", list_field,
+                    " entry to name device memory, but entry ", rank,
+                    " is of CUDA memory type ",
+                    static_cast<int>(attributes.type));
+    }
+    for (int rank = 0; rank < kTensorParallelSize; ++rank) {
+        if (!owner_known[rank]) continue;
+        for (int peer = rank + 1; peer < kTensorParallelSize; ++peer) {
+            if (!owner_known[peer]) continue;
+            TORCH_CHECK(owner[rank] != owner[peer],
+                        "MoK: _kimi_k3_tail requires ", list_field,
+                        " to hold one distinct device per rank, but entries ",
+                        rank, " and ", peer, " both live on CUDA device ",
+                        owner[rank]);
+        }
+    }
+    if (owner_known[static_cast<std::size_t>(tp_rank)]) {
+        TORCH_CHECK(owner[static_cast<std::size_t>(tp_rank)]
+                        == tensor.get_device(),
+                    "MoK: _kimi_k3_tail requires ", list_field,
+                    "[tp_rank] to live on the same device as its tensor, but "
+                    "entry ", tp_rank, " is on CUDA device ",
+                    owner[static_cast<std::size_t>(tp_rank)],
+                    " while the tensor is on ", tensor.get_device());
+    }
+
+    TORCH_CHECK(multicast_pointer > 0,
+                "MoK: _kimi_k3_tail requires ", multicast_field,
+                " to be a positive device pointer, got ", multicast_pointer);
+    TORCH_CHECK(multicast_pointer % alignment == 0,
+                "MoK: _kimi_k3_tail requires ", multicast_field,
+                " aligned to ", alignment, " bytes, but it is ",
+                multicast_pointer % alignment, " bytes past one");
+    for (int rank = 0; rank < kTensorParallelSize; ++rank) {
+        TORCH_CHECK(
+            multicast_pointer != pointers[rank],
+            "MoK: _kimi_k3_tail requires one distinct multicast pointer per "
+            "symmetric allocation, but ", multicast_field, " equals ",
+            list_field, " entry ", rank);
+    }
+    cudaPointerAttributes multicast_attributes{};
+    if (cudaPointerGetAttributes(
+            &multicast_attributes,
+            reinterpret_cast<void *>(multicast_pointer)) == cudaSuccess) {
+        TORCH_CHECK(multicast_attributes.type == cudaMemoryTypeDevice,
+                    "MoK: _kimi_k3_tail requires ", multicast_field,
+                    " to name device memory, but it is of CUDA memory type ",
+                    static_cast<int>(multicast_attributes.type));
+    } else {
+        cudaGetLastError();
+    }
 }
 
-static __host__ void check_multicast_pointer(
-    const std::int64_t pointer,
-    const char *field
+/// Reject a multicast pointer that belongs to one of the other allocations.
+///
+/// A per-allocation check cannot see this: each of the three pointers is
+/// individually valid, so only comparing them against each other reveals that
+/// the caller pointed two allocations at the same fabric address.
+static __host__ void check_multicast_pointers_are_disjoint(
+    const std::int64_t collective_buffer_multicast_ptr,
+    const std::int64_t output_mailbox_multicast_ptr,
+    const std::int64_t barrier_buffer_multicast_ptr
 ) {
-    TORCH_CHECK(pointer > 0,
-                "MoK: _kimi_k3_tail requires ", field,
-                " to be a positive device pointer, got ", pointer);
+    const std::int64_t pointers[3] = {
+        collective_buffer_multicast_ptr,
+        output_mailbox_multicast_ptr,
+        barrier_buffer_multicast_ptr};
+    const char *const fields[3] = {
+        "collective_buffer_multicast_ptr",
+        "output_mailbox_multicast_ptr",
+        "barrier_buffer_multicast_ptr"};
+    for (int first = 0; first < 3; ++first) {
+        for (int second = first + 1; second < 3; ++second) {
+            TORCH_CHECK(
+                pointers[first] != pointers[second],
+                "MoK: _kimi_k3_tail requires one distinct multicast pointer "
+                "per symmetric allocation, but ", fields[first], " and ",
+                fields[second], " are both ", pointers[first]);
+        }
+    }
 }
 
 /// Run the fused TP8 latent-MoE tail for one decode step, in one launch.
 ///
-/// Every rank must call this with the same active token count: the tail
-/// rendezvouses all eight ranks twice inside the launch, so a divergent count
-/// would leave the collective and the mailbox half-published.
+/// Every rank must call this with the same active token count. Both rendezvous
+/// are driven by one coordinator thread per rank whose arrival is independent of
+/// the token count, so a divergent count does not deadlock: it silently returns
+/// wrong data. A rank that passed a smaller count never multicasts its shard for
+/// the rows beyond it, so those rows of that rank's mailbox slot keep whatever
+/// the previous launch left there, and the ranks that passed a larger count read
+/// the resulting mixed-generation rows as if they were current. The caller owns
+/// this agreement; it is not checkable from one rank.
 static __host__ void kimi_k3_tail_entrypoint(
     const at::Tensor &routed_latent_rmsnorm_weight,
     const at::Tensor &latent_up_proj,
@@ -434,15 +575,23 @@ static __host__ void kimi_k3_tail_entrypoint(
                 "MoK: _kimi_k3_tail requires tp_rank in [0, ",
                 kTensorParallelSize - 1, "]");
 
-    check_peer_pointers(collective_buffer_ptrs, "collective_buffer_ptrs");
-    check_peer_pointers(output_mailbox_ptrs, "output_mailbox_ptrs");
-    check_peer_pointers(barrier_buffer_ptrs, "barrier_buffer_ptrs");
-    check_multicast_pointer(collective_buffer_multicast_ptr,
-                            "collective_buffer_multicast_ptr");
-    check_multicast_pointer(output_mailbox_multicast_ptr,
-                            "output_mailbox_multicast_ptr");
-    check_multicast_pointer(barrier_buffer_multicast_ptr,
-                            "barrier_buffer_multicast_ptr");
+    // The two BF16 allocations are dereferenced with 16-byte multimem octets;
+    // the barrier is a single int32 word.
+    check_symmetric_pointers(
+        collective_buffer_ptrs, collective_buffer_multicast_ptr,
+        collective_buffer, tp_rank, "collective_buffer_ptrs",
+        "collective_buffer_multicast_ptr", VECTOR_ALIGNMENT);
+    check_symmetric_pointers(
+        output_mailbox_ptrs, output_mailbox_multicast_ptr, output_mailbox,
+        tp_rank, "output_mailbox_ptrs", "output_mailbox_multicast_ptr",
+        VECTOR_ALIGNMENT);
+    check_symmetric_pointers(
+        barrier_buffer_ptrs, barrier_buffer_multicast_ptr, barrier_buffer,
+        tp_rank, "barrier_buffer_ptrs", "barrier_buffer_multicast_ptr",
+        static_cast<std::int64_t>(sizeof(std::int32_t)));
+    check_multicast_pointers_are_disjoint(
+        collective_buffer_multicast_ptr, output_mailbox_multicast_ptr,
+        barrier_buffer_multicast_ptr);
     const at::Device device = output_mailbox.device();
     for (const auto &item : {
              std::pair<const at::Tensor *, const char *>{
