@@ -1003,10 +1003,13 @@ git commit -m "bench: measure Kimi K3 decode latency on B300"
 
 **Files:**
 - Create: `benchmarks/framework_manifest.json`
-- Create: `benchmarks/frameworks/__init__.py`
+- Modify: `benchmarks/frameworks/__init__.py`
 - Create: `benchmarks/frameworks/vllm_kimi_k3.py`
 - Create: `benchmarks/frameworks/sglang_kimi_k3.py`
 - Create: `benchmarks/compare_kimi_k3_frameworks.py`
+- Create: `tests/test_kimi_k3_frameworks.py`
+- Modify: `csrc/kimi_k3_decode/persistent_kernel.cuh`
+- Modify: `csrc/kimi_k3_decode/expert_mxfp4.cuh`
 - Modify: `modal_app.py`
 
 **Interfaces:**
@@ -1044,6 +1047,8 @@ Instantiate vLLM's K3 `KimiMoE`/`LatentMoERunner` and SGLang's K3
 `flashinfer_mxfp4` layer with the same logical BF16 weights, then map each
 framework's packed tensors into the standalone preparation API. Compare
 router IDs, selected weights, intermediate routed latent, and final output.
+Use Task 10's realistic route construction: each replay occupies
+`min(16*M,896)` experts, including 256 at M=16 and all 896 at M>=56.
 
 - [ ] **Step 3: Build derived comparison images**
 
@@ -1057,12 +1062,15 @@ Run each backend with identical inputs, routing, graph capture, warmup, and
 1,000 measured iterations. Execute:
 
 ```bash
-modal run modal_app.py::compare_vllm
-modal run modal_app.py::compare_sglang
+modal run --env rahul-dev modal_app.py::compare_vllm
+modal run --env rahul-dev modal_app.py::compare_sglang
 ```
 
 Expected: framework parity meets relative L1 `0.05`, cosine `0.999`, max
-absolute `1.0`; output includes median/p90/p99 for every DFlash shape.
+absolute `1.0`; output includes 500 warmups and 1,000 rank-max samples with
+median/p90/p99 for every DFlash shape. Each Modal function returns a
+deterministic artifact archive containing resolved image/package revisions,
+raw samples, numerical comparisons, and launch traces.
 
 - [ ] **Step 5: Enforce performance gates**
 
@@ -1070,12 +1078,15 @@ At block-16 request concurrency 1 (`M=16`), require the custom median below
 both native baselines. Across block-16 concurrency 1–8, require its
 geometric-mean median no slower than the faster baseline and p99 no more than
 10% slower. If a gate fails, return to Task 10's profile candidates and retain
-the new winner only after rerunning full correctness.
+the new winner only after rerunning full correctness. If grid tuning alone
+cannot close the gap, profile the production kernel by phase, optimize the
+measured routed-expert or synchronization bottleneck, and repeat the full
+correctness/resource/graph checks before remeasuring all three backends.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add benchmarks/framework_manifest.json benchmarks/frameworks benchmarks/compare_kimi_k3_frameworks.py modal_app.py
+git add benchmarks/framework_manifest.json benchmarks/frameworks benchmarks/compare_kimi_k3_frameworks.py tests/test_kimi_k3_frameworks.py csrc/kimi_k3_decode/persistent_kernel.cuh csrc/kimi_k3_decode/expert_mxfp4.cuh modal_app.py
 git commit -m "bench: compare Kimi K3 kernel with serving backends"
 ```
 
