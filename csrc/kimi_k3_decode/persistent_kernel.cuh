@@ -108,6 +108,44 @@ inline constexpr TaskPlan task_plan(const int active_tokens) {
     };
 }
 
+/// The longest queue any phase of any accepted shape hands out.
+///
+/// Folded over `task_plan` rather than written out, because which phase is
+/// widest is not obvious: the core path's shared-down role is 112 units to the
+/// tensor path's 62, but the core path only ever runs eight rows, which caps it
+/// at 128 occupied experts and so at 3 696 units. The widest is the tensor
+/// path's down phase at a full 896 experts.
+inline constexpr int longest_queue_units() {
+    int longest = 0;
+    for (int tokens = 1; tokens <= kMaxTokens; ++tokens) {
+        const TaskPlan plan = task_plan(tokens);
+        for (const int units :
+             {plan.route_latent, plan.gate_up, plan.down, plan.tail}) {
+            if (units > longest) longest = units;
+        }
+    }
+    return longest;
+}
+
+/// The longest queue, and the highest ticket a worker can take from one.
+///
+/// Both bounds matter. The length is what a unit index is decoded against, and
+/// the ticket is what the counter has to hold without wrapping, because nothing
+/// resets it inside a launch. A CTA leaves a queue on its first refusal, so the
+/// overshoot past the last unit is exactly one refused ticket per CTA.
+inline constexpr int kLongestQueueUnits = longest_queue_units();
+inline constexpr int kLongestQueueTicket =
+    kLongestQueueUnits + kPersistentCtas;
+
+static_assert(kLongestQueueUnits == 25150,
+              "the widest phase is 6 activation + 56 shared-down + 896 * 28 "
+              "routed down units");
+static_assert(kLongestQueueTicket == 25298,
+              "the widest phase plus one refused ticket for each of 148 CTAs");
+static_assert(static_cast<unsigned int>(kLongestQueueTicket)
+                  < 0xffffffffu / 2u,
+              "a queue counter must not approach the unsigned wrap");
+
 inline std::tuple<int, int, int, int, int> task_plan_for_testing(
     const std::int64_t active_tokens
 ) {
@@ -124,6 +162,10 @@ inline std::tuple<int, int, int, int> timeout_metadata_for_testing() {
         kGridGeneration,
         kActivationArrivals,
         kActiveExpertUnits};
+}
+
+inline std::tuple<int, int> queue_bound_for_testing() {
+    return {kLongestQueueUnits, kLongestQueueTicket};
 }
 
 // ---------------------------------------------------------------------------

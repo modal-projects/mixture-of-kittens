@@ -178,10 +178,12 @@ static __device__ void grid_barrier(
 /// Claim this CTA's next unit of one phase's queue, or -1 once it is drained.
 ///
 /// Thread 0 takes the ticket and broadcasts it, so the whole CTA runs one unit
-/// at a time and the stage device functions keep their CTA-wide barriers. The
-/// counters are cleared at kernel entry and rise at most to `units` plus one
-/// overshoot per CTA within a launch, so they cannot wrap: the largest queue is
-/// 25 088 units.
+/// at a time and the stage device functions keep their CTA-wide barriers. A
+/// counter is cleared at kernel entry and then rises to `units` plus exactly
+/// one refused ticket per CTA, because a CTA leaves the loop on its first
+/// refusal. `persistent_kernel.cuh` static-asserts the resulting bound: the
+/// longest queue is the tensor path's 25 150 down units, which with the 148-CTA
+/// overshoot stops at 25 298 -- nowhere near an unsigned wrap.
 static __device__ int claim_unit(
     const Scratch &scratch,
     const int queue_index,

@@ -49,6 +49,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "", pybind11::arg("device"));
     m.def("_kimi_k3_decode_timeout_metadata",
           &kimi_k3_decode::persistent::timeout_metadata_for_testing);
+    m.def("_kimi_k3_decode_queue_bound",
+          &kimi_k3_decode::persistent::queue_bound_for_testing);
     m.def("_kimi_k3_decode_wait_timeout_clocks", []() {
         return kimi_k3_decode::persistent::kWaitTimeoutClocks;
     });
