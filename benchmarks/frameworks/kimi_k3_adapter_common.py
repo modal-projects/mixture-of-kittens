@@ -300,6 +300,31 @@ class GraphPool:
         self.memory_pool = None
 
 
+def router_fingerprint(
+    weight: torch.Tensor,
+    correction_bias: torch.Tensor,
+) -> dict[str, Any]:
+    """A cheap value that changes if either router parameter is written.
+
+    A graph records the address of these tensors, so the pool of routings a
+    pool of graphs replays is only as stable as their contents. This is what a
+    run compares before and after a capture to say the contents held.
+    """
+    return {
+        "weight_data_ptr": int(weight.data_ptr()),
+        "weight_sum": float(weight.float().sum()),
+        "weight_abs_sum": float(weight.float().abs().sum()),
+        "weight_nonzero": int(torch.count_nonzero(weight)),
+        "correction_bias_sum": float(correction_bias.float().sum()),
+        "correction_bias_abs_sum": float(correction_bias.float().abs().sum()),
+    }
+
+
+def observed_routes(ids: torch.Tensor) -> list[list[int]]:
+    """One replay's actual per-token expert selection, as archived."""
+    return [[int(expert) for expert in row] for row in ids.cpu().tolist()]
+
+
 __all__ = [
     "ARCHITECTURES",
     "EXPERT_TENSOR_NAMES",
@@ -318,6 +343,8 @@ __all__ = [
     "expert_tensor_shapes",
     "latent_reference",
     "native_weights",
+    "observed_routes",
+    "router_fingerprint",
     "router_reference",
     "shared_reference",
     "tensor_stats",

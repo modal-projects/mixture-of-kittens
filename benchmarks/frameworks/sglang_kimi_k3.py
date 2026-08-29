@@ -32,6 +32,7 @@ from benchmarks.frameworks.kimi_k3_adapter_common import (
     expert_tensor_shapes,
     latent_reference,
     native_weights,
+    router_fingerprint,
     shared_reference,
     tensor_stats,
     write_model_config,
@@ -76,6 +77,7 @@ class SglangKimiK3Adapter:
         self.tp_size = tp_size
         self._exit_stack = contextlib.ExitStack()
         self._pool = GraphPool()
+        self._router_graphs: list[torch.cuda.CUDAGraph] = []
         self._transformations: list[dict[str, Any]] = []
         self._config_dir = self._exit_stack.enter_context(
             tempfile.TemporaryDirectory(prefix="kimi-k3-sglang-")
@@ -215,22 +217,44 @@ class SglangKimiK3Adapter:
 
     # -- driving ---------------------------------------------------------
 
-    def load_router(self, router_weight: torch.Tensor) -> None:
+    def bind_router(
+        self,
+        router_weight: torch.Tensor,
+        correction_bias: torch.Tensor,
+    ) -> dict[str, Any]:
+        """Install the run's one router, once, and fingerprint what landed.
+
+        There is no reloading it. A CUDA graph records the address of
+        ``gate.weight``, so writing it between two captures makes both graphs
+        replay whichever routing was written last; the pool of routings has to
+        be inside the one tensor instead.
+        """
         copy_into(self._layer.gate.weight, router_weight)
+        copy_into(self._layer.gate.e_score_correction_bias, correction_bias)
+        torch.cuda.synchronize(self.device)
+        return self.router_fingerprint()
+
+    def router_fingerprint(self) -> dict[str, Any]:
+        return router_fingerprint(
+            self._layer.gate.weight.data,
+            self._layer.gate.e_score_correction_bias.data,
+        )
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         return self._layer(hidden)
 
-    def router_comparison(self, hidden: torch.Tensor, weights: Any) -> dict[str, Any]:
+    def _router_topk(
+        self, hidden: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The native top-16 decision, exactly as the layer's forward takes it."""
         layer = self._layer
         logits = layer.gate(hidden)
         topk_output = layer.topk(hidden, logits)
-        return compare_routes(
-            topk_output.topk_ids,
-            topk_output.topk_weights,
-            hidden,
-            weights,
-        )
+        return topk_output.topk_ids, topk_output.topk_weights
+
+    def router_comparison(self, hidden: torch.Tensor, weights: Any) -> dict[str, Any]:
+        topk_ids, topk_weights = self._router_topk(hidden)
+        return compare_routes(topk_ids, topk_weights, hidden, weights)
 
     def stage_parity(self, hidden: torch.Tensor, weights: Any) -> dict[str, Any]:
         layer = self._layer
@@ -248,18 +272,22 @@ class SglangKimiK3Adapter:
     # -- graph capture ---------------------------------------------------
 
     def capture(self, pool: list[Any]) -> list[torch.cuda.CUDAGraph]:
+        """Capture one graph per pool entry, touching no parameter in between.
+
+        Each entry differs only in its hidden state, which is the entry's own
+        static input tensor, so graph ``p`` reads entry ``p``'s coordinates out
+        of the run's one router and produces entry ``p``'s routing.
+        """
         from sglang.srt.distributed.parallel_state import graph_capture
 
         self.release()
         for entry in pool:
-            self.load_router(entry.weights.router_weight)
             self.forward(entry.hidden)
         torch.cuda.synchronize(self.device)
 
         with graph_capture() as context:
             stream = getattr(context, "stream", None)
             for entry in pool:
-                self.load_router(entry.weights.router_weight)
                 self._layer(entry.hidden)
                 torch.cuda.synchronize(self.device)
                 graph = torch.cuda.CUDAGraph()
@@ -275,8 +303,51 @@ class SglangKimiK3Adapter:
         torch.cuda.synchronize(self.device)
         return list(self._pool.graphs)
 
+    def capture_router(
+        self, pool: list[Any]
+    ) -> tuple[list[torch.cuda.CUDAGraph], list[torch.Tensor]]:
+        """Capture the router decision alone, one graph per pool entry.
+
+        The full graphs write only a final hidden state, so what routing they
+        replayed can only be inferred from it. These read the same
+        ``gate.weight`` through the same top-16 the layer's forward uses and
+        keep the expert ids in a buffer a replay overwrites, which is a direct
+        reading of what each graph actually selects.
+        """
+        from sglang.srt.distributed.parallel_state import graph_capture
+
+        for entry in pool:
+            self._router_topk(entry.hidden)
+        torch.cuda.synchronize(self.device)
+
+        graphs: list[torch.cuda.CUDAGraph] = []
+        outputs: list[torch.Tensor] = []
+        memory_pool: Any = None
+        with graph_capture() as context:
+            stream = getattr(context, "stream", None)
+            for entry in pool:
+                self._router_topk(entry.hidden)
+                torch.cuda.synchronize(self.device)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, pool=memory_pool, stream=stream):
+                    ids, _ = self._router_topk(entry.hidden)
+                memory_pool = graph.pool()
+                graphs.append(graph)
+                outputs.append(ids)
+        torch.cuda.synchronize(self.device)
+        self._router_graphs = graphs
+        return graphs, outputs
+
+    def graph_outputs(self) -> list[torch.Tensor]:
+        return list(self._pool.outputs)
+
+    def release_router(self) -> None:
+        self._router_graphs = []
+        torch.cuda.synchronize(self.device)
+
     def release(self) -> None:
         self._pool.clear()
+        self._router_graphs = []
         torch.cuda.synchronize(self.device)
 
     # -- reporting -------------------------------------------------------

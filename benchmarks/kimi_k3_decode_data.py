@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
 
 from benchmarks.kimi_k3_decode_inputs import (
     GRAPH_POOL_SIZE,
-    MAX_TOKENS,
     NUM_EXPERTS,
+    SWEEP_TOKEN_COUNTS,
     TOPK,
     route_assignments,
+    router_column,
+    router_column_plan,
 )
 from mok.kimi_k3 import (
     KIMI_K3_HIDDEN_SIZE,
@@ -39,6 +42,23 @@ class RoutedInput:
     weights: KimiK3DecodeWeights
     route_assignments: tuple[tuple[int, ...], ...]
     distinct_experts: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SharedRouter:
+    """One router weight and bias every graph in a run replays against.
+
+    Reloading a router between two graph captures overwrites the storage both
+    graphs recorded the address of, so both replay the last routing that was
+    loaded. This holds every pool entry's routing at once instead, in the
+    disjoint hidden columns :func:`router_column_plan` assigns, and is never
+    written again after it is built.
+    """
+
+    weight: torch.Tensor
+    correction_bias: torch.Tensor
+    column_plan: dict[int, int]
+    pool_size: int
 
 
 def _generator(device: torch.device, seed: int) -> torch.Generator:
@@ -178,15 +198,98 @@ def build_weights(
     )
 
 
+def build_shared_router(
+    base: KimiK3DecodeWeights,
+    device: torch.device,
+    token_counts: Sequence[int],
+    *,
+    pool_size: int = GRAPH_POOL_SIZE,
+) -> SharedRouter:
+    """Build the one router every shape and pool entry in a run routes through.
+
+    Each ``(token count, pool entry, token)`` triple owns a hidden column, and
+    that column carries only the sixteen experts the triple is meant to route
+    to. A pool entry's hidden state is non-zero in its own columns alone, so
+    the columns belonging to other entries multiply by zero and the routing a
+    replay produces is decided entirely by the entry's own input.
+    """
+    plan = router_column_plan(
+        token_counts, pool_size=pool_size, hidden_size=HIDDEN
+    )
+    weight = torch.zeros(
+        NUM_EXPERTS,
+        HIDDEN,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    for tokens in plan:
+        for pool_index in range(pool_size):
+            intended = route_assignments(tokens, pool_index)
+            for token, experts in enumerate(intended):
+                column = router_column(plan, tokens, pool_index, token)
+                for slot, expert in enumerate(experts):
+                    weight[expert, column] = 0.25 - 0.0078125 * slot
+    return SharedRouter(
+        weight=weight,
+        correction_bias=base.router_correction_bias,
+        column_plan=dict(plan),
+        pool_size=pool_size,
+    )
+
+
+_SHARED_ROUTERS: dict[tuple[int, str, tuple[int, ...], int], SharedRouter] = {}
+
+
+def shared_router(
+    base: KimiK3DecodeWeights,
+    device: torch.device,
+    token_counts: Sequence[int] = SWEEP_TOKEN_COUNTS,
+    *,
+    pool_size: int = GRAPH_POOL_SIZE,
+) -> SharedRouter:
+    """The one router a process routes a given sweep through.
+
+    Memoized on the shard it extends and the sweep it covers, so every graph a
+    run captures records the address of the same tensor and no caller can hand
+    a different one to a later capture by accident.
+    """
+    key = (
+        base.router_weight.data_ptr(),
+        str(device),
+        tuple(sorted(token_counts)),
+        pool_size,
+    )
+    router = _SHARED_ROUTERS.get(key)
+    if router is None:
+        router = build_shared_router(
+            base, device, token_counts, pool_size=pool_size
+        )
+        _SHARED_ROUTERS[key] = router
+    return router
+
+
+def clear_shared_router_cache() -> None:
+    _SHARED_ROUTERS.clear()
+
+
 def build_routed_input(
     base: KimiK3DecodeWeights,
     device: torch.device,
     tokens: int,
     pool_index: int,
+    *,
+    router: SharedRouter | None = None,
 ) -> RoutedInput:
-    """Build one pool entry and prove its actual K3 top-k assignment."""
-    if not 0 <= pool_index < GRAPH_POOL_SIZE:
-        raise ValueError(f"pool_index must be in [0, {GRAPH_POOL_SIZE})")
+    """Build one pool entry and prove its actual K3 top-k assignment.
+
+    Without an explicit router this uses the process-wide one for the full
+    sweep, which is what keeps a pool of captured graphs from collapsing onto
+    whichever routing was loaded last.
+    """
+    if router is None:
+        router = shared_router(base, device)
+    if not 0 <= pool_index < router.pool_size:
+        raise ValueError(f"pool_index must be in [0, {router.pool_size})")
     intended = route_assignments(tokens, pool_index)
     hidden = torch.zeros(
         tokens,
@@ -194,23 +297,14 @@ def build_routed_input(
         dtype=torch.bfloat16,
         device=device,
     )
-    router_weight = torch.zeros(
-        NUM_EXPERTS,
-        HIDDEN,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    for token, experts in enumerate(intended):
-        column = pool_index * MAX_TOKENS + token
-        hidden[token, column] = 8.0
-        for slot, expert in enumerate(experts):
-            router_weight[expert, column] = 0.25 - 0.0078125 * slot
-    weights = dataclasses.replace(base, router_weight=router_weight)
+    for token in range(tokens):
+        hidden[token, router_column(router.column_plan, tokens, pool_index, token)] = 8.0
+    weights = dataclasses.replace(base, router_weight=router.weight)
 
     actual_ids, _ = kimi_k3_router_reference(
         hidden,
-        router_weight,
-        base.router_correction_bias,
+        router.weight,
+        router.correction_bias,
     )
     actual = tuple(
         tuple(int(expert) for expert in row)
@@ -228,6 +322,10 @@ def build_routed_input(
 
 __all__ = [
     "RoutedInput",
+    "SharedRouter",
     "build_routed_input",
+    "build_shared_router",
     "build_weights",
+    "clear_shared_router_cache",
+    "shared_router",
 ]

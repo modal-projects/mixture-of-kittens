@@ -884,6 +884,157 @@ def test_modal_exposes_the_two_framework_comparison_entrypoints() -> None:
 # --------------------------------------------------------------------------
 
 
+def _inputs():
+    return importlib.import_module("benchmarks.kimi_k3_decode_inputs")
+
+
+def test_one_router_column_plan_covers_every_graph_a_run_captures() -> None:
+    """Every (token count, pool entry, token) triple owns its own coordinate.
+
+    A CUDA graph records the address of the router weight, not its contents,
+    so a pool of graphs can only carry a pool of routes if one immutable
+    router already holds all of them. That works because a pool entry's hidden
+    state is one-hot: the entry's routes are decided by a single column, and
+    the columns other entries use contribute nothing to it. The plan is the
+    assignment of those columns, and it has to be injective.
+    """
+    inputs = _inputs()
+    plan = inputs.router_column_plan(
+        [8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128],
+        pool_size=4,
+        hidden_size=7168,
+    )
+
+    seen: dict[int, tuple[int, int, int]] = {}
+    for tokens in (8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128):
+        for pool_index in range(4):
+            for token in range(tokens):
+                column = inputs.router_column(plan, tokens, pool_index, token)
+                assert 0 <= column < 7168
+                assert column not in seen, (column, seen.get(column))
+                seen[column] = (tokens, pool_index, token)
+    assert len(seen) == 4 * (8 + 16 + 24 + 32 + 40 + 48 + 56 + 64 + 80 + 96 + 112 + 128)
+
+
+def test_the_sweep_token_counts_cover_every_shape_the_benchmarks_measure(
+) -> None:
+    """One router covers a run, so the run's shapes have to be known up front."""
+    inputs = _inputs()
+    compare = _compare()
+    output = importlib.import_module("benchmarks.kimi_k3_decode_output")
+
+    measured = {
+        tokens
+        for groups in (compare.SHAPE_GROUPS, output.SHAPE_GROUPS)
+        for shapes in groups.values()
+        for tokens in shapes
+    }
+
+    assert measured == set(inputs.SWEEP_TOKEN_COUNTS)
+    plan = inputs.router_column_plan(
+        inputs.SWEEP_TOKEN_COUNTS, pool_size=4, hidden_size=7168
+    )
+    assert len(plan) == len(inputs.SWEEP_TOKEN_COUNTS)
+
+
+def test_the_router_column_plan_refuses_a_sweep_it_cannot_encode() -> None:
+    inputs = _inputs()
+
+    with pytest.raises(ValueError, match="hidden columns"):
+        inputs.router_column_plan(
+            list(range(1, 129)), pool_size=4, hidden_size=7168
+        )
+
+
+def test_the_router_column_plan_rejects_a_repeated_token_count() -> None:
+    inputs = _inputs()
+
+    with pytest.raises(ValueError, match="once"):
+        inputs.router_column_plan([16, 16], pool_size=4, hidden_size=7168)
+
+
+def test_graph_route_verification_rejects_a_pool_that_collapsed(
+) -> None:
+    """The failure a mutable router produces, stated as data.
+
+    Loading a new router between two captures overwrites the storage both
+    graphs point at, so every graph in the pool replays the last entry's
+    routing. The verifier's job is to see exactly that.
+    """
+    inputs = _inputs()
+    intended = [
+        inputs.route_assignments(2, pool_index) for pool_index in range(4)
+    ]
+    collapsed = [intended[-1]] * 4
+
+    with pytest.raises(AssertionError) as failure:
+        inputs.verify_graph_routes(intended, collapsed)
+
+    message = str(failure.value)
+    assert "collapsed" in message
+    assert "pool_index=0" in message
+
+
+def test_graph_route_verification_accepts_each_graph_keeping_its_own(
+) -> None:
+    inputs = _inputs()
+    intended = [
+        inputs.route_assignments(2, pool_index) for pool_index in range(4)
+    ]
+
+    summary = inputs.verify_graph_routes(intended, intended)
+
+    assert summary["graph_count"] == 4
+    assert summary["distinct_route_sets"] == 4
+    assert summary["distinct_experts_per_graph"] == [32, 32, 32, 32]
+
+
+def test_graph_route_verification_rejects_one_graph_off_its_entry() -> None:
+    inputs = _inputs()
+    intended = [
+        inputs.route_assignments(2, pool_index) for pool_index in range(4)
+    ]
+    observed = list(intended)
+    observed[2] = intended[3]
+
+    with pytest.raises(AssertionError, match="pool_index=2"):
+        inputs.verify_graph_routes(intended, observed)
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    ["benchmarks.frameworks.vllm_kimi_k3", "benchmarks.frameworks.sglang_kimi_k3"],
+)
+def test_no_adapter_writes_a_router_outside_of_binding_it(
+    module_name: str,
+) -> None:
+    """The gate parameters are written once, by name, and nowhere else.
+
+    Neither framework can be imported on a CPU box, so this reads the source:
+    the only ``copy_into`` calls that target ``gate.weight`` or the correction
+    bias are in ``_load``, which runs before anything is captured, and in
+    ``bind_router``, which is called once for the run.
+    """
+    relative = module_name.replace(".", "/") + ".py"
+    source = (REPO_ROOT / relative).read_text()
+
+    assert "def load_router(" not in source
+    assert "def bind_router(" in source
+
+    writers = [
+        block.split("(", 1)[0].split()[-1]
+        for block in source.split("\n    def ")[1:]
+        if "copy_into(self._layer.gate" in block
+        or "copy_into(layer.gate" in block
+    ]
+    assert writers == ["_load", "bind_router"], writers
+
+    capture = source.split("\n    def capture(", 1)[1].split("\n    def ", 1)[0]
+    assert "copy_into" not in capture
+    assert "load_router" not in capture
+    assert "bind_router" not in capture
+
+
 # --------------------------------------------------------------------------
 # Fail-closed numerical gates
 # --------------------------------------------------------------------------

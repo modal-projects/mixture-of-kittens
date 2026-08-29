@@ -16,6 +16,7 @@ archive, the CLI, and the tests all name one module.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import importlib
 import json
 import os
@@ -30,6 +31,7 @@ from benchmarks.kimi_k3_comparison_gates import (
     combine_archives,
     evaluate_numerical_gates,
     evaluate_performance_gates,
+    expected_parity_rows,
     merge_latency_rows,
     parity_summary,
     partial_gates,
@@ -121,6 +123,7 @@ __all__ = [
     "comparison_artifact_files",
     "effective_image_reference",
     "evaluate_numerical_gates",
+    "expected_parity_rows",
     "evaluate_performance_gates",
     "fused_gate_up_plan",
     "load_framework_manifest",
@@ -427,11 +430,24 @@ def _run_gpu(
     weights = data.build_weights(device, rank)
     workspace = kimi.get_kimi_k3_decode_workspace(torch.distributed.group.WORLD, device=device)
 
+    # One router, built before anything is captured and never written again.
+    # Every shape, every pool entry, both backends, and every graph read it.
+    router = data.shared_router(
+        weights,
+        device,
+        sorted({tokens for shapes in shape_groups.values() for tokens in shapes}),
+        pool_size=pool_size,
+    )
+    weights = dataclasses.replace(weights, router_weight=router.weight)
+
     adapter = adapter_module.build_adapter(
         device=device,
         tp_rank=rank,
         tp_size=TP_SIZE,
         weights=weights,
+    )
+    router_fingerprint = adapter.bind_router(
+        router.weight, router.correction_bias
     )
 
     parity: list[dict[str, Any]] = []
@@ -444,33 +460,13 @@ def _run_gpu(
         rows: list[dict[str, Any]] = []
         for tokens in shapes:
             pool = [
-                data.build_routed_input(weights, device, tokens, index)
+                data.build_routed_input(
+                    weights, device, tokens, index, router=router
+                )
                 for index in range(pool_size)
             ]
-            occupancy.append(
-                {
-                    "mode": mode,
-                    "tokens": tokens,
-                    "distinct_experts_per_replay": [
-                        len(entry.distinct_experts) for entry in pool
-                    ],
-                    "expected_distinct_experts": min(TOPK * tokens, NUM_EXPERTS),
-                    "pool_wide_distinct_experts": len(
-                        {
-                            expert
-                            for entry in pool
-                            for expert in entry.distinct_experts
-                        }
-                    ),
-                    "route_assignments_by_pool_entry": [
-                        [list(token) for token in entry.route_assignments]
-                        for entry in pool
-                    ],
-                }
-            )
 
             for entry in pool:
-                adapter.load_router(entry.weights.router_weight)
                 custom = runtime.decode_step(
                     workspace, entry.weights, entry.hidden
                 ).clone()
@@ -499,7 +495,7 @@ def _run_gpu(
                 del custom, native, reference
             _barrier(device)
 
-            measurements = _measure_backends(
+            measurements, verification = _measure_backends(
                 adapter,
                 workspace,
                 pool,
@@ -509,6 +505,9 @@ def _run_gpu(
                 framework=framework,
                 warmup_count=warmup_count,
                 sample_count=sample_count,
+            )
+            occupancy.append(
+                _route_occupancy_row(pool, verification, mode=mode, tokens=tokens)
             )
             phase_profiles.append(
                 {
@@ -531,7 +530,9 @@ def _run_gpu(
             torch.cuda.empty_cache()
         tables[mode] = rows
 
-    traces = _collect_traces(adapter, workspace, weights, data, runtime, device)
+    traces = _collect_traces(
+        adapter, workspace, weights, router, data, runtime, device
+    )
 
     if rank == 0:
         manifest = build_comparison_manifest(
@@ -578,14 +579,28 @@ def _run_gpu(
                 "rows": parity,
             },
         )
-        numerical = evaluate_numerical_gates(parity)
+        numerical = evaluate_numerical_gates(
+            parity,
+            expected_rows=expected_parity_rows(shape_groups, pool_size),
+        )
         write_json(
             output_dir / "numerical_gates.json",
             {"framework": framework, **numerical},
         )
         write_json(
             output_dir / "route_occupancy.json",
-            {"framework": framework, "rows": occupancy},
+            {
+                "framework": framework,
+                "router": {
+                    "shared_across_every_graph": True,
+                    "column_plan": {
+                        str(count): column
+                        for count, column in sorted(router.column_plan.items())
+                    },
+                    "bound_fingerprint": router_fingerprint,
+                },
+                "rows": occupancy,
+            },
         )
         write_json(
             output_dir / "raw_samples.json",
@@ -655,6 +670,169 @@ def entry_index(pool: Sequence[Any], entry: Any) -> int:
     raise ValueError("pool entry not found")
 
 
+def _route_occupancy_row(
+    pool: Sequence[Any],
+    verification: Mapping[str, Any],
+    *,
+    mode: str,
+    tokens: int,
+) -> dict[str, Any]:
+    """Archive what the run's replays actually routed to.
+
+    Every count here is derived from an observation: the custom column from
+    the official reference run against the entry's own input, and the native
+    column from the ids a replayed native graph wrote. The plan the entry was
+    built from is kept beside them to be compared, not to stand in for them.
+    """
+    observed = verification["observed_route_assignments_by_graph"]
+    return {
+        "mode": mode,
+        "tokens": tokens,
+        "expected_distinct_experts": min(TOPK * tokens, NUM_EXPERTS),
+        "intended_route_assignments_by_pool_entry": [
+            [list(token) for token in entry.route_assignments] for entry in pool
+        ],
+        "observed_reference_distinct_experts_per_replay": [
+            len(entry.distinct_experts) for entry in pool
+        ],
+        "observed_native_route_assignments_by_graph": observed,
+        "observed_native_distinct_experts_per_graph": (
+            verification["distinct_experts_per_graph"]
+        ),
+        "observed_native_distinct_route_sets": (
+            verification["distinct_route_sets"]
+        ),
+        "pool_wide_distinct_experts": len(
+            {
+                expert
+                for entry in observed
+                for token in entry
+                for expert in token
+            }
+        ),
+        "replayed_output_relative_l1_to_each_entry": (
+            verification["replayed_output_relative_l1_to_each_entry"]
+        ),
+        "router_fingerprint": verification["router_fingerprint"],
+    }
+
+
+def _replayed_routes(
+    adapter: Any,
+    pool: Sequence[Any],
+    device: Any,
+) -> list[list[list[int]]]:
+    """Replay each captured native router graph and read what it selected.
+
+    This is the routing the graph produces, not the routing it was captured
+    for: the ids come out of the buffer the replay writes.
+    """
+    import torch
+
+    from benchmarks.frameworks.kimi_k3_adapter_common import observed_routes
+
+    graphs, id_buffers = adapter.capture_router(list(pool))
+    routes = []
+    for graph, ids in zip(graphs, id_buffers, strict=True):
+        graph.replay()
+        torch.cuda.synchronize(device)
+        routes.append(observed_routes(ids))
+    adapter.release_router()
+    return routes
+
+
+def _replayed_output_distances(
+    adapter: Any,
+    pool: Sequence[Any],
+    graphs: Sequence[Any],
+    device: Any,
+) -> list[list[float]]:
+    """How far each replayed graph's output is from every entry's own forward.
+
+    Pool entries route to disjoint expert blocks, so a graph that replayed the
+    wrong entry's routing computes a visibly different layer output. Distances
+    to all of them are recorded rather than a single tolerance, so the check is
+    that graph ``p`` is nearest entry ``p`` -- a comparison with no threshold
+    to pick.
+    """
+    import torch
+
+    eager = []
+    for entry in pool:
+        eager.append(adapter.forward(entry.hidden).float().clone())
+    torch.cuda.synchronize(device)
+
+    outputs = adapter.graph_outputs()
+    distances: list[list[float]] = []
+    for index, graph in enumerate(graphs):
+        graph.replay()
+        torch.cuda.synchronize(device)
+        replayed = outputs[index].float()
+        distances.append(
+            [
+                float(
+                    (replayed - expected).abs().sum()
+                    / expected.abs().sum().clamp_min(1e-12)
+                )
+                for expected in eager
+            ]
+        )
+    del eager
+    return distances
+
+
+def _verify_native_graphs(
+    adapter: Any,
+    pool: Sequence[Any],
+    graphs: Sequence[Any],
+    device: Any,
+    *,
+    mode: str,
+    tokens: int,
+) -> dict[str, Any]:
+    """Prove every captured native graph replays its own pool entry.
+
+    Two independent readings. The router graphs report the expert ids a replay
+    actually selects, which is checked against the entry's intended block. The
+    full graphs report a layer output, which is checked to be nearest its own
+    entry's eager forward among all of them. A pool captured around a mutated
+    router fails both: every graph reports the last entry's routing.
+    """
+    from benchmarks.kimi_k3_decode_inputs import verify_graph_routes
+
+    before = adapter.router_fingerprint()
+    intended = [entry.route_assignments for entry in pool]
+    routes = _replayed_routes(adapter, pool, device)
+    summary = verify_graph_routes(intended, routes)
+
+    distances = _replayed_output_distances(adapter, pool, graphs, device)
+    misrouted = [
+        index
+        for index, row in enumerate(distances)
+        if min(range(len(row)), key=lambda other: row[other]) != index
+    ]
+    if misrouted:
+        raise AssertionError(
+            f"replayed graphs are nearest another entry's output at "
+            f"{mode}/{tokens}: pool indices {misrouted}, distances {distances}"
+        )
+
+    after = adapter.router_fingerprint()
+    if before != after:
+        raise AssertionError(
+            f"the router changed across capture at {mode}/{tokens}: "
+            f"{before} then {after}"
+        )
+    return {
+        "mode": mode,
+        "tokens": tokens,
+        "router_fingerprint": after,
+        "observed_route_assignments_by_graph": routes,
+        "replayed_output_relative_l1_to_each_entry": distances,
+        **summary,
+    }
+
+
 def _measure_backends(
     adapter: Any,
     workspace: Any,
@@ -666,7 +844,7 @@ def _measure_backends(
     framework: str,
     warmup_count: int,
     sample_count: int,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     import torch
 
     from mok import kimi_k3 as kimi
@@ -707,17 +885,23 @@ def _measure_backends(
     _barrier(device)
     torch.cuda.empty_cache()
 
-    results.append(summarize(framework, adapter.capture(pool)))
+    native_graphs = adapter.capture(pool)
+    verification = _verify_native_graphs(
+        adapter, pool, native_graphs, device, mode=mode, tokens=tokens
+    )
+    _barrier(device)
+    results.append(summarize(framework, native_graphs))
     adapter.release()
     _barrier(device)
     torch.cuda.empty_cache()
-    return results
+    return results, verification
 
 
 def _collect_traces(
     adapter: Any,
     workspace: Any,
     weights: Any,
+    router: Any,
     data: Any,
     runtime: Any,
     device: Any,
@@ -726,8 +910,9 @@ def _collect_traces(
 
     from mok import kimi_k3 as kimi
 
-    entry = data.build_routed_input(weights, device, CONCURRENCY_ONE_TOKENS, 0)
-    adapter.load_router(entry.weights.router_weight)
+    entry = data.build_routed_input(
+        weights, device, CONCURRENCY_ONE_TOKENS, 0, router=router
+    )
     custom_names = _kernel_trace(
         lambda: kimi.kimi_k3_decode(
             runtime.CONFIG, workspace, entry.weights, entry.hidden
