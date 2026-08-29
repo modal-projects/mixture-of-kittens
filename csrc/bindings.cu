@@ -1,6 +1,7 @@
 #include "kimi_k3_decode/entrypoints.cuh"
 #include "kimi_k3_decode/expert_mxfp4.cuh"
 #include "kimi_k3_decode/expert_mxfp4_batch_probe.cuh"
+#include "kimi_k3_decode/expert_mxfp4_native_gate_up_probe.cuh"
 #include "megakernel/entrypoints.cuh"
 #include "mxfp8.cuh"
 #include "scheduler.cuh"
@@ -220,6 +221,43 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("scratch"),
         pybind11::arg("expert"),
         pybind11::arg("use_batch_probe"));
+    m.def(
+        "_kimi_k3_prepare_native_gate_up_probe",
+        &kimi_k3_decode::expert_mxfp4::native_gate_up_probe::
+            prepare_native_gate_up_activations_entrypoint,
+        "",
+        pybind11::arg("latent"),
+        pybind11::arg("activation"),
+        pybind11::arg("activation_scale"),
+        pybind11::arg("rows"));
+    m.def(
+        "_kimi_k3_native_gate_up_probe",
+        &kimi_k3_decode::expert_mxfp4::native_gate_up_probe::
+            native_gate_up_probe_entrypoint,
+        "",
+        pybind11::arg("w1_packed"),
+        pybind11::arg("w1_scale"),
+        pybind11::arg("w3_packed"),
+        pybind11::arg("w3_scale"),
+        pybind11::arg("activation"),
+        pybind11::arg("activation_scale"),
+        pybind11::arg("assignment_tokens"),
+        pybind11::arg("experts"),
+        pybind11::arg("output_tiles"),
+        pybind11::arg("situ"),
+        pybind11::arg("situ_scale"),
+        pybind11::arg("gate"),
+        pybind11::arg("up"),
+        pybind11::arg("profile"),
+        pybind11::arg("rows"),
+        pybind11::arg("candidate"),
+        pybind11::arg("poison_inactive"),
+        pybind11::arg("capture"),
+        pybind11::arg("profile_enabled"));
+    m.def(
+        "_kimi_k3_native_gate_up_probe_resources",
+        &kimi_k3_decode::expert_mxfp4::native_gate_up_probe::
+            native_gate_up_probe_resources);
     m.def("all_gather_top_experts", &utils::all_gather_top_experts::all_gather_top_experts_entrypoint, "",
           pybind11::arg("top_experts"), pybind11::arg("all_gather_top_experts_buffer"),
           pybind11::arg("all_gather_top_experts_buffer_multicast_ptr"), pybind11::arg("rank"), pybind11::arg("chunk_bytes"));
