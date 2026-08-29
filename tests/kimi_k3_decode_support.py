@@ -679,7 +679,7 @@ def _append_profiler_debug(
         )
 
 
-def profiled_kernel_names(call: Callable[[], object]) -> list[str]:
+def _profiled_kernel_names_once(call: Callable[[], object]) -> list[str]:
     """Names of every CUDA kernel the profiler attributes to ``call()``."""
     rank = int(os.environ.get("RANK", "-1"))
     torch.cuda.synchronize()
@@ -769,6 +769,22 @@ def profiled_kernel_names(call: Callable[[], object]) -> list[str]:
         },
     )
     # endregion
+    return names
+
+
+def profiled_kernel_names(call: Callable[[], object]) -> list[str]:
+    """Names of every CUDA kernel, retrying one transient empty rank trace."""
+    names: list[str] = []
+    for _ in range(2):
+        names = _profiled_kernel_names_once(call)
+        missed_trace = torch.tensor(
+            not names,
+            dtype=torch.uint8,
+            device=torch.cuda.current_device(),
+        )
+        dist.all_reduce(missed_trace, op=dist.ReduceOp.MAX)
+        if not bool(missed_trace.item()):
+            return names
     return names
 
 
