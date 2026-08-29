@@ -133,3 +133,34 @@ def test_latency_measurement_is_outside_the_profile_context() -> None:
     assert "phase_profiling" in phases
     assert "sample_count=sample_count" in latency
     assert "sample_count=sample_count" in phases
+
+
+def test_activation_candidate_splits_rows_into_coalesced_atoms() -> None:
+    staging = _source("csrc/kimi_k3_decode/expert_mxfp4_staging.cuh")
+    expert = _source("csrc/kimi_k3_decode/expert_mxfp4.cuh")
+    persistent = _source("csrc/kimi_k3_decode/persistent_kernel.cuh")
+    bindings = _source("csrc/bindings.cu")
+    runtime = _source("benchmarks/kimi_k3_decode_runtime.py")
+    benchmark = _source("benchmarks/kimi_k3_gate_up_subphase.py")
+
+    assert "kActivationAtomsPerRow = 2" in staging
+    assert "void stage_activation_atom(" in staging
+    assert "split_activation_atoms" in expert
+    assert "rows * kGateUpRoundGroups * kActivationAtomsPerRow" in expert
+    assert "stage_activation_atom(" in expert
+    assert "benchmark_gate_up_activation_atom_staging_enabled()" in persistent
+    assert "set_benchmark_gate_up_activation_atom_staging_for_testing" in (
+        bindings
+    )
+    assert "def gate_up_activation_atom_staging()" in runtime
+    assert "with runtime.gate_up_activation_atom_staging():" in benchmark
+
+
+def test_activation_candidate_is_benchmark_only_and_production_defaults_off() -> None:
+    persistent = _source("csrc/kimi_k3_decode/persistent_kernel.cuh")
+
+    assert "static std::atomic<int> candidate{0};" in persistent
+    assert "if (!benchmark_grid_tuning_enabled()) return false;" in persistent
+    assert (
+        "Kimi K3 activation atom staging is benchmark-only" in persistent
+    )
