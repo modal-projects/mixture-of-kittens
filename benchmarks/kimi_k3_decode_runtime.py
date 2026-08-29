@@ -78,6 +78,28 @@ def phase_profiling() -> Iterator[None]:
             os.environ["MOK_KIMI_K3_ENABLE_GRID_TUNING"] = previous_guard
 
 
+@contextlib.contextmanager
+def benchmark_gate_up_variant(group_size: int) -> Iterator[None]:
+    """Select one guarded gate/up kernel instantiation for capture or replay."""
+    previous_guard = os.environ.get(
+        "MOK_KIMI_K3_ENABLE_GATE_UP_GROUPING"
+    )
+    os.environ["MOK_KIMI_K3_ENABLE_GATE_UP_GROUPING"] = "1"
+    _C._kimi_k3_decode_set_gate_up_group_size(group_size)
+    try:
+        yield
+    finally:
+        _C._kimi_k3_decode_set_gate_up_group_size(0)
+        if previous_guard is None:
+            os.environ.pop(
+                "MOK_KIMI_K3_ENABLE_GATE_UP_GROUPING", None
+            )
+        else:
+            os.environ[
+                "MOK_KIMI_K3_ENABLE_GATE_UP_GROUPING"
+            ] = previous_guard
+
+
 def phase_clock_cycles(
     workspace: KimiK3DecodeWorkspace,
 ) -> dict[str, int]:
@@ -345,7 +367,7 @@ __all__ = [
     "CONFIG",
     "assert_decode_close",
     "assert_identical_across_ranks",
-    "benchmark_decode_variant",
+    "benchmark_gate_up_variant",
     "check_decode_error",
     "decode_reference",
     "decode_device_step",

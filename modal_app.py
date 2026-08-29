@@ -488,6 +488,51 @@ def diagnose_kimi_k3_batched_expert_probe(
     }
 
 
+@app.function(image=B300_IMAGE, gpu="B300:8", timeout=14_400)
+def bench_kimi_k3_gate_up_grouping(
+    git_sha: str,
+    warmup_count: int = 500,
+    sample_count: int = 1000,
+    repeats: int = 5,
+) -> bytes:
+    """Compare guarded gate/up widths one and two at M16/M32/M128."""
+    if len(git_sha) != 40:
+        raise ValueError("git_sha must be the full 40-character commit SHA")
+    with tempfile.TemporaryDirectory(
+        prefix="kimi-k3-gate-up-grouping-"
+    ) as directory:
+        output_dir = Path(directory) / "artifacts"
+        _run_kimi_k3_torchrun(
+            [
+                "-m",
+                "benchmarks.kimi_k3_gate_up_grouping",
+                "--output-dir",
+                str(output_dir),
+                "--warmup-count",
+                str(warmup_count),
+                "--sample-count",
+                str(sample_count),
+                "--repeats",
+                str(repeats),
+            ],
+            timeout=14_100,
+            environment={"MOK_GIT_SHA": git_sha},
+        )
+        expected = {"manifest.json", "results.json", "raw_samples.json"}
+        actual = {path.name for path in output_dir.iterdir()}
+        if not expected <= actual:
+            raise RuntimeError(
+                "gate/up grouping artifacts are incomplete: "
+                f"missing={sorted(expected - actual)}"
+            )
+        archive = reproducible_tar_bytes(output_dir)
+        if archive != reproducible_tar_bytes(output_dir):
+            raise RuntimeError(
+                "normalized gate/up grouping archive is not reproducible"
+            )
+        return archive
+
+
 @app.local_entrypoint()
 def batched_expert_probe(
     git_sha: str,
@@ -534,6 +579,32 @@ def batched_expert_diagnostic(
     )
     Path(output_path).write_text(rendered, encoding="utf-8")
     print(rendered, end="")
+
+
+@app.local_entrypoint()
+def gate_up_grouping(
+    git_sha: str,
+    output_dir: str = "kimi_k3_gate_up_grouping",
+    warmup_count: int = 500,
+    sample_count: int = 1000,
+    repeats: int = 5,
+) -> None:
+    """Run and unpack the focused M16/M32/M128 gate/up comparison."""
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    archive = bench_kimi_k3_gate_up_grouping.remote(
+        git_sha,
+        warmup_count=warmup_count,
+        sample_count=sample_count,
+        repeats=repeats,
+    )
+    (destination / "artifacts.tar").write_bytes(archive)
+    with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
+        bundle.extractall(destination, filter="data")
+    print(
+        "gate/up grouping artifacts: "
+        f"{sorted(path.name for path in destination.iterdir())}"
+    )
 
 
 def _run_framework_comparison(

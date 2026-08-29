@@ -108,12 +108,28 @@ static_assert(
     kPersistentSharedBytes
         >= expert_mxfp4::grouped_pipeline::kGroupedDownPersistentSharedBytes,
     "the persistent grid must fit grouped routed down");
+static_assert(
+    kPersistentSharedBytes
+        >= expert_mxfp4::grouped_pipeline::kGroupedGateUpCandidateSharedBytes,
+    "the benchmark grid must fit grouped routed gate/up");
 static_assert(kPersistentSharedBytes >= router::kSharedBytes,
               "the persistent grid must fit the router's scoring buffer");
 
 // ---------------------------------------------------------------------------
 // Logical task counts.
 // ---------------------------------------------------------------------------
+
+template<int GATE_UP_GROUP_SIZE>
+__host__ __device__ constexpr int gate_up_units_per_expert() {
+    static_assert(
+        GATE_UP_GROUP_SIZE >= 0 && GATE_UP_GROUP_SIZE <= 2);
+    if constexpr (GATE_UP_GROUP_SIZE == 0) {
+        return expert_mxfp4::kGateUpTiles;
+    } else {
+        return expert_mxfp4::grouped_pipeline::
+            grouped_gate_up_units<GATE_UP_GROUP_SIZE>();
+    }
+}
 
 /// Every logical task of one decode step, by phase.
 ///
@@ -269,6 +285,49 @@ inline bool benchmark_phase_profile_for_testing() {
     return benchmark_phase_profile_enabled();
 }
 
+/// Select one smaller gate/up grouping only in a dedicated benchmark process.
+///
+/// Zero is the shipped 128x128 unit. One and two are m128x8 candidates whose
+/// live accumulator sets are limited to two and four respectively. The
+/// environment guard fails closed even if a benchmark exits before resetting
+/// the stored value.
+static __host__ std::atomic<int> &benchmark_gate_up_group_size_storage() {
+    static std::atomic<int> size{0};
+    return size;
+}
+
+inline bool benchmark_gate_up_grouping_guard_enabled() {
+    const char *const enabled =
+        std::getenv("MOK_KIMI_K3_ENABLE_GATE_UP_GROUPING");
+    return enabled != nullptr && std::strcmp(enabled, "1") == 0;
+}
+
+inline int benchmark_gate_up_group_size() {
+    if (!benchmark_gate_up_grouping_guard_enabled()) return 0;
+    return benchmark_gate_up_group_size_storage().load(
+        std::memory_order_relaxed);
+}
+
+inline void set_benchmark_gate_up_group_size_for_testing(
+    const std::int64_t group_size
+) {
+    TORCH_CHECK(
+        benchmark_gate_up_grouping_guard_enabled(),
+        "MoK: Kimi K3 gate/up grouping is benchmark-only; set "
+        "MOK_KIMI_K3_ENABLE_GATE_UP_GROUPING=1 in a dedicated benchmark "
+        "process");
+    TORCH_CHECK(
+        group_size >= 0 && group_size <= 2,
+        "MoK: Kimi K3 benchmark gate/up group size must be 0, 1, or 2, got ",
+        group_size);
+    benchmark_gate_up_group_size_storage().store(
+        static_cast<int>(group_size), std::memory_order_relaxed);
+}
+
+inline std::int64_t benchmark_gate_up_group_size_for_testing() {
+    return benchmark_gate_up_group_size();
+}
+
 /// The accumulators' scratch band and their names, for the reader.
 inline std::tuple<std::int64_t, std::vector<std::string>>
 phase_clock_metadata_for_testing() {
@@ -348,7 +407,7 @@ using layouts_t = std::conditional_t<TENSOR_PATH, TensorLayouts,
 // The single production kernel.
 // ---------------------------------------------------------------------------
 
-template<bool TENSOR_PATH>
+template<bool TENSOR_PATH, int GATE_UP_GROUP_SIZE>
 __global__ __launch_bounds__(kDecodeCtaThreads, 1)
 void kimi_k3_decode_persistent_kernel(
     const __nv_bfloat16 *__restrict__ hidden_states,
@@ -379,6 +438,10 @@ void kimi_k3_decode_persistent_kernel(
     const int active_tokens,
     const int profile_phases
 ) {
+    static_assert(
+        GATE_UP_GROUP_SIZE == 0
+        || GATE_UP_GROUP_SIZE == 1
+        || GATE_UP_GROUP_SIZE == 2);
     extern __shared__ __align__(16) int shared_raw[];
     std::uint8_t *const shared = reinterpret_cast<std::uint8_t *>(shared_raw);
     __shared__ std::uint32_t latch_slot;
@@ -513,7 +576,7 @@ void kimi_k3_decode_persistent_kernel(
         __syncthreads();
         router::build_expert_units(shared, scratch);
         __syncthreads();
-        mark = clocks.lap(kClockAssignments, mark);
+        mark = clocks.now();
     }
     expert_mxfp4::quantize_latent_rows(
         scratch.latent_x, scratch, active_tokens, block, grid_ctas);
@@ -540,12 +603,16 @@ void kimi_k3_decode_persistent_kernel(
         constexpr int shared_units = TENSOR_PATH
             ? 2 * shared_experts::kTensorGateCtas
             : shared_experts::kCoreGateCtas;
-        constexpr int routed_units_per_expert = expert_mxfp4::kGateUpTiles;
+        constexpr int routed_units_per_expert =
+            gate_up_units_per_expert<GATE_UP_GROUP_SIZE>();
         const int units = shared_units + expert_units * routed_units_per_expert;
-        int batch_begin;
-        while ((batch_begin = claim_unit_batch(
-                    scratch, kGateUpQueue, units, routed_batch, &claim_slot,
-                    &claim_end_slot)) >= 0) {
+        while (true) {
+            const unsigned long long queue_mark = clocks.now();
+            const int batch_begin = claim_unit_batch(
+                scratch, kGateUpQueue, units, routed_batch, &claim_slot,
+                &claim_end_slot);
+            mark = clocks.lap(kClockRoutedQueue, queue_mark);
+            if (batch_begin < 0) break;
             for (int unit = batch_begin; unit < claim_end_slot; ++unit) {
                 if (unit < shared_units) {
                     if constexpr (TENSOR_PATH) {
@@ -574,12 +641,22 @@ void kimi_k3_decode_persistent_kernel(
                 const int expert = scratch.unit_expert[
                     routed / routed_units_per_expert];
                 const int begin = scratch.expert_offsets[expert];
-                expert_mxfp4::routed_gate_up_unit(
-                    shared_raw, tensor_pool, expert_w1_packed,
-                    expert_w1_scale, expert_w3_packed, expert_w3_scale,
-                    scratch, expert, begin,
-                    scratch.expert_offsets[expert + 1] - begin,
-                    routed % routed_units_per_expert, clocks);
+                if constexpr (GATE_UP_GROUP_SIZE == 0) {
+                    expert_mxfp4::routed_gate_up_unit(
+                        shared_raw, tensor_pool, expert_w1_packed,
+                        expert_w1_scale, expert_w3_packed, expert_w3_scale,
+                        scratch, expert, begin,
+                        scratch.expert_offsets[expert + 1] - begin,
+                        routed % routed_units_per_expert, clocks);
+                } else {
+                    expert_mxfp4::grouped_pipeline::
+                        grouped_gate_up_unit<GATE_UP_GROUP_SIZE>(
+                            shared_raw, tensor_pool, expert_w1_packed,
+                            expert_w1_scale, expert_w3_packed,
+                            expert_w3_scale, scratch, expert, begin,
+                            scratch.expert_offsets[expert + 1] - begin,
+                            routed % routed_units_per_expert, clocks);
+                }
                 __syncthreads();
                 mark = clocks.lap(kClockRoutedGateUp, mark);
             }
@@ -608,10 +685,13 @@ void kimi_k3_decode_persistent_kernel(
         constexpr int routed_units_per_expert =
             expert_mxfp4::grouped_pipeline::kGroupedDownUnits;
         const int units = shared_units + expert_units * routed_units_per_expert;
-        int batch_begin;
-        while ((batch_begin = claim_unit_batch(
-                    scratch, kDownQueue, units, routed_batch, &claim_slot,
-                    &claim_end_slot)) >= 0) {
+        while (true) {
+            const unsigned long long queue_mark = clocks.now();
+            const int batch_begin = claim_unit_batch(
+                scratch, kDownQueue, units, routed_batch, &claim_slot,
+                &claim_end_slot);
+            mark = clocks.lap(kClockRoutedQueue, queue_mark);
+            if (batch_begin < 0) break;
             for (int unit = batch_begin; unit < claim_end_slot; ++unit) {
                 if (unit < shared_units) {
                     if (unit < activation_units) {
@@ -757,7 +837,7 @@ static __host__ std::int64_t shared_memory_reservations_for_testing(
 /// graph capture would have to record. The measured occupancy is then checked
 /// on every call, so a device that cannot host the grid is rejected every time
 /// rather than only on the first launch of a process.
-template<bool TENSOR_PATH>
+template<bool TENSOR_PATH, int GATE_UP_GROUP_SIZE = 0>
 static __host__ int resident_blocks_per_sm() {
     static std::array<std::atomic<int>, kMaxCudaDevices> measured{};
     static std::array<std::once_flag, kMaxCudaDevices> reserved;
@@ -768,13 +848,15 @@ static __host__ int resident_blocks_per_sm() {
                 device);
     std::call_once(reserved[static_cast<std::size_t>(device)], [device] {
         C10_CUDA_CHECK(cudaFuncSetAttribute(
-            kimi_k3_decode_persistent_kernel<TENSOR_PATH>,
+            kimi_k3_decode_persistent_kernel<
+                TENSOR_PATH, GATE_UP_GROUP_SIZE>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             kPersistentSharedBytes));
         int blocks = 0;
         C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &blocks,
-            kimi_k3_decode_persistent_kernel<TENSOR_PATH>,
+            kimi_k3_decode_persistent_kernel<
+                TENSOR_PATH, GATE_UP_GROUP_SIZE>,
             kDecodeCtaThreads, kPersistentSharedBytes));
         measured[static_cast<std::size_t>(device)].store(
             blocks, std::memory_order_relaxed);
@@ -823,6 +905,38 @@ inline std::int64_t resident_blocks_per_sm_for_testing(
                        : resident_blocks_per_sm<false>();
 }
 
+template<int GATE_UP_GROUP_SIZE>
+inline std::int64_t gate_up_group_residency(const bool tensor_path) {
+    return tensor_path
+        ? resident_blocks_per_sm<true, GATE_UP_GROUP_SIZE>()
+        : resident_blocks_per_sm<false, GATE_UP_GROUP_SIZE>();
+}
+
+inline std::tuple<std::int64_t, std::int64_t>
+gate_up_group_resource_for_testing(
+    const bool tensor_path,
+    const std::int64_t group_size
+) {
+    switch (group_size) {
+        case 0:
+            return {kPersistentSharedBytes,
+                    gate_up_group_residency<0>(tensor_path)};
+        case 1:
+            return {kPersistentSharedBytes,
+                    gate_up_group_residency<1>(tensor_path)};
+        case 2:
+            return {kPersistentSharedBytes,
+                    gate_up_group_residency<2>(tensor_path)};
+        default:
+            TORCH_CHECK(
+                false,
+                "MoK: Kimi K3 benchmark gate/up group size must be 0, 1, or "
+                "2, got ",
+                group_size);
+    }
+    return {0, 0};
+}
+
 /// Every pointer, alias, and count one persistent launch needs.
 ///
 /// The kernel takes twenty-odd arguments and the two capacity paths pass the
@@ -859,14 +973,14 @@ struct LaunchArguments {
     int profile_phases;
 };
 
-template<bool TENSOR_PATH>
+template<bool TENSOR_PATH, int GATE_UP_GROUP_SIZE>
 static __host__ void launch_persistent(
     const LaunchArguments &arguments,
     const layouts_t<TENSOR_PATH> &layouts
 ) {
     validate_grid_residency(
         arguments.available_sms,
-        resident_blocks_per_sm<TENSOR_PATH>(),
+        resident_blocks_per_sm<TENSOR_PATH, GATE_UP_GROUP_SIZE>(),
         arguments.grid_ctas);
 
     const auto bf16 = [](const at::Tensor &tensor) {
@@ -876,7 +990,7 @@ static __host__ void launch_persistent(
         return reinterpret_cast<const std::uint8_t *>(tensor.data_ptr());
     };
 
-    kimi_k3_decode_persistent_kernel<TENSOR_PATH>
+    kimi_k3_decode_persistent_kernel<TENSOR_PATH, GATE_UP_GROUP_SIZE>
         <<<arguments.grid_ctas, kDecodeCtaThreads, kPersistentSharedBytes,
            at::cuda::getCurrentCUDAStream()>>>(
             bf16(arguments.hidden_states),
@@ -969,13 +1083,39 @@ static __host__ TensorLayouts tensor_layouts(
     };
 }
 
-/// Run one whole TP8 Kimi K3 decode step in one persistent launch.
-static __host__ void launch_decode(const LaunchArguments &arguments) {
+template<int GATE_UP_GROUP_SIZE>
+static __host__ void launch_selected_decode(
+    const LaunchArguments &arguments
+) {
     if (capacity_bucket(arguments.active_tokens) <= kMaxCoreCapacity) {
-        launch_persistent<false>(arguments, NoTensorLayouts{});
+        launch_persistent<false, GATE_UP_GROUP_SIZE>(
+            arguments, NoTensorLayouts{});
         return;
     }
-    launch_persistent<true>(arguments, tensor_layouts(arguments));
+    launch_persistent<true, GATE_UP_GROUP_SIZE>(
+        arguments, tensor_layouts(arguments));
+}
+
+/// Run one whole TP8 Kimi K3 decode step in one selected persistent launch.
+///
+/// The unguarded production path always selects zero. A benchmark may select
+/// one or two, but each selection is still exactly one kernel launch.
+static __host__ void launch_decode(const LaunchArguments &arguments) {
+    switch (benchmark_gate_up_group_size()) {
+        case 0:
+            launch_selected_decode<0>(arguments);
+            return;
+        case 1:
+            launch_selected_decode<1>(arguments);
+            return;
+        case 2:
+            launch_selected_decode<2>(arguments);
+            return;
+        default:
+            TORCH_CHECK(
+                false,
+                "MoK: invalid internal Kimi K3 gate/up benchmark group size");
+    }
 }
 
 }  // namespace persistent

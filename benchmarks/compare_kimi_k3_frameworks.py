@@ -147,7 +147,7 @@ PHASE_CLOCK_NAMES = (
     "queue_clear",
     "router_score",
     "latent_project",
-    "assignments",
+    "routed_queue",
     "latent_quantize",
     "routed_gate_up",
     "routed_gate_up_stage",
@@ -159,17 +159,18 @@ PHASE_CLOCK_NAMES = (
     "grid_barrier",
     "tail",
 )
-PHASE_CLOCK_BREAKDOWN_SUFFIXES = ("_stage", "_mma", "_residual")
+PHASE_CLOCK_BREAKDOWN_SUFFIXES = ("_stage", "_mma", "_epilogue")
 
 
 def derive_phase_cycles(cycles: Mapping[str, int]) -> dict[str, int]:
-    """Expose routed work not accounted for by staging or MMA clocks."""
+    """Expose each routed epilogue outside staging and MMA clocks."""
     derived = dict(cycles)
-    routed_down = derived.get("routed_down")
-    stage = derived.get("routed_down_stage")
-    mma = derived.get("routed_down_mma")
-    if routed_down is not None and stage is not None and mma is not None:
-        derived["routed_down_residual"] = max(0, routed_down - stage - mma)
+    for phase in ("routed_gate_up", "routed_down"):
+        total = derived.get(phase)
+        stage = derived.get(f"{phase}_stage")
+        mma = derived.get(f"{phase}_mma")
+        if total is not None and stage is not None and mma is not None:
+            derived[f"{phase}_epilogue"] = max(0, total - stage - mma)
     return derived
 
 
