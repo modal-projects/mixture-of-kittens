@@ -807,8 +807,9 @@ def test_phase_clock_names_match_the_kernel_scratch_band() -> None:
     ]
 
     assert names == list(compare.PHASE_CLOCK_NAMES)
-    assert names[0] == "queue_clear"
+    assert names[0] == "readiness_wait"
     assert "routed_queue" in names
+    assert "readiness_wait" in names
     assert "assignments" not in names
     assert "routed_gate_up_stage" in names
     assert "routed_gate_up_mma" in names

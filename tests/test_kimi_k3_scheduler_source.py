@@ -182,3 +182,67 @@ def test_gate_up_benchmark_measures_all_priority_shapes_and_widths() -> None:
     assert '"queue":' in benchmark
     assert '"barrier":' in benchmark
     assert '"candidate_status": "benchmark_only"' in benchmark
+
+
+def test_gate_up_down_pipeline_is_a_guarded_benchmark_instantiation() -> None:
+    """Remove one phase barrier only behind a compile-time benchmark flag."""
+    persistent = _source("persistent_kernel.cuh")
+    kernel = _function_body(
+        persistent,
+        "void kimi_k3_decode_persistent_kernel(",
+    )
+    launch = _function_body(persistent, "void launch_decode(")
+
+    assert "MOK_KIMI_K3_ENABLE_GATE_UP_DOWN_PIPELINE" in persistent
+    assert "set_benchmark_gate_up_down_pipeline_for_testing(" in persistent
+    assert "benchmark_gate_up_down_pipeline()" in persistent
+    assert (
+        "template<bool TENSOR_PATH, int GATE_UP_GROUP_SIZE, "
+        "bool PIPELINE_GATE_UP_DOWN>"
+    ) in persistent
+    assert "if constexpr (!PIPELINE_GATE_UP_DOWN)" in kernel
+    assert "launch_selected_decode<0, true>(" in launch
+    assert "launch_selected_decode<0, false>(" in launch
+    assert "launch_selected_decode<1, false>(" in launch
+    assert "launch_selected_decode<2, false>(" in launch
+
+
+def test_gate_up_down_pipeline_uses_dependency_readiness_without_deadlock() -> None:
+    """All producer tickets precede consumers; waits are expert-local."""
+    persistent = _source("persistent_kernel.cuh")
+    sync = _source("persistent_sync.cuh")
+    router = _source("router.cuh")
+    kernel = _function_body(
+        persistent,
+        "void kimi_k3_decode_persistent_kernel(",
+    )
+    compact = _function_body(router, "void build_expert_units(")
+
+    assert "scratch.expert_counts[expert] = 0;" in compact
+    assert "kGateUpArrivals" in persistent
+    assert "publish_count_at(" in sync
+    assert "wait_for_count_at(" in sync
+    assert "publish_count_at(&scratch.expert_counts[expert])" in kernel
+    assert "&scratch.expert_counts[expert]" in kernel
+    assert "kGateUpTiles" in kernel
+    assert "kErrorPersistentGateUpDownReadiness" in persistent
+
+    gate_up = kernel.split("// Phase 3:", 1)[1].split("// Phase 4:", 1)[0]
+    down = kernel.split("// Phase 4:", 1)[1].split("// Phase 5:", 1)[0]
+    assert gate_up.index("claim_unit_batch(") < gate_up.index(
+        "publish_count_at(&scratch.expert_counts[expert])"
+    )
+    assert down.index("wait_for_count_at(") < down.index(
+        "grouped_down_unit("
+    )
+
+
+def test_gate_up_benchmark_includes_the_pipelined_transition_candidate() -> None:
+    """Measure readiness waits separately from queue and barrier cycles."""
+    benchmark = (
+        Path(__file__).parents[1] / "benchmarks" / "kimi_k3_gate_up_grouping.py"
+    ).read_text(encoding="utf-8")
+
+    assert 'Variant("pipeline_gate_up_down", 0, True)' in benchmark
+    assert '"readiness_wait":' in benchmark
+    assert "pipeline_gate_up_down" in benchmark
