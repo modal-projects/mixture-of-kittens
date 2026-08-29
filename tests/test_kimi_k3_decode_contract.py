@@ -382,6 +382,59 @@ def test_the_longest_queue_is_the_one_the_header_asserts() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Reads the compiler is free to poison.
+# ---------------------------------------------------------------------------
+
+
+def _function_body(text: str, signature: str) -> str:
+    """Return the text of one `static __device__` function by its name."""
+    start = text.index(signature)
+    depth = 0
+    for offset in range(text.index("{", start), len(text)):
+        if text[offset] == "{":
+            depth += 1
+        elif text[offset] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:offset + 1]
+    raise AssertionError(f"{signature} is never closed")
+
+
+def test_the_gate_up_rounds_never_read_a_prefetch_they_did_not_make() -> None:
+    """The last round has no next round, so its prefetch never happened.
+
+    ``next_payload`` and ``next_scale_words`` are plain local arrays, so on the
+    round that skips the prefetch they hold an indeterminate value, and reading
+    one is undefined behaviour whatever the copy is later used for. The read
+    and the write therefore have to sit under one condition, which this checks
+    by insisting every mention of either array is inside an ``if
+    (prefetching)`` block.
+    """
+    body = _function_body(
+        _source("expert_mxfp4.cuh"), "void routed_gate_up_unit("
+    )
+    guarded = re.findall(
+        r"if \(prefetching\) \{(?P<block>(?:[^{}]|\{[^{}]*\})*)\}", body
+    )
+    assert len(guarded) == 2, "one guard to prefetch under, one to copy under"
+
+    declarations = [
+        line
+        for line in body.splitlines()
+        if re.search(r"\bnext_(payload|scale_words)\b", line)
+        and re.match(r"\s*(uint4|std::uint32_t) ", line)
+    ]
+    assert len(declarations) == 2
+
+    mentions = len(re.findall(r"\bnext_(?:payload|scale_words)\b", body))
+    inside = sum(
+        len(re.findall(r"\bnext_(?:payload|scale_words)\b", block))
+        for block in guarded
+    )
+    assert mentions - inside == len(declarations), body
+
+
+# ---------------------------------------------------------------------------
 # Rejections.
 # ---------------------------------------------------------------------------
 

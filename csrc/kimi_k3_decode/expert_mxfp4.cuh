@@ -880,9 +880,15 @@ static __device__ void routed_gate_up_unit(
                     + group_base + quad * kScaleGroupsPerTile));
         }
 
+        // The last round has nothing to prefetch, and the copy-back below is
+        // guarded by the same condition: reading these to hand them to the
+        // next round when there is no next round would be reading an
+        // indeterminate local object, which is undefined however dead the
+        // value is.
+        const bool prefetching = round + 1 < kGateUpRounds;
         uint4 next_payload[kGateUpRoundGroups];
         std::uint32_t next_scale_words[kGateUpScaleTiles];
-        if (round + 1 < kGateUpRounds) {
+        if (prefetching) {
             read_weight_round(
                 group_base + kGateUpRoundGroups,
                 next_payload,
@@ -937,13 +943,15 @@ static __device__ void routed_gate_up_unit(
         mark = clocks.lap(kClockRoutedGateUpMma, mark);
         compute_phase ^= 1;
 
-        #pragma unroll
-        for (int slot = 0; slot < kGateUpRoundGroups; ++slot) {
-            payload[slot] = next_payload[slot];
-        }
-        #pragma unroll
-        for (int quad = 0; quad < kGateUpScaleTiles; ++quad) {
-            scale_words[quad] = next_scale_words[quad];
+        if (prefetching) {
+            #pragma unroll
+            for (int slot = 0; slot < kGateUpRoundGroups; ++slot) {
+                payload[slot] = next_payload[slot];
+            }
+            #pragma unroll
+            for (int quad = 0; quad < kGateUpScaleTiles; ++quad) {
+                scale_words[quad] = next_scale_words[quad];
+            }
         }
     }
 
