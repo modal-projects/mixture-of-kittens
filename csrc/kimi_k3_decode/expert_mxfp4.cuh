@@ -863,14 +863,16 @@ static __device__ void routed_gate_up_unit(
             if (laneid() == 0) {
                 #pragma unroll
                 for (int quad = 0; quad < kGateUpScaleTiles; ++quad) {
+                    auto activation_scale = scale_slot(quad);
+                    auto first_scale = scale_slot(kGateUpScaleTiles + quad);
+                    auto second_scale =
+                        scale_slot(2 * kGateUpScaleTiles + quad);
                     load_mxnv_scale_async(
-                        scale_slot(quad), activation_scale_shared[quad]);
+                        activation_scale, activation_scale_shared[quad]);
                     load_mxnv_scale_async(
-                        scale_slot(kGateUpScaleTiles + quad),
-                        first_scale_shared[quad]);
+                        first_scale, first_scale_shared[quad]);
                     load_mxnv_scale_async(
-                        scale_slot(2 * kGateUpScaleTiles + quad),
-                        second_scale_shared[quad]);
+                        second_scale, second_scale_shared[quad]);
                 }
             }
             tensor_store_wait();
@@ -1045,11 +1047,12 @@ static __device__ void routed_down_unit(
         if (laneid() == 0) {
             #pragma unroll
             for (int quad = 0; quad < kDownScaleTiles; ++quad) {
+                auto activation_scale = scale_slot(quad);
+                auto weight_scale = scale_slot(kDownScaleTiles + quad);
                 load_mxnv_scale_async(
-                    scale_slot(quad), activation_scale_shared[quad]);
+                    activation_scale, activation_scale_shared[quad]);
                 load_mxnv_scale_async(
-                    scale_slot(kDownScaleTiles + quad),
-                    weight_scale_shared[quad]);
+                    weight_scale, weight_scale_shared[quad]);
             }
         }
         tensor_store_wait();
