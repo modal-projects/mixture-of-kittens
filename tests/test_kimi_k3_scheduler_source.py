@@ -86,6 +86,73 @@ def test_batched_expert_probe_is_a_transposed_m128x8x32_microprototype() -> None
     assert "batched_down_unit(" not in persistent
 
 
+def test_native_gate_up_probe_is_an_isolated_three_stage_direct_tma_engine() -> None:
+    """Pin the requested benchmark-only producer/consumer pipeline."""
+    native = _source("expert_mxfp4_native_gate_up_probe.cuh")
+    production = _source("expert_mxfp4.cuh")
+    persistent = _source("persistent_kernel.cuh")
+
+    assert "kNativeGateUpM = 128" in native
+    assert "kNativeGateUpN = 8" in native
+    assert "kNativeGateUpK = 32" in native
+    assert "kNativeWeightStages = 3" in native
+    assert "kNativePanelGroups = 4" in native
+    assert "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B" in native
+    assert "CU_TENSOR_MAP_SWIZZLE_128B" in native
+    assert "global_dimensions[5]" in native
+    assert "global_strides[4]" in native
+    assert "box_dimensions[5]" in native
+    assert "load_direct_weight_stage(" in native
+    assert "native_gate_up_candidate(" in native
+    assert "native_gate_up_candidate(" not in production
+    assert "native_gate_up_candidate(" not in persistent
+
+
+def test_native_gate_up_panel_releases_stages_without_cta_barriers() -> None:
+    native = _source("expert_mxfp4_native_gate_up_probe.cuh")
+    candidate = _function_body(native, "void native_gate_up_candidate(")
+    panel_loop = candidate.split(
+        "for (int panel = 0; panel < kNativePanels; ++panel)", 1
+    )[1].split("native_situ_epilogue(", 1)[0]
+
+    assert "warpid() == kNativeProducerWarp" in candidate
+    assert "warpid() == kNativeConsumerWarp" in candidate
+    assert "issue_native_panel(" in candidate
+    assert panel_loop.count("batch_mixed_mma_direct(") == 2
+    assert "detail::tcgen05::commit<1>(stage_released[stage])" in panel_loop
+    assert "detail::tcgen05::commit<1>(compute_done)" in candidate
+    assert "__syncthreads()" not in panel_loop
+    assert "store_batch_accumulator(" not in candidate
+    assert "batch_result_tile" not in candidate
+
+
+def test_native_gate_up_shared_memory_forces_one_cta_per_sm_under_120_kib() -> None:
+    native = _source("expert_mxfp4_native_gate_up_probe.cuh")
+
+    assert "kNativeWeightSharedBytes == 96 * 1024" in native
+    assert "kNativeGateUpSharedBytes <= 120 * 1024" in native
+    assert "kNativeGateUpSharedReservationBytes = 120 * 1024" in native
+    assert (
+        "2 * kNativeGateUpSharedReservationBytes"
+        " > kittens::MAX_SHARED_MEMORY"
+    ) in native
+    assert "native_gate_up_probe_resources" in native
+    assert "cudaOccupancyMaxActiveBlocksPerMultiprocessor" in native
+
+
+def test_native_gate_up_epilogue_reads_live_values_directly_from_tmem() -> None:
+    native = _source("expert_mxfp4_native_gate_up_probe.cuh")
+    epilogue = _function_body(native, "void native_situ_epilogue(")
+
+    assert "group<1>::load_async(gate, gate_slice)" in epilogue
+    assert "group<1>::load_async(up, up_slice)" in epilogue
+    assert "tensor_load_wait()" in epilogue
+    assert "quantize_e4m3(" in epilogue
+    assert "scratch.situ_mxfp8" in epilogue
+    assert "scratch.situ_scale" in epilogue
+    assert "batch_result_tile" not in epilogue
+
+
 def test_grouped_down_reuses_activation_across_expert_output_tiles() -> None:
     """Group down output tiles, not unrelated rows, behind m128x8 math."""
     grouped = _source("expert_mxfp4_grouped.cuh")

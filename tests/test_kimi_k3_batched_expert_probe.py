@@ -79,6 +79,10 @@ def test_probe_rows_are_exactly_the_native_token_columns() -> None:
     )
 
     assert probe.PROBE_ROWS == (1, 2, 4, 8)
+    assert probe.SATURATED_CTAS == 148
+    assert probe.WARMUP_COUNT == 500
+    assert probe.SAMPLE_COUNT == 1000
+    assert probe.REPEATS == 5
 
 
 def test_probe_exposes_rows_one_single_launch_diagnostics() -> None:
@@ -99,20 +103,27 @@ def test_measurement_requires_a_gain_outside_repeat_dispersion() -> None:
         "benchmarks.kimi_k3_batched_expert_probe"
     )
     numerical = {
-        "finite": True,
-        "relative_l1": 0.0,
-        "cosine_similarity": 1.0,
-        "max_abs": 0.0,
+        "gate_bitwise_equal": True,
+        "up_bitwise_equal": True,
+        "situ_bitwise_equal": True,
+        "situ_scale_bitwise_equal": True,
+        "inactive_columns_isolated": True,
     }
 
     accepted = probe.evaluate_row(
+        rows=1,
         baseline_repeat_medians=[1.000, 1.002, 0.998],
         candidate_repeat_medians=[0.950, 0.952, 0.948],
+        baseline_repeat_p99s=[1.010, 1.012, 1.008],
+        candidate_repeat_p99s=[0.950, 0.952, 0.948],
         numerical=numerical,
     )
     inside_noise = probe.evaluate_row(
+        rows=1,
         baseline_repeat_medians=[1.000, 1.003, 0.999],
         candidate_repeat_medians=[0.999, 1.001, 0.998],
+        baseline_repeat_p99s=[1.010, 1.013, 1.009],
+        candidate_repeat_p99s=[1.009, 1.011, 1.008],
         numerical=numerical,
     )
 
@@ -129,18 +140,63 @@ def test_measurement_rejects_a_numerically_wrong_candidate() -> None:
     )
 
     row = probe.evaluate_row(
+        rows=1,
         baseline_repeat_medians=[1.0, 1.0],
         candidate_repeat_medians=[0.5, 0.5],
+        baseline_repeat_p99s=[1.0, 1.0],
+        candidate_repeat_p99s=[0.5, 0.5],
         numerical={
-            "finite": True,
-            "relative_l1": 0.06,
-            "cosine_similarity": 0.998,
-            "max_abs": 1.1,
+            "gate_bitwise_equal": True,
+            "up_bitwise_equal": False,
+            "situ_bitwise_equal": True,
+            "situ_scale_bitwise_equal": True,
+            "inactive_columns_isolated": True,
         },
     )
 
     assert row["numerically_correct"] is False
     assert row["passed"] is False
+
+
+@pytest.mark.parametrize(
+    ("rows", "baseline_median", "candidate_median", "baseline_p99", "candidate_p99", "passed"),
+    [
+        (1, 1.0, 0.9001, 1.0, 0.94, False),
+        (1, 1.0, 0.89, 1.0, 0.949, True),
+        (2, 1.0, 0.951, 1.0, 0.94, False),
+        (4, 1.0, 0.94, 1.0, 0.951, False),
+        (8, 1.0, 0.94, 1.0, 0.94, True),
+    ],
+)
+def test_measurement_applies_row_specific_median_and_p99_thresholds(
+    rows: int,
+    baseline_median: float,
+    candidate_median: float,
+    baseline_p99: float,
+    candidate_p99: float,
+    passed: bool,
+) -> None:
+    probe = importlib.import_module(
+        "benchmarks.kimi_k3_batched_expert_probe"
+    )
+    numerical = {
+        "gate_bitwise_equal": True,
+        "up_bitwise_equal": True,
+        "situ_bitwise_equal": True,
+        "situ_scale_bitwise_equal": True,
+        "inactive_columns_isolated": True,
+    }
+
+    row = probe.evaluate_row(
+        rows=rows,
+        baseline_repeat_medians=[baseline_median] * 3,
+        candidate_repeat_medians=[candidate_median] * 3,
+        baseline_repeat_p99s=[baseline_p99] * 3,
+        candidate_repeat_p99s=[candidate_p99] * 3,
+        numerical=numerical,
+    )
+
+    assert row["passed"] is passed
 
 
 def test_m16_route_shape_has_no_same_expert_pair_to_pack() -> None:
