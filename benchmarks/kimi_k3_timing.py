@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
-from typing import Any
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any, Protocol
 
 
 def percentile(samples: Sequence[float], quantile: float) -> float:
@@ -62,6 +62,61 @@ def summarize_rank_max(
         "p99_ms": percentile(samples, 0.99),
         "geomean_ms": geometric_mean(samples),
     }
+
+
+class TimingEvent(Protocol):
+    """The part of ``torch.cuda.Event`` a replay measurement uses."""
+
+    def record(self) -> None: ...
+
+    def elapsed_time(self, other: TimingEvent) -> float: ...
+
+
+def replay_samples(
+    replay: Callable[[int], None],
+    *,
+    warmup_count: int,
+    sample_count: int,
+    event_factory: Callable[[], TimingEvent],
+    synchronize: Callable[[], None],
+) -> list[float]:
+    """Time ``sample_count`` replays, after warming both the kernel and the events.
+
+    The warmups are the kernel's; the primed pair is the timing instrument's.
+    A process's first ``cuda.Event`` record pays a one-time driver
+    initialization, and every sample here is enqueued back to back before a
+    single synchronization, so that cost lands entirely in sample zero -- which
+    a thousand-sample p99 then reports as a tail. One pair is recorded and its
+    reading thrown away first, so the persisted series measures only replays.
+
+    The iteration index continues across the warmups, the primed replay, and
+    the measured ones, so a caller that rotates a graph pool by index keeps
+    rotating it.
+    """
+    if warmup_count < 1 or sample_count < 1:
+        raise ValueError("warmup and sample counts must be positive")
+    for iteration in range(warmup_count):
+        replay(iteration)
+    synchronize()
+
+    primed_start = event_factory()
+    primed_end = event_factory()
+    primed_start.record()
+    replay(warmup_count)
+    primed_end.record()
+    synchronize()
+    primed_start.elapsed_time(primed_end)
+
+    starts = [event_factory() for _ in range(sample_count)]
+    ends = [event_factory() for _ in range(sample_count)]
+    for offset, (start, end) in enumerate(zip(starts, ends, strict=True)):
+        start.record()
+        replay(warmup_count + 1 + offset)
+        end.record()
+    synchronize()
+    return [
+        start.elapsed_time(end) for start, end in zip(starts, ends, strict=True)
+    ]
 
 
 def rotating_candidate_orders(
@@ -139,9 +194,11 @@ def select_grid_with_effect_band(
 
 
 __all__ = [
+    "TimingEvent",
     "geometric_mean",
     "percentile",
     "rank_max_samples",
+    "replay_samples",
     "rotating_candidate_orders",
     "select_grid_with_effect_band",
     "summarize_rank_max",
