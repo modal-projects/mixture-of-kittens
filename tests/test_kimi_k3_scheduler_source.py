@@ -119,8 +119,8 @@ def test_grouped_down_reuses_activation_across_expert_output_tiles() -> None:
     assert "wait_timed_out" not in fixed
 
 
-def test_grouped_down_is_the_only_production_persistent_instantiation() -> None:
-    """Ship grouped down with the original gate/up and no runtime switch."""
+def test_gate_up_grouping_is_a_guarded_benchmark_only_instantiation() -> None:
+    """Keep grouped down in production and gate smaller gate/up candidates."""
     persistent = _source("persistent_kernel.cuh")
     grouped = _source("expert_mxfp4_grouped.cuh")
     kernel = _function_body(
@@ -128,18 +128,57 @@ def test_grouped_down_is_the_only_production_persistent_instantiation() -> None:
         "void kimi_k3_decode_persistent_kernel(",
     )
 
-    assert "MOK_KIMI_K3_ENABLE_GROUPED_PIPELINE" not in persistent
-    assert "set_benchmark_grouped_pipeline_for_testing(" not in persistent
-    assert "benchmark_grouped_pipeline_enabled()" not in persistent
-    assert "template<bool TENSOR_PATH>" in persistent
-    assert "GROUPED_DOWN" not in persistent
-    assert "grouped_gate_up_unit(" not in kernel
+    assert "MOK_KIMI_K3_ENABLE_GATE_UP_GROUPING" in persistent
+    assert "set_benchmark_gate_up_group_size_for_testing(" in persistent
+    assert "benchmark_gate_up_group_size()" in persistent
+    assert "template<bool TENSOR_PATH, int GATE_UP_GROUP_SIZE>" in persistent
+    assert "GATE_UP_GROUP_SIZE == 0" in kernel
+    assert "GATE_UP_GROUP_SIZE == 1" in kernel
+    assert "GATE_UP_GROUP_SIZE == 2" in kernel
+    assert "grouped_gate_up_unit<GATE_UP_GROUP_SIZE>(" in kernel
     assert kernel.count("routed_gate_up_unit(") == 1
     assert kernel.count("grouped_down_unit(") == 1
     assert "routed_down_unit(" not in kernel
     assert "scratch.routed_accumulator_fixed[index] = 0;" in kernel
     assert "down_progress" not in kernel
-    assert "grouped_gate_up_unit(" not in grouped
-    assert "quantize_grouped_situ(" not in grouped
+    assert "template<int GROUP_SIZE>" in grouped
+    assert "void grouped_gate_up_unit(" in grouped
+    assert "quantize_grouped_situ(" in grouped
     launch = _function_body(persistent, "void launch_decode(")
-    assert launch.count("launch_persistent<") == 2
+    assert "benchmark_gate_up_group_size()" in launch
+    assert "launch_selected_decode<0>(" in launch
+    assert "launch_selected_decode<1>(" in launch
+    assert "launch_selected_decode<2>(" in launch
+
+
+def test_gate_up_candidates_cap_live_accumulators_and_reuse_activation() -> None:
+    """Test one/two tiles without restoring the six-accumulator candidate."""
+    grouped = _source("expert_mxfp4_grouped.cuh")
+    gate_up = _function_body(grouped, "void grouped_gate_up_unit(")
+
+    assert "GROUP_SIZE >= 1 && GROUP_SIZE <= 2" in grouped
+    assert "2 * GROUP_SIZE" in gate_up
+    assert "stage_grouped_gate_up_activation(" in gate_up
+    assert gate_up.index("stage_grouped_gate_up_activation(") < gate_up.index(
+        "for (int tile = 0; tile < tile_count; ++tile)"
+    )
+    assert "kGroupedGateUpWidth = 3" not in grouped
+    assert "kGroupedGateUpUnits == 1" not in grouped
+
+
+def test_gate_up_benchmark_measures_all_priority_shapes_and_widths() -> None:
+    """The A/B must report both smaller candidates at M16/M32/M128."""
+    benchmark = (
+        Path(__file__).parents[1] / "benchmarks" / "kimi_k3_gate_up_grouping.py"
+    ).read_text(encoding="utf-8")
+
+    assert "TOKENS = (16, 32, 128)" in benchmark
+    assert 'Variant("baseline", 0)' in benchmark
+    assert 'Variant("group_1", 1)' in benchmark
+    assert 'Variant("group_2", 2)' in benchmark
+    assert '"staging":' in benchmark
+    assert '"mma":' in benchmark
+    assert '"epilogue":' in benchmark
+    assert '"queue":' in benchmark
+    assert '"barrier":' in benchmark
+    assert '"candidate_status": "benchmark_only"' in benchmark
