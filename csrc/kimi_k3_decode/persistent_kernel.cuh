@@ -108,7 +108,7 @@ static_assert(kPersistentSharedBytes >= kWidestStageSharedBytes,
               "the persistent grid must fit its widest stage");
 static_assert(kGateUpSubphaseTraceCtas == kPersistentCtas);
 static_assert(
-    kGateUpUnitSharedBytes + kGateUpSubphaseSharedBytes
+    expert_mxfp4::kGateUpUnitSharedBytes + kGateUpSubphaseSharedBytes
         <= kPersistentSharedBytes,
     "profiled gate/up units need private subphase counters after staging");
 static_assert(

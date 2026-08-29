@@ -446,6 +446,8 @@ def bench_kimi_k3_gate_up_subphase(
         prefix="kimi-k3-gate-up-subphase-"
     ) as directory:
         output_dir = Path(directory) / "artifacts"
+        debug_log = Path("/opt") / "cursor" / "logs" / "debug.log"
+        debug_log.parent.mkdir(parents=True, exist_ok=True)
         _run_kimi_k3_torchrun(
             [
                 "-m",
@@ -462,7 +464,15 @@ def bench_kimi_k3_gate_up_subphase(
             timeout=14_100,
             environment={"MOK_GIT_SHA": git_sha},
         )
-        expected = {"manifest.json", "raw_samples.json", "results.json"}
+        if not debug_log.is_file():
+            raise RuntimeError("gate/up subphase debug log was not written")
+        (output_dir / "debug.ndjson").write_bytes(debug_log.read_bytes())
+        expected = {
+            "debug.ndjson",
+            "manifest.json",
+            "raw_samples.json",
+            "results.json",
+        }
         actual = {path.name for path in output_dir.iterdir()}
         if actual != expected:
             raise RuntimeError(
