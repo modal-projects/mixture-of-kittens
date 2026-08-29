@@ -31,7 +31,8 @@ static __device__ void reduce_rows(
     const Scratch &scratch,
     const int reduce_index,
     const int tp_rank,
-    const int active_tokens
+    const int active_tokens,
+    const TailClocks &clocks
 ) {
     __shared__ float warp_totals[kWarps];
     __shared__ float row_scale;
@@ -43,6 +44,9 @@ static __device__ void reduce_rows(
     for (int row = reduce_index; row < active_tokens; row += kReduceCtas) {
         const long long row_base =
             static_cast<long long>(row) * kCollectiveColumns;
+        // #region agent log
+        unsigned long long mark = clocks.now();
+        // #endregion
 
         Octet reduced[kLatentOctetsPerThread];
         float squares = 0.0f;
@@ -62,6 +66,9 @@ static __device__ void reduce_rows(
                 }
             }
         }
+        // #region agent log
+        mark = clocks.lap(kTailClockRoutedMultimemReduce, mark);
+        // #endregion
 
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
@@ -110,6 +117,9 @@ static __device__ void reduce_rows(
                     normalized);
             }
         }
+        // #region agent log
+        mark = clocks.lap(kTailClockRmsNorm, mark);
+        // #endregion
 
         const long long shard_base =
             row_base + kLatentSize
@@ -129,6 +139,9 @@ static __device__ void reduce_rows(
                     shard);
             }
         }
+        // #region agent log
+        clocks.lap(kTailClockSharedMultimemReduce, mark);
+        // #endregion
     }
 }
 

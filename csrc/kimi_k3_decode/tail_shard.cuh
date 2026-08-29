@@ -39,9 +39,13 @@ static __device__ void shard_core(
     __nv_bfloat16 *__restrict__ const mailbox_multicast,
     const int column_block,
     const int tp_rank,
-    const int active_tokens
+    const int active_tokens,
+    const TailClocks &clocks
 ) {
     static_assert(CAPACITY >= 1 && CAPACITY <= kMaxCoreCapacity);
+    // #region agent log
+    unsigned long long mark = clocks.now();
+    // #endregion
     __nv_bfloat16 *const staged = reinterpret_cast<__nv_bfloat16 *>(shared);
     const int thread = static_cast<int>(threadIdx.x);
     const int warp = thread / 32;
@@ -101,6 +105,9 @@ static __device__ void shard_core(
         }
     }
 
+    // #region agent log
+    mark = clocks.lap(kTailClockLatentUpShardMma, mark);
+    // #endregion
     #pragma unroll
     for (int row = 0; row < CAPACITY; ++row) {
         Octet result;
@@ -129,6 +136,9 @@ static __device__ void shard_core(
                 mailbox_multicast, result, row, tp_rank, column_base);
         }
     }
+    // #region agent log
+    clocks.lap(kTailClockMailboxMulticast, mark);
+    // #endregion
 }
 
 /// Contract one 128-column output tile of this rank's shard and multicast it.
@@ -145,9 +155,13 @@ static __device__ void shard_tensor(
     __nv_bfloat16 *__restrict__ const mailbox_multicast,
     const int column_block,
     const int tp_rank,
-    const int active_tokens
+    const int active_tokens,
+    const TailClocks &clocks
 ) {
     using namespace kittens;
+    // #region agent log
+    unsigned long long mark = clocks.now();
+    // #endregion
     tma_swizzle_allocator allocator(shared_raw);
     tensor_input_tile (&input_tiles)[kStages] =
         allocator.allocate<tensor_input_tile, kStages>();
@@ -214,6 +228,9 @@ static __device__ void shard_tensor(
         warpgroup::sync(1);
     }
     __syncthreads();
+    // #region agent log
+    mark = clocks.lap(kTailClockLatentUpShardMma, mark);
+    // #endregion
 
     constexpr int groups = kTileN / kOctetLanes;
     const int thread = static_cast<int>(threadIdx.x);
@@ -238,6 +255,9 @@ static __device__ void shard_tensor(
         }
         publish_shard_octet(mailbox_multicast, value, row, tp_rank, column);
     }
+    // #region agent log
+    clocks.lap(kTailClockMailboxMulticast, mark);
+    // #endregion
 }
 
 }  // namespace tail

@@ -514,6 +514,84 @@ def batched_expert_probe(
     )
 
 
+@app.function(image=VLLM_COMPARISON_IMAGE, gpu="B300:8", timeout=86_400)
+def bench_kimi_k3_tail_probe(
+    git_sha: str,
+    warmup_count: int = 500,
+    sample_count: int = 1000,
+    clock_ghz: float = 1.96,
+) -> bytes:
+    """Run the temporary integrated/private/native TP8 tail probe."""
+    if len(git_sha) != 40:
+        raise ValueError("git_sha must be the full 40-character commit SHA")
+    with tempfile.TemporaryDirectory(prefix="kimi-k3-tail-") as directory:
+        output_dir = Path(directory) / "artifacts"
+        _run_kimi_k3_torchrun(
+            [
+                "-m",
+                "benchmarks.kimi_k3_tail_probe",
+                "--output-dir",
+                str(output_dir),
+                "--warmup-count",
+                str(warmup_count),
+                "--sample-count",
+                str(sample_count),
+                "--clock-ghz",
+                str(clock_ghz),
+            ],
+            timeout=86_100,
+            environment={"MOK_GIT_SHA": git_sha},
+        )
+        expected = {
+            "debug.ndjson",
+            "manifest.json",
+            "native_traces.json",
+            "rank0_cta_cycles.json",
+            "raw_samples.json",
+            "results.json",
+        }
+        actual = {path.name for path in output_dir.iterdir()}
+        if actual != expected:
+            raise RuntimeError(
+                "tail probe artifacts differ: "
+                f"missing={sorted(expected - actual)}, "
+                f"unexpected={sorted(actual - expected)}"
+            )
+        archive = reproducible_tar_bytes(output_dir)
+        if archive != reproducible_tar_bytes(output_dir):
+            raise RuntimeError("normalized tail probe archive is not reproducible")
+        return archive
+
+
+@app.local_entrypoint()
+def tail_probe(
+    git_sha: str,
+    output_dir: str = "kimi_k3_tail_probe",
+    warmup_count: int = 500,
+    sample_count: int = 1000,
+    clock_ghz: float = 1.96,
+) -> None:
+    """Run, unpack, and expose the temporary 8xB300 tail evidence."""
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    archive = bench_kimi_k3_tail_probe.remote(
+        git_sha,
+        warmup_count=warmup_count,
+        sample_count=sample_count,
+        clock_ghz=clock_ghz,
+    )
+    (destination / "artifacts.tar").write_bytes(archive)
+    with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
+        bundle.extractall(destination, filter="data")
+    local_debug = Path("/opt/cursor/logs/debug.log")
+    local_debug.parent.mkdir(parents=True, exist_ok=True)
+    local_debug.write_bytes((destination / "debug.ndjson").read_bytes())
+    print(
+        "tail probe artifacts: "
+        f"{sorted(path.name for path in destination.iterdir())}"
+    )
+
+
 @app.local_entrypoint()
 def batched_expert_diagnostic(
     variant: str = "candidate",

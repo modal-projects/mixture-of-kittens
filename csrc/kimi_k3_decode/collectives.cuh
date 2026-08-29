@@ -16,8 +16,12 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
+#include <string>
 #include <tuple>
+#include <vector>
 
 namespace kimi_k3_decode {
 namespace tail {
@@ -32,6 +36,44 @@ namespace tail {
 // One `std::once_flag` per possible CUDA ordinal, so the tcgen05 shared-memory
 // reservation happens once per device even when one process drives several.
 inline constexpr int kMaxCudaDevices = 32;
+
+// #region agent log
+static __host__ std::atomic<int> &benchmark_tail_profile_storage() {
+    static std::atomic<int> profile{0};
+    return profile;
+}
+
+inline bool benchmark_tail_profile_guard_enabled() {
+    const char *const enabled =
+        std::getenv("MOK_KIMI_K3_ENABLE_GRID_TUNING");
+    return enabled != nullptr && std::strcmp(enabled, "1") == 0;
+}
+
+inline void set_benchmark_tail_profile_for_testing(const bool enabled) {
+    TORCH_CHECK(
+        benchmark_tail_profile_guard_enabled(),
+        "MoK: Kimi K3 tail profiling is benchmark-only; set "
+        "MOK_KIMI_K3_ENABLE_GRID_TUNING=1 in a dedicated benchmark process");
+    benchmark_tail_profile_storage().store(
+        enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+inline bool benchmark_tail_profile_for_testing() {
+    return benchmark_tail_profile_guard_enabled()
+        && benchmark_tail_profile_storage().load(std::memory_order_relaxed)
+            != 0;
+}
+
+inline std::tuple<std::int64_t, std::int64_t, std::vector<std::string>>
+tail_clock_metadata_for_testing() {
+    std::vector<std::string> names;
+    for (const char *const name : kTailClockNames) names.emplace_back(name);
+    return {
+        static_cast<std::int64_t>(kTailClockTraceBytes),
+        static_cast<std::int64_t>(kTailClockTraceCtas),
+        names};
+}
+// #endregion
 
 // ---------------------------------------------------------------------------
 // Single-launch kernels.
@@ -50,44 +92,81 @@ void kimi_k3_tail_core_kernel(
     std::uint8_t *__restrict__ scratch_bytes,
     int *__restrict__ error_flag,
     const int tp_rank,
-    const int active_tokens
+    const int active_tokens,
+    const int profile_tail
 ) {
     extern __shared__ __align__(16) int shared_raw[];
     __shared__ std::uint32_t baseline_slot;
     const Scratch scratch = scratch_view(scratch_bytes);
     const int block = static_cast<int>(blockIdx.x);
+    // #region agent log
+    const TailClocks clocks = tail_clocks(scratch, profile_tail != 0);
+    clocks.clear();
+    __syncthreads();
+    const unsigned long long total_mark = clocks.now();
+    // #endregion
 
     if (block < kReduceBegin) {
         coordinate_ranks(scratch, error_flag, barrier_multicast, barrier_local,
-                         barrier_target);
+                         barrier_target, clocks);
+        // #region agent log
+        clocks.lap(kTailClockTotal, total_mark);
+        // #endregion
         return;
     }
 
     if (block < kShardBegin) {
         const std::uint32_t baseline = latch_generation(
             scratch, kTailReduceGeneration, &baseline_slot);
+        // #region agent log
+        unsigned long long mark = clocks.now();
+        // #endregion
         wait_for_generation(scratch, error_flag, kTailEntryGeneration,
                             baseline, kErrorTailReduceEntry);
+        // #region agent log
+        clocks.lap(kTailClockReduceEntryWait, mark);
+        // #endregion
         reduce_rows(
             collective_multicast, routed_latent_rmsnorm_weight, scratch,
-            block - kReduceBegin, tp_rank, active_tokens);
+            block - kReduceBegin, tp_rank, active_tokens, clocks);
+        // #region agent log
+        mark = clocks.now();
+        // #endregion
         publish_generation(
             scratch, kTailReduceArrivals, kTailReduceGeneration, kReduceCtas);
+        // #region agent log
+        clocks.lap(kTailClockReducePublish, mark);
+        // #endregion
     } else {
         const std::uint32_t baseline = latch_generation(
             scratch, kTailShardGeneration, &baseline_slot);
+        // #region agent log
+        unsigned long long mark = clocks.now();
+        // #endregion
         wait_for_generation(scratch, error_flag, kTailReduceGeneration,
                             baseline, kErrorTailShardReduce);
+        // #region agent log
+        clocks.lap(kTailClockShardReduceWait, mark);
+        // #endregion
         shard_core<CAPACITY>(
             reinterpret_cast<std::uint8_t *>(shared_raw), scratch,
             latent_up_proj, mailbox_multicast, block - kShardBegin, tp_rank,
-            active_tokens);
+            active_tokens, clocks);
+        // #region agent log
+        mark = clocks.now();
+        // #endregion
         publish_generation(
             scratch, kTailShardArrivals, kTailShardGeneration, kCoreShardCtas);
+        // #region agent log
+        clocks.lap(kTailClockShardPublish, mark);
+        // #endregion
     }
 
     drain_ranks(scratch, error_flag, &baseline_slot,
-                kReduceCtas + kCoreShardCtas);
+                kReduceCtas + kCoreShardCtas, clocks);
+    // #region agent log
+    clocks.lap(kTailClockTotal, total_mark);
+    // #endregion
 }
 
 __global__ __launch_bounds__(kDecodeCtaThreads, 1)
@@ -103,12 +182,19 @@ void kimi_k3_tail_tensor_kernel(
     std::uint8_t *__restrict__ scratch_bytes,
     int *__restrict__ error_flag,
     const int tp_rank,
-    const int active_tokens
+    const int active_tokens,
+    const int profile_tail
 ) {
     extern __shared__ __align__(16) int shared_raw[];
     __shared__ std::uint32_t baseline_slot;
     const Scratch scratch = scratch_view(scratch_bytes);
     const int block = static_cast<int>(blockIdx.x);
+    // #region agent log
+    const TailClocks clocks = tail_clocks(scratch, profile_tail != 0);
+    clocks.clear();
+    __syncthreads();
+    const unsigned long long total_mark = clocks.now();
+    // #endregion
 
     // The managed allocator barriers the whole CTA, so every block provisions
     // its tensor memory before the roles diverge.
@@ -116,35 +202,66 @@ void kimi_k3_tail_tensor_kernel(
 
     if (block < kReduceBegin) {
         coordinate_ranks(scratch, error_flag, barrier_multicast, barrier_local,
-                         barrier_target);
+                         barrier_target, clocks);
+        // #region agent log
+        clocks.lap(kTailClockTotal, total_mark);
+        // #endregion
         return;
     }
 
     if (block < kShardBegin) {
         const std::uint32_t baseline = latch_generation(
             scratch, kTailReduceGeneration, &baseline_slot);
+        // #region agent log
+        unsigned long long mark = clocks.now();
+        // #endregion
         wait_for_generation(scratch, error_flag, kTailEntryGeneration,
                             baseline, kErrorTailReduceEntry);
+        // #region agent log
+        clocks.lap(kTailClockReduceEntryWait, mark);
+        // #endregion
         reduce_rows(
             collective_multicast, routed_latent_rmsnorm_weight, scratch,
-            block - kReduceBegin, tp_rank, active_tokens);
+            block - kReduceBegin, tp_rank, active_tokens, clocks);
+        // #region agent log
+        mark = clocks.now();
+        // #endregion
         publish_generation(
             scratch, kTailReduceArrivals, kTailReduceGeneration, kReduceCtas);
+        // #region agent log
+        clocks.lap(kTailClockReducePublish, mark);
+        // #endregion
     } else {
         const std::uint32_t baseline = latch_generation(
             scratch, kTailShardGeneration, &baseline_slot);
+        // #region agent log
+        unsigned long long mark = clocks.now();
+        // #endregion
         wait_for_generation(scratch, error_flag, kTailReduceGeneration,
                             baseline, kErrorTailShardReduce);
+        // #region agent log
+        clocks.lap(kTailClockShardReduceWait, mark);
+        // #endregion
         shard_tensor(
             shared_raw, tensor_pool, normalized, latent_up_proj, scratch,
-            mailbox_multicast, block - kShardBegin, tp_rank, active_tokens);
+            mailbox_multicast, block - kShardBegin, tp_rank, active_tokens,
+            clocks);
+        // #region agent log
+        mark = clocks.now();
+        // #endregion
         publish_generation(
             scratch, kTailShardArrivals, kTailShardGeneration,
             kTensorShardCtas);
+        // #region agent log
+        clocks.lap(kTailClockShardPublish, mark);
+        // #endregion
     }
 
     drain_ranks(scratch, error_flag, &baseline_slot,
-                kReduceCtas + kTensorShardCtas);
+                kReduceCtas + kTensorShardCtas, clocks);
+    // #region agent log
+    clocks.lap(kTailClockTotal, total_mark);
+    // #endregion
 }
 
 // ---------------------------------------------------------------------------
@@ -246,6 +363,29 @@ static __host__ void reserve_tensor_shared_memory() {
     });
 }
 
+// #region agent log
+inline std::tuple<std::int64_t, std::int64_t, std::int64_t, std::int64_t,
+                  std::int64_t, std::int64_t, std::int64_t>
+tail_tensor_resource_metadata_for_testing() {
+    reserve_tensor_shared_memory();
+    cudaFuncAttributes attributes{};
+    C10_CUDA_CHECK(
+        cudaFuncGetAttributes(&attributes, kimi_k3_tail_tensor_kernel));
+    int blocks = 0;
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks, kimi_k3_tail_tensor_kernel, kDecodeCtaThreads,
+        kTailTensorDynamicBytes));
+    return {
+        static_cast<std::int64_t>(kTensorRoleCtas),
+        static_cast<std::int64_t>(kDecodeCtaThreads),
+        static_cast<std::int64_t>(kTailTensorDynamicBytes),
+        static_cast<std::int64_t>(blocks),
+        static_cast<std::int64_t>(attributes.numRegs),
+        static_cast<std::int64_t>(attributes.sharedSizeBytes),
+        static_cast<std::int64_t>(attributes.maxDynamicSharedSizeBytes)};
+}
+// #endregion
+
 template<int CAPACITY>
 static __host__ void launch_core(
     const __nv_bfloat16 *routed_latent_rmsnorm_weight,
@@ -258,14 +398,15 @@ static __host__ void launch_core(
     std::uint8_t *scratch_bytes,
     int *error_flag,
     const int tp_rank,
-    const int active_tokens
+    const int active_tokens,
+    const int profile_tail
 ) {
     kimi_k3_tail_core_kernel<CAPACITY>
         <<<kCoreRoleCtas, kDecodeCtaThreads, kTailCoreDynamicBytes,
            at::cuda::getCurrentCUDAStream()>>>(
             routed_latent_rmsnorm_weight, latent_up_proj, collective_multicast,
             mailbox_multicast, barrier_multicast, barrier_local, barrier_target,
-            scratch_bytes, error_flag, tp_rank, active_tokens);
+            scratch_bytes, error_flag, tp_rank, active_tokens, profile_tail);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -302,31 +443,35 @@ static __host__ void launch_tail(
     auto *const scratch_bytes =
         reinterpret_cast<std::uint8_t *>(scratch.data_ptr());
     auto *const error = reinterpret_cast<int *>(error_flag.data_ptr());
+    // #region agent log
+    const int profile_tail =
+        benchmark_tail_profile_for_testing() ? 1 : 0;
+    // #endregion
 
     switch (capacity_bucket(active_tokens)) {
         case 1:
             launch_core<1>(norm_weight, latent_up, collective_multicast,
                            mailbox_multicast, barrier_multicast, barrier_local,
                            target, scratch_bytes, error, tp_rank,
-                           active_tokens);
+                           active_tokens, profile_tail);
             return;
         case 2:
             launch_core<2>(norm_weight, latent_up, collective_multicast,
                            mailbox_multicast, barrier_multicast, barrier_local,
                            target, scratch_bytes, error, tp_rank,
-                           active_tokens);
+                           active_tokens, profile_tail);
             return;
         case 4:
             launch_core<4>(norm_weight, latent_up, collective_multicast,
                            mailbox_multicast, barrier_multicast, barrier_local,
                            target, scratch_bytes, error, tp_rank,
-                           active_tokens);
+                           active_tokens, profile_tail);
             return;
         case 8:
             launch_core<8>(norm_weight, latent_up, collective_multicast,
                            mailbox_multicast, barrier_multicast, barrier_local,
                            target, scratch_bytes, error, tp_rank,
-                           active_tokens);
+                           active_tokens, profile_tail);
             return;
         default:
             break;
@@ -354,7 +499,7 @@ static __host__ void launch_tail(
            at::cuda::getCurrentCUDAStream()>>>(
             norm_weight, normalized_view, latent_up_view, collective_multicast,
             mailbox_multicast, barrier_multicast, barrier_local, target,
-            scratch_bytes, error, tp_rank, active_tokens);
+            scratch_bytes, error, tp_rank, active_tokens, profile_tail);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
