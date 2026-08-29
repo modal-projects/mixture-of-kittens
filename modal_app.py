@@ -432,6 +432,52 @@ def bench_kimi_k3_batched_expert_probe(
         return archive
 
 
+@app.function(image=B300_IMAGE, gpu="B300:8", timeout=14_400)
+def bench_kimi_k3_gate_up_subphase(
+    git_sha: str,
+    warmup_count: int = 500,
+    sample_count: int = 1000,
+    repeats: int = 5,
+) -> bytes:
+    """Measure rank-max per-CTA routed gate/up subphases at M16."""
+    if len(git_sha) != 40:
+        raise ValueError("git_sha must be the full 40-character commit SHA")
+    with tempfile.TemporaryDirectory(
+        prefix="kimi-k3-gate-up-subphase-"
+    ) as directory:
+        output_dir = Path(directory) / "artifacts"
+        _run_kimi_k3_torchrun(
+            [
+                "-m",
+                "benchmarks.kimi_k3_gate_up_subphase",
+                "--output-dir",
+                str(output_dir),
+                "--warmup-count",
+                str(warmup_count),
+                "--sample-count",
+                str(sample_count),
+                "--repeats",
+                str(repeats),
+            ],
+            timeout=14_100,
+            environment={"MOK_GIT_SHA": git_sha},
+        )
+        expected = {"manifest.json", "raw_samples.json", "results.json"}
+        actual = {path.name for path in output_dir.iterdir()}
+        if actual != expected:
+            raise RuntimeError(
+                "gate/up subphase artifacts differ: "
+                f"missing={sorted(expected - actual)}, "
+                f"unexpected={sorted(actual - expected)}"
+            )
+        archive = reproducible_tar_bytes(output_dir)
+        if archive != reproducible_tar_bytes(output_dir):
+            raise RuntimeError(
+                "normalized gate/up subphase archive is not reproducible"
+            )
+        return archive
+
+
 @app.function(image=B300_IMAGE, gpu="B300", timeout=7_200)
 def diagnose_kimi_k3_batched_expert_probe(
     variant: str = "candidate",
@@ -510,6 +556,32 @@ def batched_expert_probe(
         bundle.extractall(destination, filter="data")
     print(
         "batched expert probe artifacts: "
+        f"{sorted(path.name for path in destination.iterdir())}"
+    )
+
+
+@app.local_entrypoint()
+def gate_up_subphase(
+    git_sha: str,
+    output_dir: str = "kimi_k3_gate_up_subphase",
+    warmup_count: int = 500,
+    sample_count: int = 1000,
+    repeats: int = 5,
+) -> None:
+    """Run and unpack the dedicated M16 gate/up subphase measurement."""
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    archive = bench_kimi_k3_gate_up_subphase.remote(
+        git_sha,
+        warmup_count=warmup_count,
+        sample_count=sample_count,
+        repeats=repeats,
+    )
+    (destination / "artifacts.tar").write_bytes(archive)
+    with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
+        bundle.extractall(destination, filter="data")
+    print(
+        "gate/up subphase artifacts: "
         f"{sorted(path.name for path in destination.iterdir())}"
     )
 

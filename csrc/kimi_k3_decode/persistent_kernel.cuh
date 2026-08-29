@@ -106,6 +106,11 @@ static_assert(kPersistentSharedBytes <= kittens::MAX_SHARED_MEMORY - 1024,
               "the persistent grid must leave room for static shared memory");
 static_assert(kPersistentSharedBytes >= kWidestStageSharedBytes,
               "the persistent grid must fit its widest stage");
+static_assert(kGateUpSubphaseTraceCtas == kPersistentCtas);
+static_assert(
+    kGateUpUnitSharedBytes + kGateUpSubphaseSharedBytes
+        <= kPersistentSharedBytes,
+    "profiled gate/up units need private subphase counters after staging");
 static_assert(
     kPersistentSharedBytes
         >= expert_mxfp4::grouped_pipeline::kGroupedDownPersistentSharedBytes,
@@ -277,6 +282,18 @@ phase_clock_metadata_for_testing() {
     std::vector<std::string> names;
     for (const char *const name : kPhaseClockNames) names.emplace_back(name);
     return {static_cast<std::int64_t>(kPhaseClockBegin), names};
+}
+
+inline std::tuple<std::int64_t, std::int64_t, std::vector<std::string>>
+gate_up_subphase_metadata_for_testing() {
+    std::vector<std::string> names;
+    for (const char *const name : kGateUpSubphaseNames) {
+        names.emplace_back(name);
+    }
+    return {
+        static_cast<std::int64_t>(kGateUpSubphaseTraceBytes),
+        static_cast<std::int64_t>(kGateUpSubphaseTraceCtas),
+        names};
 }
 
 inline void set_benchmark_grid_ctas_for_testing(const std::int64_t grid_ctas) {
@@ -537,6 +554,10 @@ void kimi_k3_decode_persistent_kernel(
     const int expert_units = static_cast<int>(
         min(published, static_cast<std::uint32_t>(kNumExperts)));
     const int routed_batch = routed_claim_batch(active_tokens);
+    if (clocks.enabled()) {
+        clocks.clear_gate_up_subphases();
+        __syncthreads();
+    }
 
     // -----------------------------------------------------------------------
     // Phase 3: routed gate/up units interleaved with the shared gate/up units.
@@ -557,6 +578,7 @@ void kimi_k3_decode_persistent_kernel(
                 scratch, kGateUpQueue, units, routed_batch, &claim_slot,
                 &claim_end_slot);
             mark = clocks.lap(kClockRoutedQueue, queue_mark);
+            clocks.add_gate_up_subphase(kGateUpQueueClaim, mark - queue_mark);
             if (batch_begin < 0) break;
             for (int unit = batch_begin; unit < claim_end_slot; ++unit) {
                 if (unit < shared_units) {

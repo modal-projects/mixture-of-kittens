@@ -95,6 +95,29 @@ def phase_clock_cycles(
     return dict(zip(names, counters, strict=True))
 
 
+def gate_up_subphase_tensor(
+    workspace: KimiK3DecodeWorkspace,
+) -> torch.Tensor:
+    """Return this launch's per-CTA routed gate/up subphase counters."""
+    begin, ctas, names = _C._kimi_k3_decode_gate_up_subphase_metadata()
+    byte_count = ctas * len(names) * 8
+    return workspace.scratch[begin : begin + byte_count].view(torch.int64).view(
+        ctas, len(names)
+    )
+
+
+def gate_up_subphase_cycles(
+    workspace: KimiK3DecodeWorkspace,
+) -> list[dict[str, int]]:
+    """Copy and name every CTA row from a dedicated profiled launch."""
+    _, _, names = _C._kimi_k3_decode_gate_up_subphase_metadata()
+    rows = gate_up_subphase_tensor(workspace).cpu().tolist()
+    return [
+        dict(zip(names, (int(value) for value in row), strict=True))
+        for row in rows
+    ]
+
+
 def _e8m0_scale_bytes(absolute_max: torch.Tensor) -> torch.Tensor:
     mantissa, exponent = torch.frexp(absolute_max.float())
     scale_exponent = torch.where(mantissa <= 0.875, exponent - 9, exponent - 8)
@@ -349,6 +372,10 @@ __all__ = [
     "decode_reference",
     "decode_device_step",
     "decode_step",
+    "gate_up_subphase_cycles",
+    "gate_up_subphase_tensor",
+    "phase_clock_cycles",
+    "phase_profiling",
     "profiled_kernel_names",
     "recorded_allocator_events",
 ]

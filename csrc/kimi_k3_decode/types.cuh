@@ -272,6 +272,53 @@ static_assert(sizeof(kPhaseClockNames) / sizeof(kPhaseClockNames[0])
                   == kPhaseClockCount);
 
 // ---------------------------------------------------------------------------
+// Benchmark-only routed gate/up subphase trace.
+//
+// The router-score matrix is dead before the routed queues open. Profiled
+// launches reuse the beginning of that existing region for one row of
+// per-CTA counters; unprofiled launches never address it, and no scratch
+// offset or public workspace size changes.
+// ---------------------------------------------------------------------------
+
+enum GateUpSubphase : int {
+    kGateUpWeightGlobalLoad = 0,
+    kGateUpWeightSharedStoreSwizzle,
+    kGateUpActivationStage,
+    kGateUpScaleStageCopy,
+    kGateUpSyncTmaTmemWait,
+    kGateUpQueueClaim,
+    kGateUpUnitSetup,
+    kGateUpUnits,
+    kGateUpSubphaseCount,
+};
+
+inline constexpr const char *kGateUpSubphaseNames[] = {
+    "weight_global_load",
+    "weight_shared_store_swizzle",
+    "activation_stage",
+    "scale_stage_copy",
+    "sync_tma_tmem_wait",
+    "queue_claim",
+    "unit_setup",
+    "units",
+};
+
+inline constexpr int kGateUpSubphaseTraceCtas = 148;
+inline constexpr int kGateUpSubphaseTraceBytes = kRouterScoreBytes;
+inline constexpr int kGateUpSubphaseTraceEnd =
+    kGateUpSubphaseTraceBytes
+    + kGateUpSubphaseTraceCtas * kGateUpSubphaseCount
+        * static_cast<int>(sizeof(unsigned long long));
+inline constexpr int kGateUpSubphaseSharedBytes =
+    kGateUpSubphaseCount * static_cast<int>(sizeof(unsigned long long));
+
+static_assert(
+    sizeof(kGateUpSubphaseNames) / sizeof(kGateUpSubphaseNames[0])
+        == kGateUpSubphaseCount);
+static_assert(kGateUpSubphaseTraceBytes % alignof(unsigned long long) == 0);
+static_assert(kGateUpSubphaseTraceEnd <= SCRATCH_BYTES);
+
+// ---------------------------------------------------------------------------
 // Timeout diagnostics.
 //
 // A bounded wait that gives up writes two things before it traps: the phase
@@ -423,6 +470,46 @@ struct PhaseClocks {
         const unsigned long long current =
             static_cast<unsigned long long>(clock64());
         add(index, current - started);
+        return current;
+    }
+
+    __device__ __forceinline__ unsigned long long *gate_up_subphases() const {
+        if (counters == nullptr) return nullptr;
+        std::uint8_t *const scratch_base =
+            reinterpret_cast<std::uint8_t *>(counters)
+            - kPhaseClockBegin * static_cast<int>(sizeof(int));
+        return reinterpret_cast<unsigned long long *>(
+                   scratch_base + kGateUpSubphaseTraceBytes)
+            + static_cast<int>(blockIdx.x) * kGateUpSubphaseCount;
+    }
+
+    __device__ __forceinline__ void clear_gate_up_subphases() const {
+        if (counters != nullptr
+            && static_cast<int>(threadIdx.x) < kGateUpSubphaseCount) {
+            gate_up_subphases()[threadIdx.x] = 0ull;
+        }
+    }
+
+    __device__ __forceinline__ void add_gate_up_subphase(
+        const GateUpSubphase subphase,
+        const unsigned long long cycles
+    ) const {
+        if (counters != nullptr && threadIdx.x == 0) {
+            gate_up_subphases()[subphase] += cycles;
+        }
+    }
+
+    __device__ __forceinline__ unsigned long long lap_gate_up_subphase(
+        unsigned long long *__restrict__ unit_counters,
+        const GateUpSubphase subphase,
+        const unsigned long long started
+    ) const {
+        if (counters == nullptr) return 0ull;
+        const unsigned long long current =
+            static_cast<unsigned long long>(clock64());
+        if (threadIdx.x == 0) {
+            unit_counters[subphase] += current - started;
+        }
         return current;
     }
 };

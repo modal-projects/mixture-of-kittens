@@ -85,6 +85,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &kimi_k3_decode::persistent::benchmark_phase_profile_for_testing);
     m.def("_kimi_k3_decode_phase_clock_metadata",
           &kimi_k3_decode::persistent::phase_clock_metadata_for_testing);
+    m.def(
+        "_kimi_k3_decode_gate_up_subphase_metadata",
+        &kimi_k3_decode::persistent::gate_up_subphase_metadata_for_testing);
     m.def("_kimi_k3_decode_benchmark_grids", []() {
         const auto &grids =
             kimi_k3_decode::persistent::kBenchmarkGridCtas;
