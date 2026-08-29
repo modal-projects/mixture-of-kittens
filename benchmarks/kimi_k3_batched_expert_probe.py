@@ -7,7 +7,6 @@ import importlib
 import json
 import math
 import os
-import time
 from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
@@ -40,33 +39,6 @@ GATE_UP_TILE_WEIGHT_BYTES = 2 * (
     TILE_CHANNELS * (LATENT // 2)
     + TILE_CHANNELS * (LATENT // 32)
 )
-
-
-def _debug_log(
-    *,
-    hypothesis_id: str,
-    location: str,
-    message: str,
-    data: dict[str, object],
-) -> None:
-    # region agent log
-    Path("/opt/cursor/logs").mkdir(parents=True, exist_ok=True)
-    with open("/opt/cursor/logs/debug.log", "a", encoding="utf-8") as stream:
-        stream.write(
-            json.dumps(
-                {
-                    "hypothesisId": hypothesis_id,
-                    "location": location,
-                    "message": message,
-                    "data": data,
-                    "timestamp": time.time_ns() // 1_000_000,
-                },
-                sort_keys=True,
-            )
-            + "\n"
-        )
-    # endregion
-
 
 def same_expert_batching_coverage(
     assignments: Sequence[Sequence[int]],
@@ -715,15 +687,6 @@ def run_focused(
         raise RuntimeError("the native gate/up probe requires an SM103 B300")
     extension = _extension()
 
-    # region agent log
-    _debug_log(
-        hypothesis_id="A,E",
-        location="benchmarks/kimi_k3_batched_expert_probe.py:run_focused",
-        message="focused probe entry",
-        data={"rows": rows, "variant": variant},
-    )
-    # endregion
-
     result: dict[str, object] = {
         "rows": rows,
         "variant": variant,
@@ -810,21 +773,6 @@ def run(
         raise RuntimeError("the native gate/up probe requires an SM103 B300")
     extension = _extension()
 
-    # region agent log
-    _debug_log(
-        hypothesis_id="A,E",
-        location="benchmarks/kimi_k3_batched_expert_probe.py:run",
-        message="benchmark configuration",
-        data={
-            "ctas": SATURATED_CTAS,
-            "rows": list(PROBE_ROWS),
-            "warmups": warmup_count,
-            "samples": sample_count,
-            "repeats": repeats,
-        },
-    )
-    # endregion
-
     resource_values = extension._kimi_k3_native_gate_up_probe_resources()
     resources = dict(
         zip(
@@ -882,21 +830,6 @@ def run(
         rows: _numerical_metrics(extension, device, weights, rows)
         for rows in PROBE_ROWS
     }
-    # region agent log
-    _debug_log(
-        hypothesis_id="B,C,D",
-        location="benchmarks/kimi_k3_batched_expert_probe.py:run",
-        message="bitwise validation completed",
-        data={
-            str(rows): {
-                key: value
-                for key, value in metrics.items()
-                if isinstance(value, bool)
-            }
-            for rows, metrics in numerical_by_rows.items()
-        },
-    )
-    # endregion
 
     rows_output: list[dict[str, Any]] = []
     raw_output: dict[str, object] = {}
@@ -1003,15 +936,6 @@ def run(
         baseline_graphs.clear()
         candidate_graphs.clear()
 
-    # region agent log
-    _debug_log(
-        hypothesis_id="A,B,D",
-        location="benchmarks/kimi_k3_batched_expert_probe.py:run",
-        message="candidate phase profiles collected",
-        data=profiles,
-    )
-    # endregion
-
     passed = bool(resources["passed"]) and all(
         bool(row["passed"]) for row in rows_output
     )
@@ -1044,22 +968,6 @@ def run(
         },
         "decision": decision,
     }
-    # region agent log
-    _debug_log(
-        hypothesis_id="C,E",
-        location="benchmarks/kimi_k3_batched_expert_probe.py:run",
-        message="integration gate evaluated",
-        data={
-            "passed": passed,
-            "resources_passed": bool(resources["passed"]),
-            "rows_passed": {
-                str(row["rows"]): bool(row["passed"])
-                for row in rows_output
-            },
-        },
-    )
-    # endregion
-
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_json(
         output_dir / "manifest.json",
