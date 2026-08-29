@@ -57,11 +57,11 @@ PRIVATE_ROUTED_STACK_CEILING = 48
 
 # Itanium mangling spells all three compile-time selections out: tensor path,
 # gate/up group size, and gate/up-to-down pipelining. This lets the shipped
-# pair and the benchmark-only pipeline pair be checked independently.
-PRODUCTION_CORE_MANGLING = "ILb0ELi0ELb0EE"
-PRODUCTION_TENSOR_MANGLING = "ILb1ELi0ELb0EE"
-PIPELINE_CORE_MANGLING = "ILb0ELi0ELb1EE"
-PIPELINE_TENSOR_MANGLING = "ILb1ELi0ELb1EE"
+# readiness pair and the benchmark-only baseline pair be checked independently.
+PRODUCTION_CORE_MANGLING = "ILb0ELi0ELb1EE"
+PRODUCTION_TENSOR_MANGLING = "ILb1ELi0ELb1EE"
+BASELINE_CORE_MANGLING = "ILb0ELi0ELb0EE"
+BASELINE_TENSOR_MANGLING = "ILb1ELi0ELb0EE"
 
 # Blackwell SASS, from the SM103 build. ``UTCQMMA`` is the native mixed
 # MXFP4-by-MXFP8 tcgen05 contraction, ``UTCHMMA`` its BF16 sibling, ``LDGMC``
@@ -160,16 +160,16 @@ def persistent_symbols(extension_path: Path) -> dict[str, str]:
 
 
 @pytest.fixture(scope="module")
-def pipeline_symbols(extension_path: Path) -> dict[str, str]:
-    """The benchmark pipeline pair, keyed by which capacity path they are."""
+def baseline_symbols(extension_path: Path) -> dict[str, str]:
+    """The benchmark baseline pair, keyed by which capacity path they are."""
     usage = _resource_usage(extension_path)
     found = [name for name in usage if PERSISTENT_SYMBOL in name]
     symbols = {
         "core": next(
-            name for name in found if PIPELINE_CORE_MANGLING in name
+            name for name in found if BASELINE_CORE_MANGLING in name
         ),
         "tensor": next(
-            name for name in found if PIPELINE_TENSOR_MANGLING in name
+            name for name in found if BASELINE_TENSOR_MANGLING in name
         ),
     }
     assert symbols["core"] != symbols["tensor"]
@@ -234,13 +234,13 @@ def test_neither_instantiation_touches_local_memory(
 
 
 @pytest.mark.parametrize("path_name", ["core", "tensor"])
-def test_pipeline_candidate_has_no_spills_or_local_memory(
+def test_baseline_candidate_has_no_spills_or_local_memory(
     extension_path: Path,
-    pipeline_symbols: dict[str, str],
+    baseline_symbols: dict[str, str],
     path_name: str,
 ) -> None:
-    """The benchmark transition must not trade barriers for register spills."""
-    symbol = pipeline_symbols[path_name]
+    """The retained benchmark baseline must stay safe while verifying prod."""
+    symbol = baseline_symbols[path_name]
     usage = _resource_usage(extension_path)[symbol]
     assert usage["STACK"] == 0, usage
     assert usage["LOCAL"] == 0, usage
@@ -248,7 +248,7 @@ def test_pipeline_candidate_has_no_spills_or_local_memory(
     assert families.isdisjoint(FORBIDDEN), sorted(families & FORBIDDEN)
     assert "UTCQMMA" in families
     resource = _C._kimi_k3_decode_gate_up_group_resource(
-        path_name == "tensor", 0, True
+        path_name == "tensor", 0, False
     )
     assert resource[1] == 1
 

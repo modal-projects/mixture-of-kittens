@@ -710,7 +710,7 @@ def test_the_launch_is_correct_across_the_unsigned_serial_wrap(
 ) -> None:
     """Both wrap-safe counters are parked just below 2^32 and pushed over it.
 
-    The grid phase generation advances seven times per launch and the cross-rank
+    The grid phase generation advances five times per launch and the cross-rank
     barrier serial once, and both are compared with unsigned difference rather
     than ordering. Starting them three short of the wrap makes this one launch
     cross it, which a naive ``>=`` comparison could not survive.
@@ -727,8 +727,8 @@ def test_the_launch_is_correct_across_the_unsigned_serial_wrap(
     actual = _decode(workspace, weights, hidden)
     torch.cuda.synchronize(device)
     assert_decode_close(actual, expected)
-    # Six barriers from three short of the wrap lands three past it.
-    assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 3
+    # Five barriers from three short of the wrap lands two past it.
+    assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 2
     assert_identical_across_ranks(actual)
 
 
@@ -928,7 +928,7 @@ def test_a_profiled_launch_reports_its_own_cycles_and_costs_one_barrier(
     _synchronize_ranks(workspace)
     _decode(workspace, weights, hidden)
     torch.cuda.synchronize(device)
-    assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 6
+    assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 5
     assert set(_phase_clocks(workspace).values()) == {0}
 
     with _phase_profiling():
@@ -938,7 +938,7 @@ def test_a_profiled_launch_reports_its_own_cycles_and_costs_one_barrier(
         first_result = _decode(workspace, weights, hidden).clone()
         torch.cuda.synchronize(device)
         first = _phase_clocks(workspace)
-        assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 7
+        assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 6
 
         # Every byte of the band set to one is 0x0101010101010101 in each
         # counter, 7.2e16 cycles: eight orders of magnitude above anything a
@@ -957,20 +957,12 @@ def test_a_profiled_launch_reports_its_own_cycles_and_costs_one_barrier(
 
     # Every production region is timed, and the poison is gone from the whole
     # band: the launch reported itself rather than itself plus whatever the
-    # band already held. The benchmark-only readiness wait stays zero in the
-    # production instantiation.
+    # band already held. Production readiness replaces the gate/up-to-down
+    # grid barrier, so its own wait clock must also report work.
     assert set(first) == set(_C._kimi_k3_decode_phase_clock_metadata()[1])
-    assert first["readiness_wait"] == 0
-    assert min(
-        cycles
-        for name, cycles in first.items()
-        if name != "readiness_wait"
-    ) > 0, first
+    assert min(first.values()) > 0, first
     for name, cycles in second.items():
-        if name == "readiness_wait":
-            assert cycles == 0
-        else:
-            assert 0 < cycles < poison_floor, (name, cycles)
+        assert 0 < cycles < poison_floor, (name, cycles)
 
     # Profiling is off again, so the band stops moving and the launch is back
     # to the six generations a measured replay spends.
@@ -979,5 +971,5 @@ def test_a_profiled_launch_reports_its_own_cycles_and_costs_one_barrier(
     _synchronize_ranks(workspace)
     _decode(workspace, weights, hidden)
     torch.cuda.synchronize(device)
-    assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 6
+    assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 5
     assert _phase_clocks(workspace) == second
