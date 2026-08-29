@@ -363,12 +363,12 @@ def test_a_completed_launch_leaves_both_diagnostics_at_zero(
 def test_the_longest_queue_is_the_one_the_header_asserts() -> None:
     """The counter is never reset inside a launch, so its bound is load bearing.
 
-    Routed queues advance by four logical units per claim, and a CTA leaves a
-    queue on its first refused batch, so the counter bound rounds the longest
-    queue to four before adding one batch per CTA. The header static-asserts
-    both numbers; this recomputes the logical length from the task plan of
-    every accepted shape, so a retiling cannot pass by updating only the
-    assertion.
+    Routed queues advance by one unit through M16 and by four above it. A CTA
+    leaves a queue on its first refused batch, so the conservative counter
+    bound rounds the longest (wide-shape) queue to four before adding one
+    maximum-width batch per CTA. The header static-asserts both numbers; this
+    recomputes the logical length from the task plan of every accepted shape,
+    so a retiling cannot pass by updating only the assertion.
     """
     units, ticket = _C._kimi_k3_decode_queue_bound()
     longest = max(

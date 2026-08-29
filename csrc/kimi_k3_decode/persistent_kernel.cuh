@@ -167,8 +167,9 @@ inline constexpr int longest_queue_units() {
 ///
 /// Both bounds matter. The length is what a unit index is decoded against, and
 /// the ticket is what the counter has to hold without wrapping, because nothing
-/// resets it inside a launch. Routed claims round the logical length up to their
-/// batch width, then every CTA can add one refused batch.
+/// resets it inside a launch. The widest shapes use the maximum routed batch,
+/// so the bound rounds the logical length up to that width and then lets every
+/// CTA add one refused batch.
 inline constexpr int kLongestQueueUnits = longest_queue_units();
 inline constexpr int kLongestQueueRounded =
     (kLongestQueueUnits + kRoutedClaimBatch - 1)
@@ -533,6 +534,7 @@ void kimi_k3_decode_persistent_kernel(
         load_relaxed_gpu(&scratch.phase[kActiveExpertUnits]);
     const int expert_units = static_cast<int>(
         min(published, static_cast<std::uint32_t>(kNumExperts)));
+    const int routed_batch = routed_claim_batch(active_tokens);
 
     // -----------------------------------------------------------------------
     // Phase 3: routed gate/up units interleaved with the shared gate/up units.
@@ -547,8 +549,8 @@ void kimi_k3_decode_persistent_kernel(
         const int units =
             shared_units + expert_units * expert_mxfp4::kGateUpTiles;
         int batch_begin;
-        while ((batch_begin = claim_unit_batch<kRoutedClaimBatch>(
-                    scratch, kGateUpQueue, units, &claim_slot,
+        while ((batch_begin = claim_unit_batch(
+                    scratch, kGateUpQueue, units, routed_batch, &claim_slot,
                     &claim_end_slot)) >= 0) {
             for (int unit = batch_begin; unit < claim_end_slot; ++unit) {
                 if (unit < shared_units) {
@@ -612,8 +614,8 @@ void kimi_k3_decode_persistent_kernel(
         const int units =
             shared_units + expert_units * expert_mxfp4::kDownTiles;
         int batch_begin;
-        while ((batch_begin = claim_unit_batch<kRoutedClaimBatch>(
-                    scratch, kDownQueue, units, &claim_slot,
+        while ((batch_begin = claim_unit_batch(
+                    scratch, kDownQueue, units, routed_batch, &claim_slot,
                     &claim_end_slot)) >= 0) {
             for (int unit = batch_begin; unit < claim_end_slot; ++unit) {
                 if (unit < shared_units) {

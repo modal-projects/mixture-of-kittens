@@ -24,12 +24,26 @@ namespace persistent {
 /// count co-resides, and the kernel reads that count from `gridDim.x`.
 inline constexpr int kPersistentCtas = 148;
 
-/// Adjacent logical units one routed-phase queue claim reserves.
+/// The primary block-16 concurrency-one shape keeps one-unit queue claims.
 ///
-/// Four cuts the two CTA barriers and one contended global atomic around those
-/// phases by 4x while keeping their scheduler quantum far below one expert's
-/// 28 down-projection tiles.
+/// Four-unit claims reduced routed work at high occupancy, but the B300 phase
+/// profile showed that they moved more cycles into barrier wait than they
+/// removed at M16. Wider shapes retain batching, where the routed savings
+/// exceeded the added wait.
+inline constexpr int kRoutedClaimBatchThreshold = 16;
 inline constexpr int kRoutedClaimBatch = 4;
+
+__host__ __device__ inline constexpr int routed_claim_batch(
+    const int active_tokens
+) {
+    return active_tokens <= kRoutedClaimBatchThreshold ? 1
+                                                       : kRoutedClaimBatch;
+}
+
+static_assert(routed_claim_batch(1) == 1);
+static_assert(routed_claim_batch(kRoutedClaimBatchThreshold) == 1);
+static_assert(routed_claim_batch(kRoutedClaimBatchThreshold + 1)
+                  == kRoutedClaimBatch);
 
 /// Dynamic shared memory every CTA requests, in bytes.
 ///
@@ -209,28 +223,27 @@ static __device__ int claim_unit(
     return *slot;
 }
 
-/// Claim up to `BATCH` adjacent units with one atomic and one CTA rendezvous.
+/// Claim up to `batch` adjacent units with one atomic and one CTA rendezvous.
 ///
 /// The returned half-open range is clipped at `units`; a CTA leaves after its
 /// first refused range just as it does for `claim_unit`.
-template<int BATCH>
 static __device__ int claim_unit_batch(
     const Scratch &scratch,
     const int queue_index,
     const int units,
+    const int batch,
     int *const begin_slot,
     int *const end_slot
 ) {
-    static_assert(BATCH > 0);
     __syncthreads();
     if (threadIdx.x == 0) {
         const unsigned int ticket = atomicAdd(
             reinterpret_cast<unsigned int *>(&scratch.phase[queue_index]),
-            static_cast<unsigned int>(BATCH));
+            static_cast<unsigned int>(batch));
         if (ticket < static_cast<unsigned int>(units)) {
             const int begin = static_cast<int>(ticket);
             *begin_slot = begin;
-            *end_slot = begin + BATCH < units ? begin + BATCH : units;
+            *end_slot = begin + batch < units ? begin + batch : units;
         } else {
             *begin_slot = -1;
             *end_slot = -1;
