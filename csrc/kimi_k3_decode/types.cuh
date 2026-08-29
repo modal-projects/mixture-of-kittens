@@ -278,6 +278,7 @@ inline constexpr int kErrorTailShardReduce = 5;
 inline constexpr int kErrorTailDrainExit = 6;
 inline constexpr int kErrorPersistentGridBarrier = 7;
 inline constexpr int kErrorPersistentActivation = 8;
+inline constexpr int kErrorPersistentDownOrder = 9;
 
 /// One bounded wait, named by the code it reports and the slots it writes.
 struct TimeoutSite {
@@ -309,12 +310,14 @@ inline constexpr TimeoutSite kTimeoutSites[] = {
      kPersistentTimeoutPhase, kGridGeneration},
     {"persistent_shared_activation", kErrorPersistentActivation,
      kPersistentTimeoutPhase, kActivationArrivals},
+    {"persistent_down_order", kErrorPersistentDownOrder,
+     kPersistentTimeoutPhase, kDownQueue},
 };
 
 inline constexpr int kTimeoutSiteCount =
     static_cast<int>(sizeof(kTimeoutSites) / sizeof(kTimeoutSites[0]));
 
-static_assert(kTimeoutSiteCount == 8);
+static_assert(kTimeoutSiteCount == 9);
 static_assert(kTimeoutSites[kTimeoutSiteCount - 1].code == kTimeoutSiteCount,
               "the timeout codes must be a dense nonzero range");
 
@@ -340,6 +343,7 @@ struct Scratch {
     __nv_bfloat16 *latent_x;
     int *unit_expert;
     float *router_scores;
+    int *down_progress;
 };
 
 __host__ __device__ inline Scratch scratch_view(std::uint8_t *base) {
@@ -364,6 +368,7 @@ __host__ __device__ inline Scratch scratch_view(std::uint8_t *base) {
         reinterpret_cast<__nv_bfloat16 *>(base + kLatentXBytes),
         reinterpret_cast<int *>(base + kUnitExpertBytes),
         reinterpret_cast<float *>(base + kRouterScoreBytes),
+        reinterpret_cast<int *>(base + kRouterScoreBytes),
     };
 }
 

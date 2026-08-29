@@ -625,7 +625,10 @@ def test_the_grid_claims_only_occupied_experts(
         ),
     ):
         drained = int(counters[counter].item())
-        assert units <= drained <= units + claim_width * PERSISTENT_CTAS, (
+        rounded = (units + claim_width - 1) // claim_width * claim_width
+        assert units <= drained <= (
+            rounded + claim_width * PERSISTENT_CTAS
+        ), (
             counter,
             drained,
         )

@@ -109,7 +109,12 @@ def test_grouped_down_reuses_activation_across_expert_output_tiles() -> None:
         "for (int tile = 0; tile < tile_count; ++tile)"
     )
     assert "grouped_batch_mixed_mma(" in down
-    assert "accumulate_grouped_down(" in down
+    assert "accumulate_grouped_down_ordered(" in down
+    ordered = _function_body(grouped, "void accumulate_grouped_down_ordered(")
+    assert "scratch.expert_ids[token * kTopK + slot] < expert" in ordered
+    assert "scratch.down_progress[progress_index]" in ordered
+    assert "kErrorPersistentDownOrder" in ordered
+    assert "atomicAdd(\n                &scratch.routed_accumulator" not in ordered
 
 
 def test_grouped_down_is_the_only_production_persistent_instantiation() -> None:
@@ -130,6 +135,7 @@ def test_grouped_down_is_the_only_production_persistent_instantiation() -> None:
     assert kernel.count("routed_gate_up_unit(") == 1
     assert kernel.count("grouped_down_unit(") == 1
     assert "routed_down_unit(" not in kernel
+    assert "scratch.down_progress[index] = 0;" in kernel
     assert "grouped_gate_up_unit(" not in grouped
     assert "quantize_grouped_situ(" not in grouped
     launch = _function_body(persistent, "void launch_decode(")

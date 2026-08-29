@@ -3,8 +3,8 @@
 #include "kittens.cuh"
 
 #include "expert_mxfp4.cuh"
-#include "expert_mxfp4_grouped.cuh"
 #include "persistent_sync.cuh"
+#include "expert_mxfp4_grouped.cuh"
 #include "router.cuh"
 #include "shared.cuh"
 #include "skinny_gemm.cuh"
@@ -515,6 +515,13 @@ void kimi_k3_decode_persistent_kernel(
         __syncthreads();
         mark = clocks.lap(kClockAssignments, mark);
     }
+    const int down_chains =
+        active_tokens * expert_mxfp4::grouped_pipeline::kGroupedDownUnits;
+    for (int index = block * kDecodeCtaThreads + thread;
+         index < down_chains;
+         index += grid_ctas * kDecodeCtaThreads) {
+        scratch.down_progress[index] = 0;
+    }
     expert_mxfp4::quantize_latent_rows(
         scratch.latent_x, scratch, active_tokens, block, grid_ctas);
     __syncthreads();
@@ -645,8 +652,7 @@ void kimi_k3_decode_persistent_kernel(
                     shared_raw, tensor_pool, expert_w2_packed,
                     expert_w2_scale, scratch, expert, begin,
                     scratch.expert_offsets[expert + 1] - begin,
-                    routed % routed_units_per_expert, active_tokens,
-                    clocks);
+                    routed % routed_units_per_expert, error_flag, clocks);
                 __syncthreads();
                 mark = clocks.lap(kClockRoutedDown, mark);
             }

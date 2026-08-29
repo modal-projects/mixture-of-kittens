@@ -68,7 +68,11 @@ _SOURCE_ROOT = Path(__file__).resolve().parents[1] / "csrc" / "kimi_k3_decode"
 # Every source that either defines a bounded wait or names the code one
 # reports. The structural tests walk these rather than trusting the table.
 _TIMEOUT_DEFINITIONS = ("tail_sync.cuh", "persistent_sync.cuh")
-_TIMEOUT_CALLERS = ("collectives.cuh", "persistent_kernel.cuh")
+_TIMEOUT_CALLERS = (
+    "collectives.cuh",
+    "expert_mxfp4_grouped.cuh",
+    "persistent_kernel.cuh",
+)
 
 
 def _source(name: str) -> str:
