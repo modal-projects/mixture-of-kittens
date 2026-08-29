@@ -25,6 +25,19 @@ def test_temporary_agent_instrumentation_has_been_removed() -> None:
         assert "hypothesisId" not in text
 
 
+def test_decode_launch_gate_retries_empty_rank_trace_collectively() -> None:
+    source = (
+        Path(__file__).parents[1] / "tests" / "kimi_k3_decode_support.py"
+    ).read_text(encoding="utf-8")
+    profiled = source.split("def profiled_kernel_names(", 1)[1].split(
+        "\ndef ", 1
+    )[0]
+
+    assert "for _ in range(2):" in profiled
+    assert "dist.all_reduce(missed_trace" in profiled
+    assert "if not bool(missed_trace.item()):" in profiled
+
+
 def test_grouped_candidate_switching_has_been_removed() -> None:
     root = Path(__file__).parents[1]
     assert not (root / "benchmarks" / "kimi_k3_grouped_pipeline.py").exists()
