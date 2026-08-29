@@ -150,6 +150,7 @@ static __device__ void routed_gate_up_unit(
 
     int compute_phase = 0;
     unsigned long long mark = clocks.now();
+    #pragma unroll 1
     for (int round = 0; round < kGateUpRounds; ++round) {
         const int group_base = round * kGateUpRoundGroups;
         const int stage = round % kWeightPipelineStages;
@@ -318,6 +319,7 @@ static __device__ void routed_down_unit(
         weight_arrived);
     wait(weight_arrived, 0);
     int compute_phase = 0;
+    #pragma unroll 1
     for (int round = 0; round < kDownRounds; ++round) {
         const int group_base = round * kDownRoundGroups;
         const int stage = round % kWeightPipelineStages;
