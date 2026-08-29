@@ -363,12 +363,11 @@ def test_a_completed_launch_leaves_both_diagnostics_at_zero(
 def test_the_longest_queue_is_the_one_the_header_asserts() -> None:
     """The counter is never reset inside a launch, so its bound is load bearing.
 
-    ``claim_unit`` hands out one ticket past the last unit for every CTA that
-    asks and is refused, and a CTA leaves a queue on its first refusal, so the
-    highest ticket is the longest queue plus exactly one per CTA. The header
-    static-asserts both numbers; this recomputes them from the task plan of
-    every shape the operator accepts, so a retiling that lengthened a queue
-    cannot pass by having the assertion updated to match it.
+    Routed queues advance by four logical units per claim, and a CTA leaves a
+    queue on its first refused batch, so their conservative bound is the
+    longest queue plus four units per CTA. The header static-asserts both
+    numbers; this recomputes the logical length from the task plan of every
+    accepted shape, so a retiling cannot pass by updating only the assertion.
     """
     units, ticket = _C._kimi_k3_decode_queue_bound()
     longest = max(
@@ -376,9 +375,25 @@ def test_the_longest_queue_is_the_one_the_header_asserts() -> None:
         for tokens in range(1, MAX_TOKENS + 1)
     )
     assert units == longest == 25_150
-    assert ticket == units + PERSISTENT_CTAS == 25_298
+    assert ticket == units + 4 * PERSISTENT_CTAS == 25_742
     # Four orders of magnitude of headroom under the unsigned wrap.
     assert ticket < 0xffffffff // 2
+
+
+def test_routed_queues_claim_four_adjacent_units_per_atomic() -> None:
+    """Batch only the long routed queues, leaving mixed work ordering intact."""
+    sync = _source("persistent_sync.cuh")
+    claim = _function_body(sync, "int claim_unit_batch(")
+    kernel = _function_body(
+        _source("persistent_kernel.cuh"),
+        "void kimi_k3_decode_persistent_kernel(",
+    )
+
+    assert "kRoutedClaimBatch = 4" in sync
+    assert "atomicAdd(" in claim
+    assert "static_cast<unsigned int>(BATCH)" in claim
+    assert kernel.count("claim_unit_batch<kRoutedClaimBatch>(") == 2
+    assert kernel.count("claim_unit(") == 1
 
 
 # ---------------------------------------------------------------------------
