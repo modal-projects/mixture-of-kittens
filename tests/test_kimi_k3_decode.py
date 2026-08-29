@@ -88,7 +88,7 @@ CORE_PROJECTION_UNITS = 112       # skinny_gemm::kCoreCtas
 TENSOR_PROJECTION_UNITS = 28      # skinny_gemm::kTensorCtas
 SCORE_SHARDS = 8                  # router::kScoreShards
 GATE_UP_TILES = 3                 # expert_mxfp4::kGateUpTiles
-DOWN_TILES = 28                   # expert_mxfp4::kDownTiles
+GROUPED_DOWN_UNITS = 7            # grouped_pipeline::kGroupedDownUnits
 CORE_SHARED_GATE_UNITS = 24       # shared_experts::kCoreGateCtas
 TENSOR_SHARED_GATE_UNITS = 6      # shared_experts::kTensorGateCtas
 ACTIVATION_UNITS = 6              # shared_experts::kActivationCtas
@@ -546,7 +546,7 @@ def test_the_task_plan_covers_every_logical_task_of_the_step(
     assert down == (
         (ACTIVATION_UNITS + TENSOR_SHARED_DOWN_UNITS) if tensor_path
         else CORE_SHARED_DOWN_UNITS
-    ) + experts * DOWN_TILES
+    ) + experts * GROUPED_DOWN_UNITS
     assert tail == (TENSOR_TAIL_UNITS if tensor_path else CORE_TAIL_UNITS)
     # Every phase hands out far more tasks than there are CTAs, which is the
     # reason the grid claims work instead of owning it.
@@ -589,17 +589,24 @@ def test_the_grid_claims_only_occupied_experts(
     down_units = (
         ACTIVATION_UNITS
         + TENSOR_SHARED_DOWN_UNITS
-        + distinct * DOWN_TILES
+        + distinct * GROUPED_DOWN_UNITS
     )
-    # A queue counter stops one ticket past its last unit for every CTA that
-    # asked and was refused, so it lands in a band whose width is the grid.
-    for counter, units in (
-        (GATE_UP_QUEUE, gate_up_units),
-        (DOWN_QUEUE, down_units),
-        (ROUTE_LATENT_QUEUE, tokens * SCORE_SHARDS + TENSOR_PROJECTION_UNITS),
+    # Batched routed queues stop one width-four claim past their last unit for
+    # every CTA that was refused; the route/latent queue still claims singly.
+    for counter, units, claim_width in (
+        (GATE_UP_QUEUE, gate_up_units, 4),
+        (DOWN_QUEUE, down_units, 4),
+        (
+            ROUTE_LATENT_QUEUE,
+            tokens * SCORE_SHARDS + TENSOR_PROJECTION_UNITS,
+            1,
+        ),
     ):
         drained = int(counters[counter].item())
-        assert units <= drained <= units + PERSISTENT_CTAS, (counter, drained)
+        assert units <= drained <= units + claim_width * PERSISTENT_CTAS, (
+            counter,
+            drained,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -637,7 +644,7 @@ def test_a_poisoned_scratch_does_not_survive_a_launch(
 ) -> None:
     """Every data region a step reads is one the same step wrote.
 
-    The routed accumulator is the sharpest case: 25 088 down units add into it
+    The routed accumulator is the sharpest case: 6 272 down units add into it
     atomically, so a launch that trusted whatever was there would return the
     previous step's routed latent plus this one's. Poisoning every region and
     getting the same answer is what proves the phase-0 clear and the

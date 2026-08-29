@@ -119,27 +119,25 @@ def test_grouped_pipeline_reuses_activation_across_expert_output_tiles() -> None
     assert "accumulate_grouped_down(" in down
 
 
-def test_grouped_down_is_a_guarded_separate_persistent_instantiation() -> None:
-    """The benchmark switch must change down without changing gate/up."""
+def test_grouped_down_is_the_only_production_persistent_instantiation() -> None:
+    """Ship grouped down with the original gate/up and no runtime switch."""
     persistent = _source("persistent_kernel.cuh")
+    grouped = _source("expert_mxfp4_grouped.cuh")
     kernel = _function_body(
         persistent,
         "void kimi_k3_decode_persistent_kernel(",
     )
 
-    assert "MOK_KIMI_K3_ENABLE_GROUPED_PIPELINE" in persistent
-    assert "set_benchmark_grouped_pipeline_for_testing(" in persistent
-    assert "benchmark_grouped_pipeline_enabled()" in persistent
-    assert "template<bool TENSOR_PATH, bool GROUPED_DOWN>" in persistent
-    assert kernel.count("if constexpr (GROUPED_DOWN)") == 1
+    assert "MOK_KIMI_K3_ENABLE_GROUPED_PIPELINE" not in persistent
+    assert "set_benchmark_grouped_pipeline_for_testing(" not in persistent
+    assert "benchmark_grouped_pipeline_enabled()" not in persistent
+    assert "template<bool TENSOR_PATH>" in persistent
+    assert "GROUPED_DOWN" not in persistent
     assert "grouped_gate_up_unit(" not in kernel
     assert kernel.count("routed_gate_up_unit(") == 1
-    assert "grouped_down_unit(" in kernel
-    assert "launch_persistent<true, false>(" in persistent
-    assert "launch_persistent<false, false>(" in persistent
-    assert "launch_persistent<true, true>(" in persistent
-    assert "launch_persistent<false, true>(" in persistent
+    assert kernel.count("grouped_down_unit(") == 1
+    assert "routed_down_unit(" not in kernel
+    assert "grouped_gate_up_unit(" not in grouped
+    assert "quantize_grouped_situ(" not in grouped
     launch = _function_body(persistent, "void launch_decode(")
-    assert "const bool grouped = benchmark_grouped_pipeline_enabled();" in launch
-    assert launch.count("launch_grouped_decode<") == 2
-    assert launch.count("launch_production_decode<") == 2
+    assert launch.count("launch_persistent<") == 2

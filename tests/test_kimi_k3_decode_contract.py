@@ -375,9 +375,9 @@ def test_the_longest_queue_is_the_one_the_header_asserts() -> None:
         max(_C._kimi_k3_decode_task_plan(tokens)[:4])
         for tokens in range(1, MAX_TOKENS + 1)
     )
-    assert units == longest == 25_150
+    assert units == longest == 6_334
     rounded = (units + 3) // 4 * 4
-    assert ticket == rounded + 4 * PERSISTENT_CTAS == 25_744
+    assert ticket == rounded + 4 * PERSISTENT_CTAS == 6_928
     # Four orders of magnitude of headroom under the unsigned wrap.
     assert ticket < 0xffffffff // 2
 
