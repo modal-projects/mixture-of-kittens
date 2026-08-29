@@ -180,6 +180,7 @@ def evaluate_row(
         "candidate_p99_of_repeats_ms": candidate_p99,
         "median_dispersion_ms": median_dispersion,
         "p99_dispersion_ms": p99_dispersion,
+        "effect_band_ms": median_dispersion,
         "improvement_ms": median_improvement,
         "p99_improvement_ms": p99_improvement,
         "improvement_fraction": median_fraction,

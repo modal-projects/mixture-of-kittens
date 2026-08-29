@@ -110,6 +110,7 @@ def test_native_gate_up_probe_is_an_isolated_three_stage_direct_tma_engine() -> 
 
 def test_native_gate_up_panel_releases_stages_without_cta_barriers() -> None:
     native = _source("expert_mxfp4_native_gate_up_probe.cuh")
+    producer = _function_body(native, "void native_producer_dispatch(")
     candidate = _function_body(native, "void native_gate_up_candidate(")
     panel_loop = candidate.split(
         "for (int panel = 0; panel < kNativePanels; ++panel)", 1
@@ -117,7 +118,7 @@ def test_native_gate_up_panel_releases_stages_without_cta_barriers() -> None:
 
     assert "warpid() == kNativeProducerWarp" in candidate
     assert "warpid() == kNativeConsumerWarp" in candidate
-    assert "issue_native_panel(" in candidate
+    assert "issue_native_panel(" in producer
     assert panel_loop.count("batch_mixed_mma_direct(") == 2
     assert "detail::tcgen05::commit<1>(stage_released[stage])" in panel_loop
     assert "detail::tcgen05::commit<1>(compute_done)" in candidate
@@ -128,6 +129,7 @@ def test_native_gate_up_panel_releases_stages_without_cta_barriers() -> None:
 
 def test_native_gate_up_shared_memory_forces_one_cta_per_sm_under_120_kib() -> None:
     native = _source("expert_mxfp4_native_gate_up_probe.cuh")
+    normalized = " ".join(native.split())
 
     assert "kNativeWeightSharedBytes == 96 * 1024" in native
     assert "kNativeGateUpSharedBytes <= 120 * 1024" in native
@@ -135,7 +137,7 @@ def test_native_gate_up_shared_memory_forces_one_cta_per_sm_under_120_kib() -> N
     assert (
         "2 * kNativeGateUpSharedReservationBytes"
         " > kittens::MAX_SHARED_MEMORY"
-    ) in native
+    ) in normalized
     assert "native_gate_up_probe_resources" in native
     assert "cudaOccupancyMaxActiveBlocksPerMultiprocessor" in native
 

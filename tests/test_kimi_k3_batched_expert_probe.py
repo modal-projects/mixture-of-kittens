@@ -113,7 +113,7 @@ def test_measurement_requires_a_gain_outside_repeat_dispersion() -> None:
     accepted = probe.evaluate_row(
         rows=1,
         baseline_repeat_medians=[1.000, 1.002, 0.998],
-        candidate_repeat_medians=[0.950, 0.952, 0.948],
+        candidate_repeat_medians=[0.890, 0.892, 0.888],
         baseline_repeat_p99s=[1.010, 1.012, 1.008],
         candidate_repeat_p99s=[0.950, 0.952, 0.948],
         numerical=numerical,
