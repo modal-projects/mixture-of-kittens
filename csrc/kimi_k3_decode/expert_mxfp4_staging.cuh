@@ -331,7 +331,8 @@ __device__ __forceinline__ void issue_direct_weight_round(
 __device__ __forceinline__ void mixed_mma_direct(
     const mixed_accumulator_tile &destination,
     const mixed_operand_tile &activation,
-    const std::uint64_t weight_chunk,
+    const direct_weight_stage &weight,
+    const int chunk,
     const kittens::full_tt_fp8e8m0<16> &activation_scale,
     const kittens::full_tt_fp8e8m0<16> &weight_scale,
     const int scale_factor_id,
@@ -340,6 +341,10 @@ __device__ __forceinline__ void mixed_mma_direct(
     kittens::st_descriptor<
         mixed_operand_tile, kittens::transpose::N> activation_descriptor(
             activation);
+    kittens::st_descriptor<
+        direct_weight_stage, kittens::transpose::N> weight_descriptor(weight);
+    const std::uint64_t weight_chunk =
+        weight_descriptor.chunk_descriptor(chunk);
     const std::uint32_t instruction =
         mixed_instruction_descriptor(scale_factor_id);
     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");

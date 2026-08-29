@@ -429,7 +429,6 @@ def test_routed_tma_writes_the_mma_layout_and_double_buffers_it() -> None:
     )
     assert "packed_weight_tile" not in staging
     assert "stage_weight_row(" not in body
-    assert body.count("weight_descriptor.chunk_descriptor(slot)") == 2
     assert (
         "#pragma unroll 1\n"
         "    for (int round = 0; round < kGateUpRounds; ++round)"
