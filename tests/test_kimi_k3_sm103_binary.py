@@ -55,13 +55,10 @@ ROUTED_EXPERTS_SYMBOL = "kimi_k3_routed_experts_kernel"
 # pressure, not a claim that 48 is acceptable.
 PRIVATE_ROUTED_STACK_CEILING = 48
 
-# Itanium mangling spells all three compile-time selections out: tensor path,
-# gate/up group size, and gate/up-to-down pipelining. This lets the shipped
-# readiness pair and the benchmark-only baseline pair be checked independently.
-PRODUCTION_CORE_MANGLING = "ILb0ELi0ELb1EE"
-PRODUCTION_TENSOR_MANGLING = "ILb1ELi0ELb1EE"
-BASELINE_CORE_MANGLING = "ILb0ELi0ELb0EE"
-BASELINE_TENSOR_MANGLING = "ILb1ELi0ELb0EE"
+# Itanium mangling spells the two ``bool TENSOR_PATH`` instantiations out, so
+# the core and tcgen05 builds of the production template can be told apart.
+PRODUCTION_CORE_MANGLING = "ILb0EE"
+PRODUCTION_TENSOR_MANGLING = "ILb1EE"
 
 # Blackwell SASS, from the SM103 build. ``UTCQMMA`` is the native mixed
 # MXFP4-by-MXFP8 tcgen05 contraction, ``UTCHMMA`` its BF16 sibling, ``LDGMC``
@@ -147,6 +144,7 @@ def persistent_symbols(extension_path: Path) -> dict[str, str]:
     """The two persistent instantiations, keyed by which capacity path they are."""
     usage = _resource_usage(extension_path)
     found = [name for name in usage if PERSISTENT_SYMBOL in name]
+    assert len(found) == 2, found
     symbols = {
         "core": next(
             name for name in found if PRODUCTION_CORE_MANGLING in name
@@ -158,22 +156,6 @@ def persistent_symbols(extension_path: Path) -> dict[str, str]:
     assert symbols["core"] != symbols["tensor"]
     return symbols
 
-
-@pytest.fixture(scope="module")
-def baseline_symbols(extension_path: Path) -> dict[str, str]:
-    """The benchmark baseline pair, keyed by which capacity path they are."""
-    usage = _resource_usage(extension_path)
-    found = [name for name in usage if PERSISTENT_SYMBOL in name]
-    symbols = {
-        "core": next(
-            name for name in found if BASELINE_CORE_MANGLING in name
-        ),
-        "tensor": next(
-            name for name in found if BASELINE_TENSOR_MANGLING in name
-        ),
-    }
-    assert symbols["core"] != symbols["tensor"]
-    return symbols
 
 @pytest.mark.parametrize("path_name", ["core", "tensor"])
 def test_neither_instantiation_spills(
@@ -231,26 +213,6 @@ def test_neither_instantiation_touches_local_memory(
     """The same claim as ``STACK:0``, read off the instructions themselves."""
     families = _mnemonics(extension_path, persistent_symbols[path_name])
     assert families.isdisjoint(FORBIDDEN), sorted(families & FORBIDDEN)
-
-
-@pytest.mark.parametrize("path_name", ["core", "tensor"])
-def test_baseline_candidate_has_no_spills_or_local_memory(
-    extension_path: Path,
-    baseline_symbols: dict[str, str],
-    path_name: str,
-) -> None:
-    """The retained benchmark baseline must stay safe while verifying prod."""
-    symbol = baseline_symbols[path_name]
-    usage = _resource_usage(extension_path)[symbol]
-    assert usage["STACK"] == 0, usage
-    assert usage["LOCAL"] == 0, usage
-    families = _mnemonics(extension_path, symbol)
-    assert families.isdisjoint(FORBIDDEN), sorted(families & FORBIDDEN)
-    assert "UTCQMMA" in families
-    resource = _C._kimi_k3_decode_gate_up_group_resource(
-        path_name == "tensor", 0, False
-    )
-    assert resource[1] == 1
 
 
 @pytest.mark.parametrize("path_name", ["core", "tensor"])

@@ -39,9 +39,10 @@ def test_decode_launch_gate_retries_empty_rank_trace_collectively() -> None:
     assert "if not bool(missed_trace.item()):" in profiled
 
 
-def test_grouped_candidate_switching_has_been_removed() -> None:
+def test_rejected_candidate_switching_has_been_removed() -> None:
     root = Path(__file__).parents[1]
     assert not (root / "benchmarks" / "kimi_k3_grouped_pipeline.py").exists()
+    assert not (root / "benchmarks" / "kimi_k3_gate_up_grouping.py").exists()
 
     sources = (
         root / "benchmarks" / "kimi_k3_decode_runtime.py",
@@ -52,6 +53,11 @@ def test_grouped_candidate_switching_has_been_removed() -> None:
         assert "MOK_KIMI_K3_ENABLE_GROUPED_PIPELINE" not in text
         assert "_kimi_k3_decode_set_grouped_pipeline" not in text
         assert "bench_kimi_k3_grouped_pipeline" not in text
+        assert "MOK_KIMI_K3_ENABLE_GATE_UP_GROUPING" not in text
+        assert "MOK_KIMI_K3_ENABLE_GATE_UP_DOWN_PIPELINE" not in text
+        assert "_kimi_k3_decode_set_gate_up_group_size" not in text
+        assert "_kimi_k3_decode_set_gate_up_down_pipeline" not in text
+        assert "bench_kimi_k3_gate_up_grouping" not in text
 
 
 def test_probe_retains_layout_as_evidence_for_a_compound_pipeline() -> None:
