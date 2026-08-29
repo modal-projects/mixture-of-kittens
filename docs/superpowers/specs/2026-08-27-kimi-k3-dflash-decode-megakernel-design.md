@@ -322,7 +322,9 @@ Run in the K3-enabled vLLM CUDA 13 image pinned by the benchmark manifest:
 
 1. map identical packed expert shards and BF16 dense weights into vLLM's Kimi
    K3 `FusedMoE`/`LatentMoERunner`;
-2. compare layer outputs for all DFlash block-8 and block-16 shapes;
+2. compare each layer output with the official reference and compare the
+   custom/native outputs diagnostically for all DFlash block-8 and block-16
+   shapes;
 3. benchmark the native vLLM layer and the custom operator under identical
    CUDA Graph, stream, input pool, and timing conditions;
 4. attempt end-to-end K3 DFlash serving with
@@ -345,6 +347,10 @@ Run in the K3-enabled SGLang image with:
 Map identical weights into the SGLang native K3 MoE layer, compare outputs, and
 benchmark native versus custom execution. Also run an end-to-end server smoke
 test with the published DFlash configuration.
+
+The custom kernel must satisfy the official-reference tolerances. A serving
+backend's own numerical miss is reported but does not require the custom
+kernel to imitate that backend-specific error.
 
 ### Benchmark methodology
 

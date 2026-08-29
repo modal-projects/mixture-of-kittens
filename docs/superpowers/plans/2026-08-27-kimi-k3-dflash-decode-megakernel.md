@@ -1066,11 +1066,15 @@ modal run --env rahul-dev modal_app.py::compare_vllm
 modal run --env rahul-dev modal_app.py::compare_sglang
 ```
 
-Expected: framework parity meets relative L1 `0.05`, cosine `0.999`, max
-absolute `1.0`; output includes 500 warmups and 1,000 rank-max samples with
-median/p90/p99 for every DFlash shape. Each Modal function returns a
-deterministic artifact archive containing resolved image/package revisions,
-raw samples, numerical comparisons, and launch traces.
+Expected: the custom kernel meets the official-reference gates of relative L1
+`0.05`, cosine `0.999`, and max absolute `1.0`; router IDs match exactly and
+selected weights stay within `1e-5`. Native vLLM/SGLang outputs are compared
+to both the custom result and the official reference, but a native backend's
+own miss does not require the custom kernel to reproduce that error. Output
+includes 500 warmups and 1,000 rank-max samples with median/p90/p99 for every
+DFlash shape. Each Modal function returns a deterministic artifact archive
+containing resolved image/package revisions, raw samples, numerical
+comparisons, and launch traces.
 
 - [ ] **Step 5: Enforce performance gates**
 
