@@ -35,6 +35,7 @@ from pathlib import Path
 
 import modal
 
+from benchmarks.compare_kimi_k3_frameworks import comparison_artifact_files
 from benchmarks.kimi_k3_artifacts import reproducible_tar_bytes
 
 
@@ -149,20 +150,6 @@ COMPARISON_IMAGES = {
     "vllm": "vllm/vllm-openai:kimi-k3",
     "sglang": "lmsysorg/sglang:kimi-k3",
 }
-COMPARISON_ARTIFACT_FILES = (
-    "manifest.json",
-    "versions.json",
-    "transformations.json",
-    "parity.json",
-    "route_occupancy.json",
-    "latency_block8.json",
-    "latency_block8.csv",
-    "latency_block16.json",
-    "latency_block16.csv",
-    "raw_samples.json",
-    "launch_traces.json",
-    "performance_gates.json",
-)
 _NVIDIA_INCLUDE_GLOB = "/usr/local/lib/python3.12/dist-packages/nvidia/*/include"
 _CPATH_SNIPPET = (
     "import glob;print(':'.join(sorted(glob.glob("
@@ -407,13 +394,7 @@ def _run_framework_comparison(
             environment={"MOK_GIT_SHA": git_sha},
         )
         measured = [mode for mode in modes.split(",") if mode]
-        skipped = {
-            f"latency_{mode}.{suffix}"
-            for mode in ("block8", "block16")
-            if mode not in measured
-            for suffix in ("json", "csv")
-        }
-        expected = set(COMPARISON_ARTIFACT_FILES) - skipped
+        expected = set(comparison_artifact_files(measured))
         actual = {path.name for path in output_dir.iterdir()}
         if actual != expected:
             raise RuntimeError(

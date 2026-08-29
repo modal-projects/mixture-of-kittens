@@ -392,4 +392,8 @@ def test_modal_exposes_the_two_framework_comparison_entrypoints() -> None:
     assert "vllm/vllm-openai:kimi-k3" in source
     assert "lmsysorg/sglang:kimi-k3" in source
     assert source.count("framework_comparison_image(") >= 2
-    assert "COMPARISON_ARTIFACT_FILES" in source
+    # The expected artifact set is sourced from the comparison module rather
+    # than restated here, so a new artifact cannot pass the driver's
+    # completeness check while the Modal function still rejects it.
+    assert "comparison_artifact_files" in source
+    assert "COMPARISON_ARTIFACT_FILES" not in source
