@@ -256,8 +256,8 @@ static __device__ int claim_unit_batch(
 /// Spin on one counter address until it reaches `target`, then acquire.
 ///
 /// `diagnostic_counter_index` names the transition family in the timeout
-/// record. It may differ from the address: the benchmark-only pipelined routed
-/// path stores one readiness count per expert outside the compact phase band.
+/// record. It may differ from the address: the routed path stores one
+/// readiness count per expert outside the compact phase band.
 static __device__ void wait_for_count_at(
     const Scratch &scratch,
     int *__restrict__ const error_flag,

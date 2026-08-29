@@ -203,8 +203,8 @@ inline constexpr int kActiveExpertUnits = 33;
 // A zero value means no persistent wait timed out. On timeout the waiting CTA
 // records the counter slot it gave up on before trapping.
 inline constexpr int kPersistentTimeoutPhase = 34;
-// Benchmark-only pipelining uses this arrival counter to publish completion of
-// every shared gate/up unit before shared-down consumers read their outputs.
+// Shared gate/up units publish completion here before shared-down consumers
+// read their outputs.
 inline constexpr int kGateUpArrivals = 35;
 static_assert(kPersistentTimeoutPhase < NUM_PHASE_COUNTERS);
 static_assert(kGateUpArrivals < NUM_PHASE_COUNTERS);

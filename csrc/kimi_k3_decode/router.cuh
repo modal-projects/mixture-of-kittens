@@ -153,7 +153,6 @@ static __device__ void build_assignments(
 /// last lane publishes the total. The caller must have just run
 /// `build_assignments` on the same shared buffer, which is what leaves the
 /// per-expert counts there; that call does not disturb them afterwards.
-template<bool RESET_GATE_UP_READINESS = false>
 static __device__ void build_expert_units(
     const std::uint8_t *__restrict__ shared,
     const Scratch &scratch
@@ -180,14 +179,11 @@ static __device__ void build_expert_units(
         const int expert = lane * kPerLane + i;
         if (counts[expert] <= 0) continue;
         scratch.unit_expert[unit] = expert;
-        if constexpr (RESET_GATE_UP_READINESS) {
-            // The persistent path no longer reads the global assignment
-            // counts after compaction. Reuse them as per-expert gate/up
-            // readiness slots only in the benchmark instantiation; the phase
-            // barrier following this function publishes every zero before a
-            // producer can increment one.
-            scratch.expert_counts[expert] = 0;
-        }
+        // The persistent path no longer reads the global assignment counts
+        // after compaction. Reuse them as per-expert gate/up readiness slots;
+        // the phase barrier following this function publishes every zero
+        // before a producer can increment one.
+        scratch.expert_counts[expert] = 0;
         unit++;
     }
     if (lane == 31) scratch.phase[kActiveExpertUnits] = inclusive;
