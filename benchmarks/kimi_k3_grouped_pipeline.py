@@ -4,18 +4,18 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import importlib
 import json
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import torch
 import torch.distributed as dist
 
-from benchmarks import kimi_k3_decode_data as data
-from benchmarks import kimi_k3_decode_runtime as runtime
 from benchmarks.compare_kimi_k3_frameworks import (
     derive_phase_cycles,
     summarize_phase_cycles,
@@ -25,8 +25,6 @@ from benchmarks.kimi_k3_timing import (
     replay_samples,
     summarize_rank_max,
 )
-from mok import _C
-from mok import kimi_k3 as kimi
 
 
 TOKENS = (16, 128)
@@ -110,22 +108,27 @@ def _stats(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, Any]:
 
 
 def _capture_pool(
-    workspace: kimi.KimiK3DecodeWorkspace,
+    runtime_module: ModuleType,
+    workspace: Any,
     pool: Sequence[Any],
     variant: Variant,
     device: torch.device,
 ) -> list[torch.cuda.CUDAGraph]:
     graphs: list[torch.cuda.CUDAGraph] = []
-    with runtime.benchmark_decode_variant(
+    with runtime_module.benchmark_decode_variant(
         grouped_pipeline=variant.grouped_pipeline,
         grid_ctas=variant.grid_ctas,
     ):
         for entry in pool:
-            runtime.decode_step(workspace, entry.weights, entry.hidden)
+            runtime_module.decode_step(
+                workspace, entry.weights, entry.hidden
+            )
             torch.cuda.synchronize(device)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                runtime.decode_step(workspace, entry.weights, entry.hidden)
+                runtime_module.decode_step(
+                    workspace, entry.weights, entry.hidden
+                )
             graphs.append(graph)
     return graphs
 
@@ -158,21 +161,24 @@ def _measure(
 
 
 def _phase_profile(
-    workspace: kimi.KimiK3DecodeWorkspace,
+    runtime_module: ModuleType,
+    workspace: Any,
     pool: Sequence[Any],
     variant: Variant,
     device: torch.device,
 ) -> dict[str, Any]:
-    with runtime.benchmark_decode_variant(
+    with runtime_module.benchmark_decode_variant(
         grouped_pipeline=variant.grouped_pipeline,
         grid_ctas=variant.grid_ctas,
     ):
-        with runtime.phase_profiling():
+        with runtime_module.phase_profiling():
             for entry in pool:
-                runtime.decode_step(workspace, entry.weights, entry.hidden)
+                runtime_module.decode_step(
+                    workspace, entry.weights, entry.hidden
+                )
             torch.cuda.synchronize(device)
             cycles = derive_phase_cycles(
-                runtime.phase_clock_cycles(workspace)
+                runtime_module.phase_clock_cycles(workspace)
             )
     staging = (
         cycles.get("routed_gate_up_stage", 0)
@@ -210,16 +216,17 @@ def _phase_profile(
 
 
 def _kernel_names(
-    workspace: kimi.KimiK3DecodeWorkspace,
+    runtime_module: ModuleType,
+    workspace: Any,
     entry: Any,
     variant: Variant,
 ) -> list[str]:
-    with runtime.benchmark_decode_variant(
+    with runtime_module.benchmark_decode_variant(
         grouped_pipeline=variant.grouped_pipeline,
         grid_ctas=variant.grid_ctas,
     ):
-        return runtime.profiled_kernel_names(
-            lambda: runtime.decode_step(
+        return runtime_module.profiled_kernel_names(
+            lambda: runtime_module.decode_step(
                 workspace, entry.weights, entry.hidden
             )
         )
@@ -271,13 +278,22 @@ def run(
 ) -> dict[str, Any]:
     if warmup_count < 1 or sample_count < 1 or repeats < 2:
         raise ValueError("warmups and samples must be positive; repeats >= 2")
+    # GPU-only modules are loaded after torchrun has established the process
+    # environment. This keeps the pure benchmark contract importable in a
+    # source checkout where the CUDA extension has not been built.
+    data_module = importlib.import_module("benchmarks.kimi_k3_decode_data")
+    runtime_module = importlib.import_module(
+        "benchmarks.kimi_k3_decode_runtime"
+    )
+    kimi_module = importlib.import_module("mok.kimi_k3")
+    extension = importlib.import_module("mok._C")
     rank, device = _init_distributed()
-    weights = data.build_weights(device, rank)
-    workspace = kimi.get_kimi_k3_decode_workspace(
+    weights = data_module.build_weights(device, rank)
+    workspace = kimi_module.get_kimi_k3_decode_workspace(
         dist.group.WORLD,
         device=device,
     )
-    router = data.shared_router(
+    router = data_module.shared_router(
         weights,
         device,
         TOKENS,
@@ -292,7 +308,7 @@ def run(
 
     for tokens in TOKENS:
         pool = [
-            data.build_routed_input(
+            data_module.build_routed_input(
                 weights,
                 device,
                 tokens,
@@ -302,28 +318,30 @@ def run(
             for index in range(POOL_SIZE)
         ]
         for pool_index, entry in enumerate(pool):
-            with runtime.benchmark_decode_variant(
+            with runtime_module.benchmark_decode_variant(
                 grouped_pipeline=False,
                 grid_ctas=BASELINE.grid_ctas,
             ):
-                baseline = runtime.decode_step(
+                baseline = runtime_module.decode_step(
                     workspace, entry.weights, entry.hidden
                 ).clone()
-            with runtime.benchmark_decode_variant(
+            with runtime_module.benchmark_decode_variant(
                 grouped_pipeline=True,
                 grid_ctas=CANDIDATE.grid_ctas,
             ):
-                candidate = runtime.decode_step(
+                candidate = runtime_module.decode_step(
                     workspace, entry.weights, entry.hidden
                 ).clone()
             torch.cuda.synchronize(device)
-            reference = runtime.decode_reference(entry.hidden, entry.weights)
+            reference = runtime_module.decode_reference(
+                entry.hidden, entry.weights
+            )
             baseline_vs_reference = _stats(baseline, reference)
             candidate_vs_reference = _stats(candidate, reference)
             candidate_vs_baseline = _stats(candidate, baseline)
-            runtime.assert_decode_close(baseline, reference)
-            runtime.assert_decode_close(candidate, reference)
-            runtime.assert_identical_across_ranks(candidate)
+            runtime_module.assert_decode_close(baseline, reference)
+            runtime_module.assert_decode_close(candidate, reference)
+            runtime_module.assert_identical_across_ranks(candidate)
             numerical_rows.append(
                 {
                     "tokens": tokens,
@@ -337,7 +355,9 @@ def run(
         _barrier(device)
 
         graphs = {
-            variant.name: _capture_pool(workspace, pool, variant, device)
+            variant.name: _capture_pool(
+                runtime_module, workspace, pool, variant, device
+            )
             for variant in VARIANTS
         }
         samples_by_variant: dict[str, list[list[float]]] = {
@@ -392,13 +412,13 @@ def run(
         raw_samples[str(tokens)] = samples_by_variant
         phase_profiles[str(tokens)] = {
             variant.name: _phase_profile(
-                workspace, pool, variant, device
+                runtime_module, workspace, pool, variant, device
             )
             for variant in VARIANTS
         }
         launch_names[str(tokens)] = {
             variant.name: _kernel_names(
-                workspace, pool[-1], variant
+                runtime_module, workspace, pool[-1], variant
             )
             for variant in (BASELINE, CANDIDATE)
         }
@@ -411,10 +431,10 @@ def run(
     resource = {
         "tensor_path": {
             "dynamic_shared_bytes": int(
-                _C._kimi_k3_decode_grouped_pipeline_resource(True)[0]
+                extension._kimi_k3_decode_grouped_pipeline_resource(True)[0]
             ),
             "resident_blocks_per_sm": int(
-                _C._kimi_k3_decode_grouped_pipeline_resource(True)[1]
+                extension._kimi_k3_decode_grouped_pipeline_resource(True)[1]
             ),
         }
     }
