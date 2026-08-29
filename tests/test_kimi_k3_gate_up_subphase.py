@@ -118,8 +118,8 @@ def test_latency_measurement_is_outside_the_profile_context() -> None:
     latency = source.split("def measure_latency_repeats(", 1)[1].split(
         "\ndef ", 1
     )[0]
-    phases = source.split("def measure_subphase_repeats(", 1)[1].split(
-        "\ndef ", 1
+    phases = source.split("def _measure_subphase_repeat(", 1)[1].split(
+        "\ndef _init_distributed(", 1
     )[0]
 
     assert "phase_profiling" not in latency
