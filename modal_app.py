@@ -430,6 +430,33 @@ def _run_framework_comparison(
         return first_archive
 
 
+def _run_graph_route_probe(framework: str) -> bytes:
+    """Replay both router constructions on the device and return the report."""
+    output_dir = Path(REMOTE_ROOT) / "kimi_k3_graph_routes"
+    _run_kimi_k3_torchrun(
+        [
+            "-m",
+            "benchmarks.kimi_k3_graph_route_probe",
+            "--framework",
+            framework,
+            "--output-dir",
+            str(output_dir),
+        ],
+        timeout=5_400,
+    )
+    return (output_dir / "graph_routes.json").read_bytes()
+
+
+@app.function(image=VLLM_COMPARISON_IMAGE, gpu="B300:8", timeout=7_200)
+def graph_routes_vllm() -> bytes:
+    return _run_graph_route_probe("vllm")
+
+
+@app.function(image=SGLANG_COMPARISON_IMAGE, gpu="B300:8", timeout=7_200)
+def graph_routes_sglang() -> bytes:
+    return _run_graph_route_probe("sglang")
+
+
 @app.function(image=VLLM_COMPARISON_IMAGE, gpu="B300:8", timeout=86_400)
 def compare_vllm(
     git_sha: str,
@@ -535,6 +562,26 @@ def compare(
             "Kimi K3 comparison gates failed; artifacts are in "
             f"{root} and the verdict is in {root / 'combined'}"
         )
+
+
+@app.local_entrypoint()
+def graph_routes(
+    output_dir: str = "kimi_k3_graph_routes",
+    frameworks: str = "vllm,sglang",
+) -> None:
+    """Show what each captured native router graph actually replays."""
+    entrypoints = {"vllm": graph_routes_vllm, "sglang": graph_routes_sglang}
+    root = Path(output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    handles = {
+        name: entrypoints[name].spawn()
+        for name in frameworks.split(",")
+        if name
+    }
+    for name, handle in handles.items():
+        report = handle.get()
+        (root / f"{name}.json").write_bytes(report)
+        print(f"{name}: {root / f'{name}.json'}")
 
 
 @app.local_entrypoint()
