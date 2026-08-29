@@ -313,12 +313,16 @@ def _run_kimi_k3_torchrun(
 
 
 @app.function(image=B300_IMAGE, gpu="B300:8", timeout=14_400)
-def test_kimi_k3_decode() -> None:
+def test_kimi_k3_decode(tests: str = "") -> None:
     """Run TP8 decode correctness plus SM103 resource and launch checks."""
     Path("/opt/cursor/logs").mkdir(parents=True, exist_ok=True)
-    test_files = sorted(
-        str(path)
-        for path in Path("tests").glob("test_kimi_k3*.py")
+    test_files = (
+        tests.split(",")
+        if tests
+        else sorted(
+            str(path)
+            for path in Path("tests").glob("test_kimi_k3*.py")
+        )
     )
     try:
         _run_kimi_k3_torchrun(

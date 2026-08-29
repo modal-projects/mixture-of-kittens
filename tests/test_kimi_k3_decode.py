@@ -51,6 +51,7 @@ from .kimi_k3_decode_support import (
     GATE_UP_QUEUE,
     GRID_GENERATION,
     HIDDEN,
+    LATENT,
     MAX_TOKENS,
     PERSISTENT_CTAS,
     PERSISTENT_KERNEL,
@@ -62,6 +63,7 @@ from .kimi_k3_decode_support import (
     UINT32_MAX,
     _as_int32,
     _phase,
+    _region,
     _synchronize_ranks,
     assert_decode_close,
     assert_distinct,
@@ -729,6 +731,9 @@ def test_rotating_rank_skew_leaves_the_step_bit_identical(
     baseline = _decode(workspace, weights, hidden).clone()
     torch.cuda.synchronize(device)
     assert_decode_close(baseline, expected)
+    baseline_routed = _region(
+        workspace.scratch, "routed_accumulator", torch.float32
+    )[: tokens * LATENT].clone()
     # region agent log
     with open("/opt/cursor/logs/debug.log", "a", encoding="utf-8") as debug_file:
         debug_file.write(json.dumps({
@@ -768,6 +773,29 @@ def test_rotating_rank_skew_leaves_the_step_bit_identical(
                     "down_counter": int(
                         _phase(workspace.scratch)[DOWN_QUEUE].item()
                     ),
+                },
+                "timestamp": time.time_ns() // 1_000_000,
+            }) + "\n")
+        # endregion
+        routed_difference = (
+            _region(workspace.scratch, "routed_accumulator", torch.float32)[
+                : tokens * LATENT
+            ]
+            - baseline_routed
+        ).abs()
+        # region agent log
+        with open("/opt/cursor/logs/debug.log", "a", encoding="utf-8") as debug_file:
+            debug_file.write(json.dumps({
+                "hypothesisId": "D1,D3",
+                "location": "tests/test_kimi_k3_decode.py:skew_routed_accumulator",
+                "message": "rank-skew routed accumulator compared with baseline",
+                "data": {
+                    "rank": rank,
+                    "step": step,
+                    "different_values": int(
+                        torch.count_nonzero(routed_difference).item()
+                    ),
+                    "max_abs": float(routed_difference.max().item()),
                 },
                 "timestamp": time.time_ns() // 1_000_000,
             }) + "\n")
