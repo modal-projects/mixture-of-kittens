@@ -129,9 +129,21 @@ static __device__ void routed_gate_up_unit(
     // layout the MMA consumes. The alternate stage receives the next round
     // while the tensor core reads the current one.
     //
-    // Scales remain ordinary loads because their row pitches are already
-    // compact; each word is written to shared immediately so it is not live
-    // across the pipelined TMA/MMA region.
+    // Scales remain a small register prefetch. Their row pitches are already
+    // compact, while the packed payload is the measured strided-load burden
+    // this candidate is isolating.
+    std::uint32_t scale_words[kGateUpScaleTiles];
+    const auto read_scale_round = [&](
+        const int group_base,
+        std::uint32_t (&scales)[kGateUpScaleTiles]
+    ) {
+        #pragma unroll
+        for (int quad = 0; quad < kGateUpScaleTiles; ++quad) {
+            scales[quad] = *reinterpret_cast<const std::uint32_t *>(
+                weight_row_scales + group_base + quad * kScaleGroupsPerTile);
+        }
+    };
+    read_scale_round(0, scale_words);
     issue_direct_weight_round(
         first_weight_stage, second_weight_stage,
         layouts.w1, layouts.w3, expert, output_tile, 0, 0, weight_arrived);
@@ -144,10 +156,11 @@ static __device__ void routed_gate_up_unit(
         const int stage = round % kWeightPipelineStages;
         wait(weight_arrived, round % 2);
 
-        stage_scale_quad(
-            weight_scale_shared[0], weight_row,
-            *reinterpret_cast<const std::uint32_t *>(
-                weight_row_scales + group_base));
+        #pragma unroll
+        for (int quad = 0; quad < kGateUpScaleTiles; ++quad) {
+            stage_scale_quad(
+                weight_scale_shared[quad], weight_row, scale_words[quad]);
+        }
 
         // The batch is at most 128 rows and usually one, so the activation is
         // spread over whatever threads its rows and groups need.
@@ -180,6 +193,7 @@ static __device__ void routed_gate_up_unit(
         asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
         __syncthreads();
         if (round + 1 < kGateUpRounds) {
+            read_scale_round(group_base + kGateUpRoundGroups, scale_words);
             issue_direct_weight_round(
                 first_weight_stage, second_weight_stage,
                 layouts.w1, layouts.w3, expert, output_tile,
