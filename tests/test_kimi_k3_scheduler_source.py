@@ -41,3 +41,17 @@ def test_routed_queue_batching_starts_above_the_primary_m16_regime() -> None:
     assert kernel.count("routed_claim_batch(active_tokens)") == 1
     assert kernel.count("claim_unit_batch(") == 2
     assert kernel.count("claim_unit(") == 1
+
+
+def test_routed_down_epilogue_uses_one_vector_atomic_per_column_pair() -> None:
+    """The focused epilogue prototype must halve scalar atomic issue count."""
+    body = _function_body(
+        _source("expert_mxfp4_staging.cuh"), "void accumulate_down_tile("
+    )
+
+    assert "constexpr int kColumnsPerAtomic = 2;" in body
+    assert "batch_rows * kMmaN / kColumnsPerAtomic" in body
+    assert "float2 contribution" in body
+    assert "float2 *const destination" in body
+    assert "atomicAdd(destination, contribution);" in body
+    assert "result[{row, column + 1}]" in body

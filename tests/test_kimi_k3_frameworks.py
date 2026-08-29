@@ -758,6 +758,26 @@ def test_phase_cycle_summary_ranks_regions_by_their_accounted_share() -> None:
     assert summary["dominant_share"] == pytest.approx(0.6)
 
 
+def test_phase_cycle_derivation_exposes_unaccounted_routed_down_work() -> None:
+    """The focused run must isolate staging/MMA from the epilogue candidate."""
+    compare = _compare()
+
+    cycles = compare.derive_phase_cycles(
+        {
+            "routed_down": 300,
+            "routed_down_stage": 250,
+            "routed_down_mma": 40,
+        }
+    )
+
+    assert cycles["routed_down_residual"] == 10
+    summary = compare.summarize_phase_cycles(cycles)
+    assert summary["accounted_cycles"] == 300
+    assert summary["share_of_accounted"]["routed_down_residual"] == pytest.approx(
+        1 / 30
+    )
+
+
 def test_phase_cycle_summary_tolerates_an_unprofiled_launch() -> None:
     compare = _compare()
     summary = compare.summarize_phase_cycles({"router_score": 0, "tail": 0})

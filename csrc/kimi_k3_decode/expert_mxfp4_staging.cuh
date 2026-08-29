@@ -283,19 +283,28 @@ __device__ __forceinline__ void accumulate_down_tile(
     const int active_tokens
 ) {
     const int thread = static_cast<int>(threadIdx.x);
-    for (int index = thread; index < batch_rows * kMmaN;
+    constexpr int kColumnsPerAtomic = 2;
+    constexpr int kColumnPairs = kMmaN / kColumnsPerAtomic;
+    static_assert(kMmaN % kColumnsPerAtomic == 0);
+    for (int index = thread;
+         index < batch_rows * kMmaN / kColumnsPerAtomic;
          index += kDecodeCtaThreads) {
-        const int row = index / kMmaN;
-        const int column = index % kMmaN;
+        const int row = index / kColumnPairs;
+        const int column =
+            (index % kColumnPairs) * kColumnsPerAtomic;
         const int assignment = assignment_begin + row;
         const int token = scratch.assignment_tokens[assignment];
         if (token >= 0 && token < active_tokens) {
-            atomicAdd(
+            const float route_weight =
+                decode_route_weight(scratch, assignment);
+            const float2 contribution = make_float2(
+                result[{row, column}] * route_weight,
+                result[{row, column + 1}] * route_weight);
+            float2 *const destination = reinterpret_cast<float2 *>(
                 &scratch.routed_accumulator[
                     static_cast<long long>(token) * kLatentSize
-                    + output_base + column],
-                result[{row, column}]
-                    * decode_route_weight(scratch, assignment));
+                    + output_base + column]);
+            atomicAdd(destination, contribution);
         }
     }
 }

@@ -122,6 +122,7 @@ __all__ = [
     "capture_versions",
     "combine_archives",
     "comparison_artifact_files",
+    "derive_phase_cycles",
     "effective_image_reference",
     "evaluate_numerical_gates",
     "expected_parity_rows",
@@ -159,7 +160,7 @@ PHASE_CLOCK_NAMES = (
     "grid_barrier",
     "tail",
 )
-PHASE_CLOCK_BREAKDOWN_SUFFIXES = ("_stage", "_mma")
+PHASE_CLOCK_BREAKDOWN_SUFFIXES = ("_stage", "_mma", "_residual")
 _AGENT_DEBUG_LOG = "/opt/cursor/logs/debug.log"
 
 
@@ -185,6 +186,17 @@ def _agent_debug_log(
             )
     except OSError:
         pass
+
+
+def derive_phase_cycles(cycles: Mapping[str, int]) -> dict[str, int]:
+    """Expose routed work not accounted for by staging or MMA clocks."""
+    derived = dict(cycles)
+    routed_down = derived.get("routed_down")
+    stage = derived.get("routed_down_stage")
+    mma = derived.get("routed_down_mma")
+    if routed_down is not None and stage is not None and mma is not None:
+        derived["routed_down_residual"] = max(0, routed_down - stage - mma)
+    return derived
 
 
 def summarize_phase_cycles(cycles: Mapping[str, int]) -> dict[str, Any]:
@@ -444,7 +456,7 @@ def _phase_profile(
         )
         # endregion
         torch.cuda.synchronize(device)
-        cycles = runtime.phase_clock_cycles(workspace)
+        cycles = derive_phase_cycles(runtime.phase_clock_cycles(workspace))
     # region agent log
     _agent_debug_log(
         "B",
