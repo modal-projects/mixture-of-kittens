@@ -437,14 +437,17 @@ def diagnose_kimi_k3_batched_expert_probe(
     variant: str = "candidate",
     rows: int = 1,
     sanitizer: bool = True,
+    sanitizer_tool: str = "memcheck",
 ) -> dict[str, int | str]:
-    """Run one synchronized probe launch, optionally under CUDA memcheck."""
+    """Run one synchronized probe launch, optionally under a CUDA sanitizer."""
     if variant not in ("setup", "baseline", "candidate", "both"):
         raise ValueError(
             "variant must be setup, baseline, candidate, or both"
         )
     if rows < 1 or rows > 8:
         raise ValueError("rows must be between 1 and 8")
+    if sanitizer_tool not in ("memcheck", "racecheck"):
+        raise ValueError("sanitizer_tool must be memcheck or racecheck")
     probe_command = [
         "python",
         "-m",
@@ -458,7 +461,7 @@ def diagnose_kimi_k3_batched_expert_probe(
         [
             "compute-sanitizer",
             "--tool",
-            "memcheck",
+            sanitizer_tool,
             "--error-exitcode",
             "99",
             "--show-backtrace",
