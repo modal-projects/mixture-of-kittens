@@ -43,6 +43,23 @@ def test_routed_queue_batching_starts_above_the_primary_m16_regime() -> None:
     assert kernel.count("claim_unit(") == 1
 
 
+def test_route_selection_fuses_with_scoring_before_assignment_quantization() -> None:
+    """Select on the last score shard and overlap assignments with quantization."""
+    router = _source("router.cuh")
+    kernel = _function_body(
+        _source("persistent_kernel.cuh"),
+        "void kimi_k3_decode_persistent_kernel(",
+    )
+
+    assert "void select_after_score_shard(" in router
+    select = _function_body(router, "void select_after_score_shard(")
+    assert "atomicAdd(&scratch.expert_counts[token], 1)" in select
+    assert "ticket == kScoreShards - 1" in select
+    assert "select_token(" in select
+    assert "select_after_score_shard(" in kernel
+    assert kernel.count("grid_barrier(") == 7
+
+
 def test_routed_down_epilogue_uses_one_vector_atomic_per_column_pair() -> None:
     """The focused epilogue prototype must halve scalar atomic issue count."""
     body = _function_body(
