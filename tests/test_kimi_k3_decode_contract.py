@@ -130,7 +130,7 @@ def test_the_alignment_contract_covers_every_tensor_the_kernel_dereferences(
     contracted = {field for field, _ in _DECODE_ALIGNMENT}
     assert contracted.isdisjoint(_SCALAR_WORD_TENSORS)
     assert contracted | _SCALAR_WORD_TENSORS == tensors
-    assert all(alignment in (16, 32, 256) for _, alignment in _DECODE_ALIGNMENT)
+    assert all(alignment in (16, 256) for _, alignment in _DECODE_ALIGNMENT)
 
 
 def _misaligned(original: torch.Tensor, alignment: int) -> torch.Tensor:
@@ -400,58 +400,46 @@ def _function_body(text: str, signature: str) -> str:
     raise AssertionError(f"{signature} is never closed")
 
 
-def test_routed_tma_writes_the_mma_layout_and_double_buffers_it() -> None:
-    """Packed weights reach the MMA layout without a thread-copying hop.
+def test_the_gate_up_rounds_never_read_a_prefetch_they_did_not_make() -> None:
+    """The last round has no next round, so its prefetch never happened.
 
-    CUDA's aligned-U4 tensor-map format expands four K32 groups into one
-    128-byte-swizzled row. Two stages are enough to overlap the next direct
-    transfer with the current contraction, while keeping both routed units
-    inside the persistent shared-memory budget.
+    A second buffer to prefetch into is what creates the hazard: on the round
+    that skips the prefetch it holds an indeterminate value, and copying it
+    forward reads that value, which is undefined however dead the copy proves
+    to be. One buffer removes the hazard rather than guarding it -- the round
+    stages its own bytes first, then reloads the same registers -- so the
+    contract is that no second buffer exists and the reload is the only write
+    the loop makes to the one that does.
     """
     body = _function_body(
         _source("expert_mxfp4.cuh"), "void routed_gate_up_unit("
     )
     loop = body[body.index("for (int round = 0; round < kGateUpRounds; ++round)"):]
-    staging = _source("expert_mxfp4_staging.cuh")
 
-    assert "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B" in staging
-    assert "CU_TENSOR_MAP_SWIZZLE_128B" in staging
-    assert "kDirectWeightGroups = 4" in staging
-    assert "kWeightPipelineStages = 2" in staging
-    assert "using direct_weight_stage =" in staging
-    assert (
-        "direct_weight_stage (&first_weight_stage)[kWeightPipelineStages]"
-        in body
-    )
-    assert (
-        "direct_weight_stage (&second_weight_stage)[kWeightPipelineStages]"
-        in body
-    )
-    assert "packed_weight_tile" not in staging
-    assert "stage_weight_row(" not in body
-    assert (
-        "#pragma unroll 1\n"
-        "    for (int round = 0; round < kGateUpRounds; ++round)"
-        in body
-    )
+    declarations = [
+        line
+        for line in body.splitlines()
+        if re.match(r"\s*(uint4|std::uint32_t) \w+\[kGateUp\w+\];", line)
+    ]
+    assert len(declarations) == 2, declarations
+    assert "uint4 payload[kGateUpRoundGroups];" in declarations[0]
+    assert "std::uint32_t scale_words[kGateUpScaleTiles];" in declarations[1]
 
-    # Round zero is primed before the loop. The only later direct issue is
-    # guarded and targets the alternate stage.
-    assert body.count("issue_direct_weight_round(") == 2
+    # The prefetch is the loop's only reload, it targets the one buffer, and
+    # it is the only thing the last-round test guards.
     guarded = re.findall(
         r"if \(round \+ 1 < kGateUpRounds\) \{(?P<block>(?:[^{}]|\{[^{}]*\})*)\}",
         loop,
     )
     assert len(guarded) == 1, loop
-    assert "issue_direct_weight_round(" in guarded[0]
-    assert "(round + 1) % kWeightPipelineStages" in guarded[0]
+    assert "read_weight_round(" in guarded[0]
+    assert "payload, scale_words);" in guarded[0]
+    assert len(re.findall(r"read_weight_round\(", loop)) == 1
 
-    persistent = _source("persistent_kernel.cuh")
-    kernel = _function_body(
-        persistent, "void kimi_k3_decode_persistent_kernel("
-    )
-    assert "layouts.routed" in kernel
-    assert "kimi_k3_decode_persistent_kernel<TENSOR_PATH" in persistent
+    # No copy forward, because there is nothing to copy from.
+    assert not re.search(r"\bnext_(?:payload|scale_words)\b", body), body
+    assert "payload[slot] =" not in loop
+    assert "scale_words[quad] =" not in loop
 
 
 # ---------------------------------------------------------------------------

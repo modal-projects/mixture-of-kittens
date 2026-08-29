@@ -257,15 +257,6 @@ static __host__ at::Tensor routed_experts_entrypoint(
         check_tensor_alignment(*item.first, "_kimi_k3_routed_experts",
                                item.second, VECTOR_ALIGNMENT);
     }
-    for (const auto &item : {
-             std::pair<const at::Tensor *, const char *>{
-                 &expert_w1_packed, "expert_w1_packed"},
-             {&expert_w3_packed, "expert_w3_packed"},
-             {&expert_w2_packed, "expert_w2_packed"}}) {
-        check_tensor_alignment(
-            *item.first, "_kimi_k3_routed_experts", item.second,
-            expert_mxfp4::kDirectWeightAlignment);
-    }
     check_tensor_alignment(scratch, "_kimi_k3_routed_experts", "scratch",
                            SCRATCH_ALIGNMENT);
     check_sm103(latent_x, "_kimi_k3_routed_experts");
@@ -794,14 +785,11 @@ static __host__ void kimi_k3_decode_entrypoint(
         {&routed_expert_up_proj, "routed_expert_up_proj", VECTOR_ALIGNMENT},
         {&routed_latent_rmsnorm_weight, "routed_latent_rmsnorm_weight",
          VECTOR_ALIGNMENT},
-        {&expert_w1_packed, "expert_w1_packed",
-         expert_mxfp4::kDirectWeightAlignment},
+        {&expert_w1_packed, "expert_w1_packed", VECTOR_ALIGNMENT},
         {&expert_w1_scale, "expert_w1_scale", VECTOR_ALIGNMENT},
-        {&expert_w3_packed, "expert_w3_packed",
-         expert_mxfp4::kDirectWeightAlignment},
+        {&expert_w3_packed, "expert_w3_packed", VECTOR_ALIGNMENT},
         {&expert_w3_scale, "expert_w3_scale", VECTOR_ALIGNMENT},
-        {&expert_w2_packed, "expert_w2_packed",
-         expert_mxfp4::kDirectWeightAlignment},
+        {&expert_w2_packed, "expert_w2_packed", VECTOR_ALIGNMENT},
         {&expert_w2_scale, "expert_w2_scale", VECTOR_ALIGNMENT},
         {&shared_gate_proj, "shared_gate_proj", VECTOR_ALIGNMENT},
         {&shared_up_proj, "shared_up_proj", VECTOR_ALIGNMENT},

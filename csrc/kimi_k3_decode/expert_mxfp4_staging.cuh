@@ -13,7 +13,6 @@
 
 #include "expert_mxfp4_mma.cuh"
 
-#include <cstddef>
 #include <cstdint>
 
 namespace kimi_k3_decode {
@@ -30,109 +29,6 @@ static_assert(kGateUpTiles == 3);
 static_assert(kDownTiles == 28);
 static_assert(kLatentGroups == 112);
 static_assert(kSituGroups == 12);
-
-// `CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B` requires an inner box of 128 U4
-// values and writes each packed 8-byte group into one 16-byte shared atom.
-// Four adjacent K32 groups are therefore the smallest direct TMA tile that
-// already has the exact byte layout consumed by the mixed MMA. Its supported
-// 128-byte swizzle also lets four K32 chunk descriptors address the result
-// without a compact-to-swizzled thread-copying hop.
-inline constexpr int kDirectWeightGroups = 4;
-inline constexpr int kWeightPipelineStages = 2;
-inline constexpr int kDirectWeightAlignment = 32;
-inline constexpr int kDirectWeightTransactionBytes =
-    kMmaN * kDirectWeightGroups * kMmaK / 2;
-using direct_weight_stage =
-    kittens::st_fp8e4m3<
-        kMmaN, kDirectWeightGroups * kMmaK, true, 128>;
-
-struct alignas(128) direct_weight_layout {
-    CUtensorMap tensor_map;
-};
-
-struct RoutedLayouts {
-    direct_weight_layout w1;
-    direct_weight_layout w3;
-    direct_weight_layout w2;
-};
-
-static __host__ inline direct_weight_layout direct_weight_layout_for(
-    const std::uint8_t *pointer,
-    const int rows,
-    const int packed_columns
-) {
-    static_assert(kDirectWeightGroups * kMmaK == 128);
-    TORCH_CHECK(
-        reinterpret_cast<std::uintptr_t>(pointer)
-                % kDirectWeightAlignment
-            == 0,
-        "MoK: direct Kimi K3 weight TMA requires a ",
-        kDirectWeightAlignment, "-byte-aligned packed weight");
-    TORCH_CHECK(rows % kMmaN == 0);
-    TORCH_CHECK(
-        (2 * packed_columns) % (kDirectWeightGroups * kMmaK) == 0);
-
-    direct_weight_layout layout{};
-    const std::uint64_t global_dimensions[5] = {
-        kDirectWeightGroups * kMmaK,
-        static_cast<std::uint64_t>(rows),
-        static_cast<std::uint64_t>(
-            2 * packed_columns / (kDirectWeightGroups * kMmaK)),
-        1,
-        kNumExperts,
-    };
-    const std::uint64_t global_strides[4] = {
-        static_cast<std::uint64_t>(packed_columns),
-        kDirectWeightGroups * kMmaK / 2,
-        static_cast<std::uint64_t>(rows) * packed_columns,
-        static_cast<std::uint64_t>(rows) * packed_columns,
-    };
-    const std::uint32_t box_dimensions[5] = {
-        kDirectWeightGroups * kMmaK,
-        kMmaN,
-        1,
-        1,
-        1,
-    };
-    const std::uint32_t element_strides[5] = {1, 1, 1, 1, 1};
-    const CUresult result = cuTensorMapEncodeTiled(
-        &layout.tensor_map,
-        CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B,
-        5,
-        const_cast<std::uint8_t *>(pointer),
-        global_dimensions,
-        global_strides,
-        box_dimensions,
-        element_strides,
-        CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CU_TENSOR_MAP_SWIZZLE_128B,
-        CU_TENSOR_MAP_L2_PROMOTION_NONE,
-        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-    const char *error = nullptr;
-    if (result != CUDA_SUCCESS) {
-        cuGetErrorString(result, &error);
-    }
-    TORCH_CHECK(
-        result == CUDA_SUCCESS,
-        "MoK: failed to encode direct Kimi K3 weight tensor map: ",
-        error == nullptr ? "unknown CUDA driver error" : error);
-    return layout;
-}
-
-static __host__ inline RoutedLayouts routed_layouts(
-    const std::uint8_t *w1,
-    const std::uint8_t *w3,
-    const std::uint8_t *w2
-) {
-    return RoutedLayouts{
-        direct_weight_layout_for(
-            w1, kExpertW1W3PackedRows, kExpertW1W3PackedColumns),
-        direct_weight_layout_for(
-            w3, kExpertW1W3PackedRows, kExpertW1W3PackedColumns),
-        direct_weight_layout_for(
-            w2, kExpertW2PackedRows, kExpertW2PackedColumns),
-    };
-}
 
 __device__ __forceinline__ float decode_route_weight(
     const Scratch &scratch,
@@ -258,111 +154,18 @@ __device__ __forceinline__ void stage_activation_row(
     *atom_of(tile, row, 1) = *reinterpret_cast<const uint4 *>(source + 16);
 }
 
-/// Load one four-K32 stage into its final 128-byte-swizzled MMA layout.
-__device__ __forceinline__ void load_direct_weight_stage(
-    direct_weight_stage &destination,
-    const direct_weight_layout &layout,
-    const int expert,
-    const int output_tile,
-    const int round,
-    kittens::semaphore &arrived
+/// Stage one MXFP4 weight row: sixteen packed bytes, eight per atom.
+///
+/// `16U4_ALIGN16B` puts sixteen packed U4 values at the front of each atom and
+/// the MMA never reads the rest, so each atom is written whole -- eight source
+/// bytes and eight zeros -- and the tile needs no separate clearing pass.
+__device__ __forceinline__ void stage_weight_row(
+    mixed_operand_tile &tile,
+    const int row,
+    const uint4 payload
 ) {
-    const std::uint64_t tensor_map =
-        reinterpret_cast<std::uint64_t>(&layout.tensor_map);
-    const std::uint32_t barrier =
-        static_cast<std::uint32_t>(__cvta_generic_to_shared(&arrived));
-    const std::uint32_t destination_shared =
-        static_cast<std::uint32_t>(
-            __cvta_generic_to_shared(&destination));
-    asm volatile(
-        "cp.async.bulk.tensor.5d.shared::cluster.global.tile"
-        ".mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%3, %4, %5, %6, %7}], [%2];"
-        :
-        : "r"(destination_shared),
-          "l"(tensor_map),
-          "r"(barrier),
-          "n"(0),
-          "r"(output_tile * kMmaN),
-          "r"(round),
-          "n"(0),
-          "r"(expert)
-        : "memory");
-}
-
-/// Prime or advance the two-stage gate/up weight pipeline.
-__device__ __forceinline__ void issue_direct_weight_round(
-    direct_weight_stage (&first)[kWeightPipelineStages],
-    direct_weight_stage (&second)[kWeightPipelineStages],
-    const direct_weight_layout &first_layout,
-    const direct_weight_layout &second_layout,
-    const int expert,
-    const int output_tile,
-    const int round,
-    const int stage,
-    kittens::semaphore &arrived
-) {
-    if (threadIdx.x != 0) return;
-    kittens::tma::expect_bytes(
-        arrived, 2 * kDirectWeightTransactionBytes);
-    load_direct_weight_stage(
-        first[stage], first_layout, expert, output_tile, round, arrived);
-    load_direct_weight_stage(
-        second[stage], second_layout, expert, output_tile, round, arrived);
-}
-
-/// Prime or advance the two-stage down-projection weight pipeline.
-__device__ __forceinline__ void issue_direct_weight_round(
-    direct_weight_stage (&weight)[kWeightPipelineStages],
-    const direct_weight_layout &layout,
-    const int expert,
-    const int output_tile,
-    const int round,
-    const int stage,
-    kittens::semaphore &arrived
-) {
-    if (threadIdx.x != 0) return;
-    kittens::tma::expect_bytes(arrived, kDirectWeightTransactionBytes);
-    load_direct_weight_stage(
-        weight[stage], layout, expert, output_tile, round, arrived);
-}
-
-/// Contract one K32 chunk from a direct 128-byte-swizzled weight stage.
-__device__ __forceinline__ void mixed_mma_direct(
-    const mixed_accumulator_tile &destination,
-    const mixed_operand_tile &activation,
-    const direct_weight_stage &weight,
-    const int chunk,
-    const kittens::full_tt_fp8e8m0<16> &activation_scale,
-    const kittens::full_tt_fp8e8m0<16> &weight_scale,
-    const int scale_factor_id,
-    const bool accumulate
-) {
-    kittens::st_descriptor<
-        mixed_operand_tile, kittens::transpose::N> activation_descriptor(
-            activation);
-    kittens::st_descriptor<
-        direct_weight_stage, kittens::transpose::N> weight_descriptor(weight);
-    const std::uint64_t weight_chunk =
-        weight_descriptor.chunk_descriptor(chunk);
-    const std::uint32_t instruction =
-        mixed_instruction_descriptor(scale_factor_id);
-    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-    asm volatile(
-        "{\n\t"
-        ".reg .pred p;\n\t"
-        "setp.eq.u32 p, 1, %6;\n\t"
-        "tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X "
-        "[%0], %1, %2, %3, [%4], [%5], p;\n\t"
-        "}\n"
-        :
-        : "r"(destination.addr),
-          "l"(activation_descriptor.base_desc),
-          "l"(weight_chunk),
-          "r"(instruction),
-          "r"(activation_scale.addr),
-          "r"(weight_scale.addr),
-          "r"(accumulate ? 1u : 0u));
+    *atom_of(tile, row, 0) = make_uint4(payload.x, payload.y, 0u, 0u);
+    *atom_of(tile, row, 1) = make_uint4(payload.z, payload.w, 0u, 0u);
 }
 
 __device__ __forceinline__ void store_accumulator(
@@ -500,24 +303,40 @@ __device__ __forceinline__ void accumulate_down_tile(
 // ---------------------------------------------------------------------------
 // K-group rounds.
 //
-// One round is the tensor map's minimum 128-U4 box: four contiguous K32
-// groups. The two shared stages alternate, so the next round's direct TMA can
-// run while the current stage is consumed. Scales use the same four-group
-// width and remain one contiguous word per row.
+// A unit stages a whole round of K groups, issues every one of the round's
+// contractions, and waits once. Three things follow from that and all three
+// are why it is done this way.
+//
+// The round's global reads of one weight row are contiguous: K group `g` reads
+// packed bytes `[16g, 16g + 16)` of the row, so eight groups is one 128-byte
+// span and twelve is a whole 192-byte W2 row. Its scale reads are contiguous
+// for the same reason, which turns what was one strided byte per group into
+// one vector for the round.
+//
+// The round's reads are also all in flight at once. Sixteen bytes per group
+// per row is one vector register, so a thread issues the round's loads back to
+// back before it consumes any of them, and the memory system sees the whole
+// round's parallelism rather than one group's.
+//
+// And the round amortizes synchronization. The measured profile of the
+// unbatched loop spent 15% of the decode step inside barriers, six per K
+// group; a round costs two whatever its width.
 // ---------------------------------------------------------------------------
 
-/// K groups one direct-TMA gate/up round stages.
-inline constexpr int kGateUpRoundGroups = kDirectWeightGroups;
+/// K groups one gate/up round stages. 112 latent groups is fourteen rounds.
+inline constexpr int kGateUpRoundGroups = 8;
 inline constexpr int kGateUpRounds = kLatentGroups / kGateUpRoundGroups;
 
-/// K groups one direct-TMA down round stages.
-inline constexpr int kDownRoundGroups = kDirectWeightGroups;
+/// K groups one down round stages, which is every group the SiTU width has.
+inline constexpr int kDownRoundGroups = kSituGroups;
 inline constexpr int kDownRounds = kSituGroups / kDownRoundGroups;
 
 static_assert(kLatentGroups % kGateUpRoundGroups == 0);
-static_assert(kSituGroups % kDownRoundGroups == 0);
-static_assert(kGateUpRounds == 28);
-static_assert(kDownRounds == 3);
+static_assert(kGateUpRounds == 14);
+static_assert(kDownRounds == 1);
+
+// A round's weight staging is exactly one row of one operand tile per thread.
+static_assert(2 * kMmaN == kDecodeCtaThreads);
 
 /// Scale tiles a round stages, one per quad of K groups.
 ///
@@ -532,8 +351,8 @@ inline constexpr int kDownScaleTiles = kDownRoundGroups / kScaleGroupsPerTile;
 
 static_assert(kGateUpRoundGroups % kScaleGroupsPerTile == 0);
 static_assert(kDownRoundGroups % kScaleGroupsPerTile == 0);
-static_assert(kGateUpScaleTiles == 1);
-static_assert(kDownScaleTiles == 1);
+static_assert(kGateUpScaleTiles == 2);
+static_assert(kDownScaleTiles == 3);
 
 /// First tensor-memory column the routed scale factors occupy.
 ///
@@ -552,9 +371,6 @@ static_assert(kRoutedScaleColumnBase
               <= kittens::tensor_allocator<1, 1>::cols);
 
 static_assert(sizeof(mixed_operand_tile) == 4096);
-static_assert(sizeof(direct_weight_stage) == 16384);
-static_assert(2 * kDirectWeightTransactionBytes
-              == static_cast<int>(sizeof(direct_weight_stage)));
 static_assert(sizeof(mixed_scale_tile) == 512);
 static_assert(sizeof(mixed_result_tile) == 65536);
 
@@ -586,13 +402,9 @@ __host__ __device__ constexpr int staging_bytes(
 }
 
 inline constexpr int kGateUpStagingBytes =
-    staging_bytes(1, kGateUpRoundGroups, 3, kGateUpScaleTiles)
-    + 2 * kWeightPipelineStages
-        * static_cast<int>(sizeof(direct_weight_stage));
+    staging_bytes(3, kGateUpRoundGroups, 3, kGateUpScaleTiles);
 inline constexpr int kDownStagingBytes =
-    staging_bytes(1, kDownRoundGroups, 2, kDownScaleTiles)
-    + kWeightPipelineStages
-        * static_cast<int>(sizeof(direct_weight_stage));
+    staging_bytes(2, kDownRoundGroups, 2, kDownScaleTiles);
 
 /// Shared bytes one gate/up unit holds, which is the widest of any K3 stage.
 ///
@@ -610,10 +422,10 @@ inline constexpr int kDownUnitSharedBytes =
         ? kDownStagingBytes
         : static_cast<int>(sizeof(mixed_result_tile));
 
-static_assert(kGateUpStagingBytes == 84992);
-static_assert(kDownStagingBytes == 51200);
+static_assert(kGateUpStagingBytes == 101376);
+static_assert(kDownStagingBytes == 102400);
 static_assert(kGateUpUnitSharedBytes == 131072);
-static_assert(kDownUnitSharedBytes == 65536);
+static_assert(kDownUnitSharedBytes == 102400);
 
 }  // namespace expert_mxfp4
 }  // namespace kimi_k3_decode
