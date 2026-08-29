@@ -131,6 +131,7 @@ def _scratch_layout() -> dict[str, tuple[int, int]]:
         ("tail_shared_shard", MAX_TOKENS * SHARD * 2),
         ("latent_x", MAX_TOKENS * LATENT * 2),
         ("unit_expert", 896 * 4),
+        ("router_scores", MAX_TOKENS * 896 * 4),
     )
     layout: dict[str, tuple[int, int]] = {}
     cursor = 0

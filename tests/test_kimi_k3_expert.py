@@ -72,6 +72,7 @@ def _scratch_layout() -> dict[str, tuple[int, int]]:
         ("tail_shared_shard", MAX_TOKENS * 896 * 2),
         ("latent_x", MAX_TOKENS * HIDDEN * 2),
         ("unit_expert", EXPERTS * 4),
+        ("router_scores", MAX_TOKENS * EXPERTS * 4),
     )
     layout: dict[str, tuple[int, int]] = {}
     cursor = 0
@@ -431,7 +432,7 @@ def test_workspace_bytes_matches_extended_expert_scratch(
 ) -> None:
     from mok import _C
 
-    assert SCRATCH_BYTES == 5_817_344
+    assert SCRATCH_BYTES == 6_276_096
     assert _C.kimi_k3_decode_workspace_bytes() == SCRATCH_BYTES
     for name, (offset, _) in SCRATCH_LAYOUT.items():
         if name != "total_bytes":

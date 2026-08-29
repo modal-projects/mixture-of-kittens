@@ -184,36 +184,42 @@ static __device__ void build_expert_units(
     if (lane == 31) scratch.phase[kActiveExpertUnits] = inclusive;
 }
 
-/// Score all 896 experts for one token and publish its top-16 routes.
+/// Experts one scoring unit contracts, and the units one token is split into.
 ///
-/// `expert_ids_out` and `expert_weights_out` are the private stage's returned
-/// tensors; the persistent kernel has none and passes null.
-static __device__ void score_token(
+/// Scoring a token reads all 896 expert rows of the router weight: 12.8 MB,
+/// which a single CTA streams at only tens of GB/s. The measured decode
+/// profile put 546 us of a 1.39 ms step inside one such CTA while the rest of
+/// the grid waited at a barrier, so a token's experts are dealt out to eight
+/// units instead. Eight warps and 112 experts a unit divide evenly, and eight
+/// units a token fills the 148-CTA grid from two tokens up.
+inline constexpr int kScoreShards = 8;
+inline constexpr int kScoreShardExperts = kNumExperts / kScoreShards;
+
+static_assert(kNumExperts % kScoreShards == 0);
+static_assert(kScoreShardExperts % kWarps == 0,
+              "a shard's experts must divide evenly across its warps");
+
+/// Contract one shard of one token's expert scores into the scratch table.
+///
+/// The arithmetic is exactly what a whole-token scoring does: the same octet
+/// accumulation in the same order over the same row, and the same sigmoid.
+/// Only which CTA runs it, and where the result lands, differ.
+static __device__ void score_shard(
     std::uint8_t *__restrict__ shared,
     const __nv_bfloat16 *__restrict__ hidden_states,
     const __nv_bfloat16 *__restrict__ router_weight,
-    const float *__restrict__ router_correction_bias,
     const Scratch &scratch,
-    int *__restrict__ expert_ids_out,
-    float *__restrict__ expert_weights_out,
-    const int token
+    const int token,
+    const int shard
 ) {
     __nv_bfloat16 *const hidden =
         reinterpret_cast<__nv_bfloat16 *>(shared + kHiddenBytes);
-    float *const raw_scores = reinterpret_cast<float *>(shared + kRawScoreBytes);
-    unsigned long long *const keys =
-        reinterpret_cast<unsigned long long *>(shared + kKeyBytes);
-    int *const selected_ids = reinterpret_cast<int *>(shared + kSelectedIdBytes);
-    float *const selected_weights =
-        reinterpret_cast<float *>(shared + kSelectedWeightBytes);
-    unsigned long long *const best_key =
-        reinterpret_cast<unsigned long long *>(shared + kBestKeyBytes);
 
     const int thread = static_cast<int>(threadIdx.x);
     const int warp = thread / 32;
     const int lane = thread % 32;
 
-    // Stage the token's row once; all 896 expert rows then stream past it.
+    // Stage the token's row once; the shard's expert rows then stream past it.
     const __nv_bfloat16 *const hidden_row =
         hidden_states + static_cast<long long>(token) * kHiddenSize;
     for (int i = thread * 8; i < kHiddenSize; i += kDecodeCtaThreads * 8) {
@@ -222,8 +228,14 @@ static __device__ void score_token(
     }
     __syncthreads();
 
+    const int shard_begin = shard * kScoreShardExperts;
+    float *const scores =
+        scratch.router_scores + static_cast<long long>(token) * kNumExperts;
+
     // One warp per expert keeps every 14 KB weight row read fully coalesced.
-    for (int expert = warp; expert < kNumExperts; expert += kWarps) {
+    for (int expert = shard_begin + warp;
+         expert < shard_begin + kScoreShardExperts;
+         expert += kWarps) {
         const __nv_bfloat16 *const weight_row =
             router_weight + static_cast<long long>(expert) * kHiddenSize;
         float logit = 0.0f;
@@ -237,12 +249,42 @@ static __device__ void score_token(
         for (int offset = 16; offset > 0; offset >>= 1) {
             logit += __shfl_down_sync(0xffffffffu, logit, offset);
         }
-        if (lane == 0) {
-            const float score = router_sigmoid(logit);
-            raw_scores[expert] = score;
-            keys[expert] =
-                selection_key(score + router_correction_bias[expert], expert);
-        }
+        if (lane == 0) scores[expert] = router_sigmoid(logit);
+    }
+}
+
+/// Pick one token's top-16 routes out of the scores the shards contracted.
+///
+/// `expert_ids_out` and `expert_weights_out` are the private stage's returned
+/// tensors; the persistent kernel has none and passes null.
+static __device__ void select_token(
+    std::uint8_t *__restrict__ shared,
+    const float *__restrict__ router_correction_bias,
+    const Scratch &scratch,
+    int *__restrict__ expert_ids_out,
+    float *__restrict__ expert_weights_out,
+    const int token
+) {
+    float *const raw_scores = reinterpret_cast<float *>(shared + kRawScoreBytes);
+    unsigned long long *const keys =
+        reinterpret_cast<unsigned long long *>(shared + kKeyBytes);
+    int *const selected_ids = reinterpret_cast<int *>(shared + kSelectedIdBytes);
+    float *const selected_weights =
+        reinterpret_cast<float *>(shared + kSelectedWeightBytes);
+    unsigned long long *const best_key =
+        reinterpret_cast<unsigned long long *>(shared + kBestKeyBytes);
+
+    const int thread = static_cast<int>(threadIdx.x);
+    const float *const scores =
+        scratch.router_scores + static_cast<long long>(token) * kNumExperts;
+
+    // Peer CTAs contracted most of these shards, so read past L1.
+    for (int expert = thread; expert < kNumExperts;
+         expert += kDecodeCtaThreads) {
+        const float score = __ldcg(&scores[expert]);
+        raw_scores[expert] = score;
+        keys[expert] =
+            selection_key(score + router_correction_bias[expert], expert);
     }
     __syncthreads();
 
@@ -285,6 +327,31 @@ static __device__ void score_token(
         scratch.expert_ids[route] = selected_ids[thread];
         scratch.expert_weights[route] = selected_weights[thread];
     }
+}
+
+/// Score all 896 experts for one token and publish its top-16 routes.
+///
+/// One CTA running every shard is what the staged stage and the private
+/// route-and-project entrypoint want; the persistent kernel spreads the shards
+/// over the grid and calls the two halves itself.
+static __device__ void score_token(
+    std::uint8_t *__restrict__ shared,
+    const __nv_bfloat16 *__restrict__ hidden_states,
+    const __nv_bfloat16 *__restrict__ router_weight,
+    const float *__restrict__ router_correction_bias,
+    const Scratch &scratch,
+    int *__restrict__ expert_ids_out,
+    float *__restrict__ expert_weights_out,
+    const int token
+) {
+    for (int shard = 0; shard < kScoreShards; ++shard) {
+        score_shard(shared, hidden_states, router_weight, scratch, token,
+                    shard);
+    }
+    __threadfence();
+    __syncthreads();
+    select_token(shared, router_correction_bias, scratch, expert_ids_out,
+                 expert_weights_out, token);
 }
 
 /// Score one token, then, on the last arriving CTA, publish the expert-major

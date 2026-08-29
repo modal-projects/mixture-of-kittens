@@ -80,6 +80,7 @@ def _scratch_layout() -> dict[str, tuple[int, int]]:
         ("tail_shared_shard", KIMI_K3_MAX_TOKENS * 896 // 2),
         ("latent_x", KIMI_K3_MAX_TOKENS * KIMI_K3_LATENT_SIZE // 2),
         ("unit_expert", KIMI_K3_NUM_EXPERTS),
+        ("router_scores", KIMI_K3_MAX_TOKENS * KIMI_K3_NUM_EXPERTS),
     )
     layout: dict[str, tuple[int, int]] = {}
     cursor = 0
@@ -309,7 +310,7 @@ def test_workspace_bytes_matches_the_documented_scratch_layout(
 ) -> None:
     from mok import _C
 
-    assert SCRATCH_BYTES == 5_817_344
+    assert SCRATCH_BYTES == 6_276_096
     assert _C.kimi_k3_decode_workspace_bytes() == SCRATCH_BYTES
     assert SCRATCH_LAYOUT["phase"][0] == 0
     assert SCRATCH_LAYOUT["expert_ids"][0] * 4 % SCRATCH_ALIGNMENT == 0

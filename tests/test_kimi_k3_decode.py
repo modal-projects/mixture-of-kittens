@@ -82,6 +82,7 @@ from .kimi_k3_tail_support import _prime_barrier_serial, _rotating_skew
 # that a silent retiling is caught here rather than only by a slow test.
 CORE_PROJECTION_UNITS = 112       # skinny_gemm::kCoreCtas
 TENSOR_PROJECTION_UNITS = 28      # skinny_gemm::kTensorCtas
+SCORE_SHARDS = 8                  # router::kScoreShards
 GATE_UP_TILES = 3                 # expert_mxfp4::kGateUpTiles
 DOWN_TILES = 28                   # expert_mxfp4::kDownTiles
 CORE_SHARED_GATE_UNITS = 24       # shared_experts::kCoreGateCtas
@@ -531,7 +532,7 @@ def test_the_task_plan_covers_every_logical_task_of_the_step(
         tokens
     )
     assert grid == PERSISTENT_CTAS
-    assert route_latent == tokens + (
+    assert route_latent == tokens * SCORE_SHARDS + (
         TENSOR_PROJECTION_UNITS if tensor_path else CORE_PROJECTION_UNITS
     )
     assert gate_up == (
@@ -655,7 +656,7 @@ def test_the_launch_is_correct_across_the_unsigned_serial_wrap(
 ) -> None:
     """Both wrap-safe counters are parked just below 2^32 and pushed over it.
 
-    The grid phase generation advances six times per launch and the cross-rank
+    The grid phase generation advances seven times per launch and the cross-rank
     barrier serial once, and both are compared with unsigned difference rather
     than ordering. Starting them three short of the wrap makes this one launch
     cross it, which a naive ``>=`` comparison could not survive.
@@ -672,8 +673,8 @@ def test_the_launch_is_correct_across_the_unsigned_serial_wrap(
     actual = _decode(workspace, weights, hidden)
     torch.cuda.synchronize(device)
     assert_decode_close(actual, expected)
-    # Six barriers from three short of the wrap lands three past it.
-    assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 3
+    # Seven barriers from three short of the wrap lands four past it.
+    assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 4
     assert_identical_across_ranks(actual)
 
 

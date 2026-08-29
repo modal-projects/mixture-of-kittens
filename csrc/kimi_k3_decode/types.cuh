@@ -114,9 +114,16 @@ inline constexpr int kUnitExpertBytes =
     kLatentXBytes
     + scratch_byte_region_bytes(
         kMaxTokens * kLatentSize * sizeof(__nv_bfloat16));
+// Every token's raw router score for every expert. Scoring a token reads the
+// whole 12.8 MB router weight, which is far more than one CTA can stream in
+// the time the rest of a decode step takes, so the persistent kernel splits a
+// token's experts over many CTAs and lands their scores here. Selection then
+// reads this back and picks the top sixteen with nothing left to contract.
+inline constexpr int kRouterScoreBytes =
+    kUnitExpertBytes + scratch_region_bytes(kNumExperts);
 
 static constexpr int SCRATCH_BYTES =
-    kUnitExpertBytes + scratch_region_bytes(kNumExperts);
+    kRouterScoreBytes + scratch_region_bytes(kMaxTokens * kNumExperts);
 
 static_assert(kLatentMxfp8Bytes == 40448);
 static_assert(kLatentScaleBytes == 499200);
@@ -130,7 +137,8 @@ static_assert(kTailNormalizedBytes == 3749376);
 static_assert(kTailSharedShardBytes == 4666880);
 static_assert(kLatentXBytes == 4896256);
 static_assert(kUnitExpertBytes == 5813760);
-static_assert(SCRATCH_BYTES == 5817344);
+static_assert(kRouterScoreBytes == 5817344);
+static_assert(SCRATCH_BYTES == 6276096);
 
 // Generation-tagged completion counters. Each role's last CTA clears its arrival
 // counter and bumps its generation, so a reused workspace never needs a host reset.
@@ -331,6 +339,7 @@ struct Scratch {
     __nv_bfloat16 *tail_shared_shard;
     __nv_bfloat16 *latent_x;
     int *unit_expert;
+    float *router_scores;
 };
 
 __host__ __device__ inline Scratch scratch_view(std::uint8_t *base) {
@@ -354,6 +363,7 @@ __host__ __device__ inline Scratch scratch_view(std::uint8_t *base) {
         reinterpret_cast<__nv_bfloat16 *>(base + kTailSharedShardBytes),
         reinterpret_cast<__nv_bfloat16 *>(base + kLatentXBytes),
         reinterpret_cast<int *>(base + kUnitExpertBytes),
+        reinterpret_cast<float *>(base + kRouterScoreBytes),
     };
 }
 

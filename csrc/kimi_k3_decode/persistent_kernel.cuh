@@ -129,7 +129,7 @@ inline constexpr TaskPlan task_plan(const int active_tokens) {
     const int experts = kTopK * active_tokens < kNumExperts
         ? kTopK * active_tokens : kNumExperts;
     return TaskPlan{
-        active_tokens
+        active_tokens * router::kScoreShards
             + (tensor_path ? skinny_gemm::kTensorCtas : skinny_gemm::kCoreCtas),
         (tensor_path ? 2 * shared_experts::kTensorGateCtas
                      : shared_experts::kCoreGateCtas)
@@ -419,21 +419,28 @@ void kimi_k3_decode_persistent_kernel(
     mark = clocks.lap(kClockGridBarrier, mark);
 
     // -----------------------------------------------------------------------
-    // Phase 1: score every token and project the routed latent.
+    // Phase 1: contract every token's expert scores and project the routed
+    // latent.
+    //
+    // A token's 896 scores are eight units rather than one. Scoring a token
+    // reads the whole 12.8 MB router weight, and a single CTA streams that at
+    // tens of GB/s: the measured profile of the one-unit-per-token layout put
+    // 546 us of a 1.39 ms step inside one CTA while the other 132 waited at
+    // the barrier below.
     // -----------------------------------------------------------------------
     {
         constexpr int projection_units =
             TENSOR_PATH ? skinny_gemm::kTensorCtas : skinny_gemm::kCoreCtas;
-        const int units = active_tokens + projection_units;
+        const int score_units = active_tokens * router::kScoreShards;
+        const int units = score_units + projection_units;
         int unit;
         while ((unit = claim_unit(
                     scratch, kRouteLatentQueue, units, &claim_slot)) >= 0) {
-            if (unit < active_tokens) {
-                // The persistent path has no returned router tensors: every
-                // consumer reads the routes straight out of scratch.
-                router::score_token(
-                    shared, hidden_states, router_weight,
-                    router_correction_bias, scratch, nullptr, nullptr, unit);
+            if (unit < score_units) {
+                router::score_shard(
+                    shared, hidden_states, router_weight, scratch,
+                    unit / router::kScoreShards,
+                    unit % router::kScoreShards);
                 __syncthreads();
                 mark = clocks.lap(kClockRouterScore, mark);
                 continue;
@@ -441,12 +448,12 @@ void kimi_k3_decode_persistent_kernel(
             if constexpr (TENSOR_PATH) {
                 skinny_gemm::latent_down_tcgen05(
                     shared_raw, tensor_pool, layouts.hidden,
-                    layouts.latent_down, layouts.latent, unit - active_tokens);
+                    layouts.latent_down, layouts.latent, unit - score_units);
             } else {
                 // Row guards inside make one capacity cover every core bucket.
                 skinny_gemm::latent_down_cuda_core<kMaxCoreCapacity>(
                     shared, hidden_states, routed_expert_down_proj,
-                    scratch.latent_x, unit - active_tokens, active_tokens);
+                    scratch.latent_x, unit - score_units, active_tokens);
             }
             __syncthreads();
             mark = clocks.lap(kClockLatentProject, mark);
@@ -456,11 +463,36 @@ void kimi_k3_decode_persistent_kernel(
     mark = clocks.lap(kClockGridBarrier, mark);
 
     // -----------------------------------------------------------------------
-    // Phase 2: build the assignment table while the grid quantizes the latent.
+    // Phase 2: select every token's top-16 while the grid quantizes the
+    // latent.
+    //
+    // Selection is one pass over 896 contracted scores, and a decode step
+    // never has more tokens than the grid has CTAs, so the tokens are dealt
+    // out by block index rather than through a queue. The quantization is
+    // independent of selection and covers the whole grid.
+    // -----------------------------------------------------------------------
+    if (block < active_tokens) {
+        // The persistent path has no returned router tensors: every consumer
+        // reads the routes straight out of scratch.
+        router::select_token(
+            shared, router_correction_bias, scratch, nullptr, nullptr, block);
+        __syncthreads();
+        mark = clocks.lap(kClockRouterScore, mark);
+    }
+    expert_mxfp4::quantize_latent_rows(
+        scratch.latent_x, scratch, active_tokens, block, grid_ctas);
+    __syncthreads();
+    mark = clocks.lap(kClockLatentQuantize, mark);
+    grid_barrier(scratch, error_flag, grid, grid_ctas);
+    mark = clocks.lap(kClockGridBarrier, mark);
+
+    // -----------------------------------------------------------------------
+    // Phase 2b: build the expert-major assignment table.
     //
     // The table is a single-CTA histogram and scan over every token's routes,
-    // so it cannot be split; the quantization is independent of it and covers
-    // the rest of the grid.
+    // so it cannot be split, and it can only start once every token has
+    // selected. It is small -- at most 2 048 routes -- and the barrier that
+    // follows is what publishes it to the routed workers.
     // -----------------------------------------------------------------------
     if (block == 0) {
         router::build_assignments(shared, scratch, active_tokens);
@@ -468,12 +500,6 @@ void kimi_k3_decode_persistent_kernel(
         router::build_expert_units(shared, scratch);
         __syncthreads();
         mark = clocks.lap(kClockAssignments, mark);
-    } else {
-        expert_mxfp4::quantize_latent_rows(
-            scratch.latent_x, scratch, active_tokens, block - 1,
-            grid_ctas - 1);
-        __syncthreads();
-        mark = clocks.lap(kClockLatentQuantize, mark);
     }
     grid_barrier(scratch, error_flag, grid, grid_ctas);
     mark = clocks.lap(kClockGridBarrier, mark);
