@@ -20,6 +20,7 @@ import json
 import math
 import os
 import tempfile
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
@@ -657,14 +658,88 @@ def assert_identical_across_ranks(values: torch.Tensor) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _append_profiler_debug(
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: dict[str, object],
+) -> None:
+    with open("/opt/cursor/logs/debug.log", "a", encoding="utf-8") as debug_file:
+        debug_file.write(
+            json.dumps(
+                {
+                    "hypothesisId": hypothesis_id,
+                    "location": location,
+                    "message": message,
+                    "data": data,
+                    "timestamp": time.time_ns() // 1_000_000,
+                }
+            )
+            + "\n"
+        )
+
+
 def profiled_kernel_names(call: Callable[[], object]) -> list[str]:
     """Names of every CUDA kernel the profiler attributes to ``call()``."""
+    rank = int(os.environ.get("RANK", "-1"))
     torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    # region agent log
+    _append_profiler_debug(
+        "A,C",
+        "tests/kimi_k3_decode_support.py:profile_entry",
+        "profiler boundary entered",
+        {
+            "rank": rank,
+            "current_device": torch.cuda.current_device(),
+            "current_stream": torch.cuda.current_stream().cuda_stream,
+        },
+    )
+    # endregion
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CUDA]
     ) as profiler:
-        call()
+        start.record()
+        result = call()
+        end.record()
         torch.cuda.synchronize()
+    # region agent log
+    _append_profiler_debug(
+        "C,D",
+        "tests/kimi_k3_decode_support.py:profile_call_complete",
+        "profiled call and stream work completed",
+        {
+            "rank": rank,
+            "elapsed_ms": start.elapsed_time(end),
+            "result_type": type(result).__name__,
+            "result_device": str(getattr(result, "device", None)),
+            "result_data_ptr": (
+                result.data_ptr() if isinstance(result, torch.Tensor) else None
+            ),
+        },
+    )
+    # endregion
+    profiler_events = list(profiler.events())
+    # region agent log
+    _append_profiler_debug(
+        "A,B",
+        "tests/kimi_k3_decode_support.py:profiler_events",
+        "in-memory profiler events collected",
+        {
+            "rank": rank,
+            "event_count": len(profiler_events),
+            "events": [
+                {
+                    "name": event.name,
+                    "device_type": str(event.device_type),
+                    "device_index": event.device_index,
+                }
+                for event in profiler_events[:8]
+            ],
+        },
+    )
+    # endregion
     with tempfile.TemporaryDirectory() as directory:
         # ``export_chrome_trace`` renames a temporary file into place, so the
         # trace has to be reopened by path once the export has returned.
@@ -672,11 +747,29 @@ def profiled_kernel_names(call: Callable[[], object]) -> list[str]:
         profiler.export_chrome_trace(trace_path)
         with open(trace_path, encoding="utf-8") as trace_file:
             trace = json.load(trace_file)
-    return [
+    names = [
         event["name"]
         for event in trace["traceEvents"]
         if event.get("cat") == "kernel"
     ]
+    trace_categories: dict[str, int] = {}
+    for event in trace["traceEvents"]:
+        category = str(event.get("cat"))
+        trace_categories[category] = trace_categories.get(category, 0) + 1
+    # region agent log
+    _append_profiler_debug(
+        "A,B,D",
+        "tests/kimi_k3_decode_support.py:trace_export",
+        "Chrome trace exported and parsed",
+        {
+            "rank": rank,
+            "trace_event_count": len(trace["traceEvents"]),
+            "categories": trace_categories,
+            "kernel_names": names,
+        },
+    )
+    # endregion
+    return names
 
 
 def published_shared_partial(
