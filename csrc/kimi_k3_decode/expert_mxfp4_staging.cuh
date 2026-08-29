@@ -291,9 +291,10 @@ __device__ __forceinline__ void load_direct_weight_stage(
 }
 
 /// Prime or advance the two-stage gate/up weight pipeline.
+template<int STAGES>
 __device__ __forceinline__ void issue_direct_weight_round(
-    direct_weight_stage (&first)[kWeightPipelineStages],
-    direct_weight_stage (&second)[kWeightPipelineStages],
+    direct_weight_stage (&first)[STAGES],
+    direct_weight_stage (&second)[STAGES],
     const direct_weight_layout &first_layout,
     const direct_weight_layout &second_layout,
     const int expert,
@@ -302,6 +303,7 @@ __device__ __forceinline__ void issue_direct_weight_round(
     const int stage,
     kittens::semaphore &arrived
 ) {
+    static_assert(STAGES == 1 || STAGES == kWeightPipelineStages);
     if (threadIdx.x != 0) return;
     kittens::tma::expect_bytes(
         arrived, 2 * kDirectWeightTransactionBytes);
@@ -312,8 +314,9 @@ __device__ __forceinline__ void issue_direct_weight_round(
 }
 
 /// Prime or advance the two-stage down-projection weight pipeline.
+template<int STAGES>
 __device__ __forceinline__ void issue_direct_weight_round(
-    direct_weight_stage (&weight)[kWeightPipelineStages],
+    direct_weight_stage (&weight)[STAGES],
     const direct_weight_layout &layout,
     const int expert,
     const int output_tile,
@@ -321,6 +324,7 @@ __device__ __forceinline__ void issue_direct_weight_round(
     const int stage,
     kittens::semaphore &arrived
 ) {
+    static_assert(STAGES == 1 || STAGES == kWeightPipelineStages);
     if (threadIdx.x != 0) return;
     kittens::tma::expect_bytes(arrived, kDirectWeightTransactionBytes);
     load_direct_weight_stage(
