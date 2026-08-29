@@ -187,18 +187,23 @@ def test_gate_up_benchmark_measures_all_priority_shapes_and_widths() -> None:
     assert '"candidate_status": "benchmark_only"' in benchmark
 
 
-def test_gate_up_down_pipeline_is_a_guarded_benchmark_instantiation() -> None:
-    """Remove one phase barrier only behind a compile-time benchmark flag."""
+def test_gate_up_down_pipeline_is_the_production_instantiation() -> None:
+    """Ship dependency readiness while retaining baseline only for measurement."""
     persistent = _source("persistent_kernel.cuh")
     kernel = _function_body(
         persistent,
         "void kimi_k3_decode_persistent_kernel(",
+    )
+    selection = _function_body(
+        persistent,
+        "bool benchmark_gate_up_down_pipeline(",
     )
     launch = _function_body(persistent, "void launch_decode(")
 
     assert "MOK_KIMI_K3_ENABLE_GATE_UP_DOWN_PIPELINE" in persistent
     assert "set_benchmark_gate_up_down_pipeline_for_testing(" in persistent
     assert "benchmark_gate_up_down_pipeline()" in persistent
+    assert "return true;" in selection
     assert (
         "template<bool TENSOR_PATH, int GATE_UP_GROUP_SIZE, "
         "bool PIPELINE_GATE_UP_DOWN>"
