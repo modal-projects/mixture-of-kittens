@@ -340,6 +340,7 @@ def _replay_samples(
     *,
     warmup_count: int,
     sample_count: int,
+    settle_count: int,
 ) -> list[float]:
     import torch
 
@@ -347,6 +348,7 @@ def _replay_samples(
         replay,
         warmup_count=warmup_count,
         sample_count=sample_count,
+        settle_count=settle_count,
         event_factory=lambda: torch.cuda.Event(enable_timing=True),
         synchronize=lambda: torch.cuda.synchronize(device),
     )
@@ -859,6 +861,7 @@ def _measure_backends(
             device,
             warmup_count=warmup_count,
             sample_count=sample_count,
+            settle_count=len(graphs),
         )
         return merge_backend_samples(
             backend=backend,

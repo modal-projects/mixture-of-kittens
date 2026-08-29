@@ -1239,3 +1239,44 @@ def test_replay_samples_discards_a_settling_replay_after_priming() -> None:
 
     assert samples == [1.0, 1.0, 1.0, 1.0]
     assert replays == [0, 1, 2, 3, 4, 5, 6, 7]
+
+
+def test_replay_samples_settles_every_graph_in_a_rotating_pool() -> None:
+    """A pool rotates, so one settling replay only settles one of its graphs.
+
+    The measurement rotates a pool of graphs by iteration index, and the
+    discarded replays have to cover the whole pool: otherwise the persisted
+    series opens with some graph's first timed replay. The fake below charges
+    every graph's first timed replay an extra 9, so a series that contains one
+    cannot read as steady.
+    """
+    from benchmarks.kimi_k3_timing import replay_samples
+
+    pool = 4
+    warmup_count = 2
+    clock = [0.0]
+    replays: list[int] = []
+    timed_before: set[int] = set()
+
+    def replay(iteration: int) -> None:
+        replays.append(iteration)
+        if len(replays) <= warmup_count:
+            return
+        graph = iteration % pool
+        first_timed = graph not in timed_before
+        timed_before.add(graph)
+        clock[0] += 1.0 + (9.0 if first_timed else 0.0)
+        if len(replays) == warmup_count + 1:
+            clock[0] += 50.0  # the driver's first event record
+
+    samples = replay_samples(
+        replay,
+        warmup_count=warmup_count,
+        sample_count=4,
+        settle_count=pool,
+        event_factory=lambda: _FakeEvent(clock),
+        synchronize=lambda: None,
+    )
+
+    assert samples == [1.0, 1.0, 1.0, 1.0]
+    assert replays == list(range(warmup_count + 1 + pool + 4))

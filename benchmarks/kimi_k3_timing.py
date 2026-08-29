@@ -79,32 +79,39 @@ def replay_samples(
     sample_count: int,
     event_factory: Callable[[], TimingEvent],
     synchronize: Callable[[], None],
+    settle_count: int = 1,
 ) -> list[float]:
     """Time ``sample_count`` replays, after warming the kernel and the instrument.
 
-    The warmups are the kernel's. The two discarded pairs are the instrument's.
-    A process's first ``cuda.Event`` record pays a one-time driver
+    The warmups are the kernel's. The discarded pairs are the instrument's. A
+    process's first ``cuda.Event`` record pays a one-time driver
     initialization, and every sample here is enqueued back to back before a
     single synchronization, so that cost lands entirely in whichever replay it
-    brackets. The first pair pays it. The replay that pair brackets is
-    therefore not a steady-state one either, so a second pair runs and is
-    discarded as well, and only then does the persisted series begin.
+    brackets. The first pair pays it, which makes the replay that pair brackets
+    not a steady-state one either, so ``settle_count`` further pairs run and
+    are discarded before the persisted series begins.
+
+    A caller that rotates a pool of graphs passes its pool size, because one
+    settling replay settles one graph and the rest would open the series with
+    their own first timed replay.
 
     The series is exactly ``sample_count`` long: the discarded replays are
     extra work, not samples taken out of the count.
 
-    The iteration index continues across the warmups, both discarded replays,
+    The iteration index continues across the warmups, every discarded replay,
     and the measured ones, so a caller that rotates a graph pool by index keeps
     rotating it.
     """
     if warmup_count < 1 or sample_count < 1:
         raise ValueError("warmup and sample counts must be positive")
+    if settle_count < 1:
+        raise ValueError("settle count must be positive")
     for iteration in range(warmup_count):
         replay(iteration)
     synchronize()
 
     settled = warmup_count
-    for _ in range(2):
+    for _ in range(1 + settle_count):
         start = event_factory()
         end = event_factory()
         start.record()

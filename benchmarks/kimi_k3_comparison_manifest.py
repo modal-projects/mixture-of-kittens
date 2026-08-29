@@ -382,8 +382,9 @@ def build_comparison_manifest(
             "rank_reduction": "maximum per iteration across all eight ranks",
             "percentile_method": "R-7 linear interpolation",
             "event_priming": (
-                "one event pair recorded and discarded before the persisted "
-                "samples"
+                "one event pair recorded and discarded, then one settling "
+                "replay and event pair per graph in the pool, before the "
+                "persisted samples"
             ),
         },
         "adapter_weight_shapes": {
