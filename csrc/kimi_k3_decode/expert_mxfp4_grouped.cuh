@@ -433,13 +433,17 @@ static __device__ void grouped_gate_up_unit(
                     for (int tile = 0; tile < tile_count; ++tile) {
                         #pragma unroll
                         for (int half = 0; half < 2; ++half) {
+                            auto staged_scale =
+                                scale_slot(tile * 2 + half);
                             load_mxnv_scale_async(
-                                scale_slot(tile * 2 + half),
+                                staged_scale,
                                 weight_scale[buffer][tile][half][0]);
                         }
                     }
+                    auto staged_activation_scale =
+                        scale_slot(2 * kGroupedGateUpWidth);
                     load_mxnv_scale_async(
-                        scale_slot(2 * kGroupedGateUpWidth),
+                        staged_activation_scale,
                         activation_scale_shared);
                 }
                 tensor_store_wait();
@@ -572,12 +576,15 @@ static __device__ void grouped_down_unit(
             if (warpid() == 0) {
                 if (laneid() == 0) {
                     for (int tile = 0; tile < tile_count; ++tile) {
+                        auto staged_scale = scale_slot(tile);
                         load_mxnv_scale_async(
-                            scale_slot(tile),
+                            staged_scale,
                             weight_scale[buffer][tile][0]);
                     }
+                    auto staged_activation_scale =
+                        scale_slot(kGroupedDownWidth);
                     load_mxnv_scale_async(
-                        scale_slot(kGroupedDownWidth),
+                        staged_activation_scale,
                         activation_scale_shared);
                 }
                 tensor_store_wait();
