@@ -72,17 +72,24 @@ __device__ __forceinline__ float decode_route_weight(
 // because the destination moves with the source: consecutive vectors belong to
 // consecutive K groups, which are different 4 KB operand tiles, and 4,096 is a
 // whole number of 128-byte bank periods, so the warp's thirty-two shared
-// stores collide on the same banks. The packed layout makes the two ends
-// exclusive. A row-major deal buys conflict-free shared stores with
-// thirty-two-sector reads; a vector-major deal buys four-sector reads with a
-// twelve-way store conflict; and no thread-to-element map has both, because
-// the global row stride and the shared tile stride disagree.
+// stores collide on the same banks.
 //
-// Having both is what a copy engine is for, and it is what the native layer
+// Two mappings were built and measured, and each pays on one side: the shipped
+// row-major deal takes conflict-free shared stores and thirty-two-sector
+// reads, and the vector-major deal takes four-sector reads and a twelve-way
+// store conflict. Nothing here rules out a third mapping -- a staging buffer
+// per row group, or a different swizzle, would move the trade and neither was
+// tried -- so these are two measured points, not a proof that the global row
+// stride and the swizzled tile stride can never be satisfied together.
+//
+// What the two points do say is where to spend the next attempt. A copy engine
+// gets both sides at once by construction, and it is what the native layer
 // uses: vLLM's expert BMM is `..._tma_ldgstsSf_rgTma_...`, a TMA read of the
-// global tile writing the swizzled shared destination directly. That is the
-// change this staging needs, and it is a different kernel structure, not a
-// different index.
+// global tile writing the swizzled shared destination directly, under an
+// `m128x8x32` contraction that puts tokens on N. That pairing is the leading
+// candidate for this region, and it is a different kernel structure rather
+// than a different index -- but it has not been built or measured here, so it
+// is a candidate and not a conclusion.
 // ---------------------------------------------------------------------------
 
 /// One shared tile row's two sixteen-byte atoms.

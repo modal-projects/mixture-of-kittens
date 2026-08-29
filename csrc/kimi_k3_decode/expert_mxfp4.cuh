@@ -135,6 +135,13 @@ static __device__ void routed_gate_up_unit(
     // weight row's HBM latency is paid underneath a contraction rather than
     // in front of one. The reads land in registers, which is what lets them
     // outlive the barrier that publishes the round they belong to.
+    //
+    // One buffer serves both roles. A round stages its own bytes into shared
+    // memory first, which is the last read of them, and only then reloads the
+    // same registers with the next round's bytes -- so the prefetch keeps its
+    // distance without a second buffer to hold it or a copy to move it across.
+    // The final round simply does not reload, and nothing reads what it did
+    // not write.
     uint4 payload[kGateUpRoundGroups];
     std::uint32_t scale_words[kGateUpScaleTiles];
     const auto read_weight_round = [&](
@@ -198,19 +205,13 @@ static __device__ void routed_gate_up_unit(
                     + group_base + quad * kScaleGroupsPerTile));
         }
 
-        // The last round has nothing to prefetch, and the copy-back below is
-        // guarded by the same condition: reading these to hand them to the
-        // next round when there is no next round would be reading an
-        // indeterminate local object, which is undefined however dead the
-        // value is.
-        const bool prefetching = round + 1 < kGateUpRounds;
-        uint4 next_payload[kGateUpRoundGroups];
-        std::uint32_t next_scale_words[kGateUpScaleTiles];
-        if (prefetching) {
+        // Both staging loops above have consumed `payload` and `scale_words`,
+        // so the round's own bytes are dead and the registers can be reloaded
+        // in place with the next round's. The last round has no next round and
+        // leaves them alone; nothing below reads them again.
+        if (round + 1 < kGateUpRounds) {
             read_weight_round(
-                group_base + kGateUpRoundGroups,
-                next_payload,
-                next_scale_words);
+                group_base + kGateUpRoundGroups, payload, scale_words);
         }
 
         asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
@@ -260,17 +261,6 @@ static __device__ void routed_gate_up_unit(
         __syncthreads();
         mark = clocks.lap(kClockRoutedGateUpMma, mark);
         compute_phase ^= 1;
-
-        if (prefetching) {
-            #pragma unroll
-            for (int slot = 0; slot < kGateUpRoundGroups; ++slot) {
-                payload[slot] = next_payload[slot];
-            }
-            #pragma unroll
-            for (int quad = 0; quad < kGateUpScaleTiles; ++quad) {
-                scale_words[quad] = next_scale_words[quad];
-            }
-        }
     }
 
     store_accumulator(first_accumulator, first_result_shared);

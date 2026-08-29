@@ -40,6 +40,11 @@ from mok import _C
 
 PERSISTENT_SYMBOL = "kimi_k3_decode_persistent_kernel"
 
+# The private per-stage entry point the MXFP4 unit tests drive. It compiles the
+# same routed gate/up and down units the persistent kernel inlines, at the same
+# register ceiling, so it is the first place register pressure shows up.
+ROUTED_EXPERTS_SYMBOL = "kimi_k3_routed_experts_kernel"
+
 # Itanium mangling spells the two ``bool TENSOR_PATH`` instantiations out, so
 # the core and tcgen05 builds of the same template can be told apart by name.
 CORE_MANGLING = "ILb0E"
@@ -154,6 +159,25 @@ def test_neither_instantiation_spills(
     usage = _resource_usage(extension_path)[persistent_symbols[path_name]]
     assert usage["STACK"] == 0, usage
     assert usage["LOCAL"] == 0, usage
+
+
+def test_the_private_routed_expert_kernel_does_not_spill_either(
+    extension_path: Path,
+) -> None:
+    """The same units, compiled on their own, with the same budget.
+
+    Nothing the decode step launches calls this entry point, but it inlines
+    the routed gate/up and down units the persistent kernel does, so a change
+    that pushes those units over the register ceiling spills here whether or
+    not the persistent instantiations have the slack to absorb it. Holding it
+    to zero keeps that headroom measurable instead of implicit.
+    """
+    usage = _resource_usage(extension_path)
+    found = [name for name in usage if ROUTED_EXPERTS_SYMBOL in name]
+    assert len(found) == 1, found
+    assert usage[found[0]]["STACK"] == 0, usage[found[0]]
+    assert usage[found[0]]["LOCAL"] == 0, usage[found[0]]
+    assert not (_mnemonics(extension_path, found[0]) & FORBIDDEN)
 
 
 @pytest.mark.parametrize("path_name", ["core", "tensor"])

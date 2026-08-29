@@ -403,35 +403,43 @@ def _function_body(text: str, signature: str) -> str:
 def test_the_gate_up_rounds_never_read_a_prefetch_they_did_not_make() -> None:
     """The last round has no next round, so its prefetch never happened.
 
-    ``next_payload`` and ``next_scale_words`` are plain local arrays, so on the
-    round that skips the prefetch they hold an indeterminate value, and reading
-    one is undefined behaviour whatever the copy is later used for. The read
-    and the write therefore have to sit under one condition, which this checks
-    by insisting every mention of either array is inside an ``if
-    (prefetching)`` block.
+    A second buffer to prefetch into is what creates the hazard: on the round
+    that skips the prefetch it holds an indeterminate value, and copying it
+    forward reads that value, which is undefined however dead the copy proves
+    to be. One buffer removes the hazard rather than guarding it -- the round
+    stages its own bytes first, then reloads the same registers -- so the
+    contract is that no second buffer exists and the reload is the only write
+    the loop makes to the one that does.
     """
     body = _function_body(
         _source("expert_mxfp4.cuh"), "void routed_gate_up_unit("
     )
-    guarded = re.findall(
-        r"if \(prefetching\) \{(?P<block>(?:[^{}]|\{[^{}]*\})*)\}", body
-    )
-    assert len(guarded) == 2, "one guard to prefetch under, one to copy under"
+    loop = body[body.index("for (int round = 0; round < kGateUpRounds; ++round)"):]
 
     declarations = [
         line
         for line in body.splitlines()
-        if re.search(r"\bnext_(payload|scale_words)\b", line)
-        and re.match(r"\s*(uint4|std::uint32_t) ", line)
+        if re.match(r"\s*(uint4|std::uint32_t) \w+\[kGateUp\w+\];", line)
     ]
-    assert len(declarations) == 2
+    assert len(declarations) == 2, declarations
+    assert "uint4 payload[kGateUpRoundGroups];" in declarations[0]
+    assert "std::uint32_t scale_words[kGateUpScaleTiles];" in declarations[1]
 
-    mentions = len(re.findall(r"\bnext_(?:payload|scale_words)\b", body))
-    inside = sum(
-        len(re.findall(r"\bnext_(?:payload|scale_words)\b", block))
-        for block in guarded
+    # The prefetch is the loop's only reload, it targets the one buffer, and
+    # it is the only thing the last-round test guards.
+    guarded = re.findall(
+        r"if \(round \+ 1 < kGateUpRounds\) \{(?P<block>(?:[^{}]|\{[^{}]*\})*)\}",
+        loop,
     )
-    assert mentions - inside == len(declarations), body
+    assert len(guarded) == 1, loop
+    assert "read_weight_round(" in guarded[0]
+    assert "payload, scale_words);" in guarded[0]
+    assert len(re.findall(r"read_weight_round\(", loop)) == 1
+
+    # No copy forward, because there is nothing to copy from.
+    assert not re.search(r"\bnext_(?:payload|scale_words)\b", body), body
+    assert "payload[slot] =" not in loop
+    assert "scale_words[quad] =" not in loop
 
 
 # ---------------------------------------------------------------------------
