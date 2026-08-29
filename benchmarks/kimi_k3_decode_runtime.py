@@ -33,15 +33,27 @@ DEQUANT_CHUNK = 16
 CONFIG = KimiK3DecodeConfig()
 
 
+def decode_device_step(
+    workspace: KimiK3DecodeWorkspace,
+    weights: KimiK3DecodeWeights,
+    hidden: torch.Tensor,
+) -> torch.Tensor:
+    return kimi_k3_decode(CONFIG, workspace, weights, hidden)
+
+
+def check_decode_error(workspace: KimiK3DecodeWorkspace) -> None:
+    error = int(workspace.error_flag.item())
+    if error:
+        raise AssertionError(f"persistent kernel error flag: {error}")
+
+
 def decode_step(
     workspace: KimiK3DecodeWorkspace,
     weights: KimiK3DecodeWeights,
     hidden: torch.Tensor,
 ) -> torch.Tensor:
-    result = kimi_k3_decode(CONFIG, workspace, weights, hidden)
-    error = int(workspace.error_flag.item())
-    if error:
-        raise AssertionError(f"persistent kernel error flag: {error}")
+    result = decode_device_step(workspace, weights, hidden)
+    check_decode_error(workspace)
     return result
 
 
@@ -370,7 +382,9 @@ __all__ = [
     "assert_decode_close",
     "assert_identical_across_ranks",
     "benchmark_decode_variant",
+    "check_decode_error",
     "decode_reference",
+    "decode_device_step",
     "decode_step",
     "profiled_kernel_names",
     "recorded_allocator_events",

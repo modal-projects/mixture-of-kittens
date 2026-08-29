@@ -120,15 +120,18 @@ def _capture_pool(
         grid_ctas=variant.grid_ctas,
     ):
         for entry in pool:
-            runtime_module.decode_step(
+            runtime_module.decode_device_step(
                 workspace, entry.weights, entry.hidden
             )
             torch.cuda.synchronize(device)
+            runtime_module.check_decode_error(workspace)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                runtime_module.decode_step(
+                runtime_module.decode_device_step(
                     workspace, entry.weights, entry.hidden
                 )
+            torch.cuda.synchronize(device)
+            runtime_module.check_decode_error(workspace)
             graphs.append(graph)
     return graphs
 
@@ -146,11 +149,13 @@ def _gathered_rank_samples(
 def _measure(
     graphs: Sequence[torch.cuda.CUDAGraph],
     *,
+    runtime_module: ModuleType,
+    workspace: Any,
     warmup_count: int,
     sample_count: int,
     device: torch.device,
 ) -> list[float]:
-    return replay_samples(
+    samples = replay_samples(
         lambda iteration: graphs[iteration % len(graphs)].replay(),
         warmup_count=warmup_count,
         sample_count=sample_count,
@@ -158,6 +163,8 @@ def _measure(
         event_factory=lambda: torch.cuda.Event(enable_timing=True),
         synchronize=lambda: torch.cuda.synchronize(device),
     )
+    runtime_module.check_decode_error(workspace)
+    return samples
 
 
 def _phase_profile(
@@ -369,6 +376,8 @@ def run(
             for variant in order:
                 local_samples = _measure(
                     graphs[variant.name],
+                    runtime_module=runtime_module,
+                    workspace=workspace,
                     warmup_count=warmup_count,
                     sample_count=sample_count,
                     device=device,
