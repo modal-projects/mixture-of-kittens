@@ -534,6 +534,26 @@ def test_the_benchmark_grid_override_cannot_leak_into_production(
     assert _C._kimi_k3_decode_benchmark_grid() == production
 
 
+def test_gate_up_activation_candidate_cannot_leak_into_production(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The split-atom mapping is false by default and benchmark-guarded."""
+    monkeypatch.delenv("MOK_KIMI_K3_ENABLE_GRID_TUNING", raising=False)
+    assert not _C._kimi_k3_decode_gate_up_activation_atom_staging()
+    with pytest.raises(RuntimeError, match="benchmark-only"):
+        _C._kimi_k3_decode_set_gate_up_activation_atom_staging(True)
+
+    monkeypatch.setenv("MOK_KIMI_K3_ENABLE_GRID_TUNING", "1")
+    _C._kimi_k3_decode_set_gate_up_activation_atom_staging(True)
+    assert _C._kimi_k3_decode_gate_up_activation_atom_staging()
+
+    monkeypatch.delenv("MOK_KIMI_K3_ENABLE_GRID_TUNING")
+    assert not _C._kimi_k3_decode_gate_up_activation_atom_staging()
+    monkeypatch.setenv("MOK_KIMI_K3_ENABLE_GRID_TUNING", "1")
+    _C._kimi_k3_decode_set_gate_up_activation_atom_staging(False)
+    monkeypatch.delenv("MOK_KIMI_K3_ENABLE_GRID_TUNING")
+
+
 def test_the_shared_memory_reservation_happens_once_per_device(
     tp8_context: tuple[int, int, torch.device],
 ) -> None:

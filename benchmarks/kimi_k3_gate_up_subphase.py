@@ -384,92 +384,97 @@ def run(
         for index in range(POOL_SIZE)
     ]
 
-    correctness = []
-    for entry in pool:
-        actual = runtime.decode_step(
-            workspace, entry.weights, entry.hidden
-        ).clone()
-        torch.cuda.synchronize(device)
-        expected = runtime.decode_reference(entry.hidden, entry.weights)
-        relative_l1, cosine, maximum = runtime.assert_decode_close(
-            actual, expected
-        )
-        correctness.append(
-            {
-                "relative_l1": relative_l1,
-                "cosine_similarity": cosine,
-                "max_abs": maximum,
-            }
-        )
-    if rank == 0:
-        # region agent log
-        _agent_log(
-            location="benchmarks/kimi_k3_gate_up_subphase.py:run:correctness",
-            message="production arithmetic gate passed before measurement",
-            data={
-                "pool_entries": len(correctness),
-                "maximum_relative_l1": max(
-                    float(row["relative_l1"]) for row in correctness
-                ),
-            },
-            hypothesis_id="A,B,C,D,E",
-        )
-        # endregion
-
-    graphs: list[torch.cuda.CUDAGraph] = []
-    for entry in pool:
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            kimi.kimi_k3_decode(
-                runtime.CONFIG, workspace, entry.weights, entry.hidden
+    with runtime.gate_up_activation_atom_staging():
+        correctness = []
+        for entry in pool:
+            actual = runtime.decode_step(
+                workspace, entry.weights, entry.hidden
+            ).clone()
+            torch.cuda.synchronize(device)
+            expected = runtime.decode_reference(entry.hidden, entry.weights)
+            relative_l1, cosine, maximum = runtime.assert_decode_close(
+                actual, expected
             )
-        graphs.append(graph)
+            correctness.append(
+                {
+                    "relative_l1": relative_l1,
+                    "cosine_similarity": cosine,
+                    "max_abs": maximum,
+                }
+            )
+        if rank == 0:
+            # region agent log
+            _agent_log(
+                location=(
+                    "benchmarks/kimi_k3_gate_up_subphase.py:run:correctness"
+                ),
+                message="production arithmetic gate passed before measurement",
+                data={
+                    "pool_entries": len(correctness),
+                    "maximum_relative_l1": max(
+                        float(row["relative_l1"]) for row in correctness
+                    ),
+                },
+                hypothesis_id="A,B,C,D,E",
+            )
+            # endregion
 
-    latency = measure_latency_repeats(
-        graphs,
-        extension=extension,
-        timing=timing,
-        device=device,
-        warmup_count=warmup_count,
-        sample_count=sample_count,
-        repeats=repeats,
-    )
-    phases = measure_subphase_repeats(
-        workspace,
-        pool,
-        runtime=runtime,
-        extension=extension,
-        device=device,
-        warmup_count=warmup_count,
-        sample_count=sample_count,
-        repeats=repeats,
-    )
+        graphs: list[torch.cuda.CUDAGraph] = []
+        for entry in pool:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                kimi.kimi_k3_decode(
+                    runtime.CONFIG, workspace, entry.weights, entry.hidden
+                )
+            graphs.append(graph)
 
-    dominant_votes = [
-        str(repeat["summary"]["dominant_subphase"]) for repeat in phases
-    ]
-    dominant = max(
-        set(dominant_votes),
-        key=lambda name: (dominant_votes.count(name), name),
-    )
-    if rank == 0:
-        # region agent log
-        _agent_log(
-            location="benchmarks/kimi_k3_gate_up_subphase.py:run:dominance",
-            message="stable M16 critical-path dominance selected",
-            data={
-                "dominant_subphase": dominant,
-                "repeat_votes": dominant_votes,
-            },
-            hypothesis_id="A,B,C,D,E",
+        latency = measure_latency_repeats(
+            graphs,
+            extension=extension,
+            timing=timing,
+            device=device,
+            warmup_count=warmup_count,
+            sample_count=sample_count,
+            repeats=repeats,
         )
-        # endregion
-
-    kernel_names = runtime.profiled_kernel_names(
-        lambda: runtime.decode_device_step(
-            workspace, pool[0].weights, pool[0].hidden
+        phases = measure_subphase_repeats(
+            workspace,
+            pool,
+            runtime=runtime,
+            extension=extension,
+            device=device,
+            warmup_count=warmup_count,
+            sample_count=sample_count,
+            repeats=repeats,
         )
-    )
+
+        dominant_votes = [
+            str(repeat["summary"]["dominant_subphase"]) for repeat in phases
+        ]
+        dominant = max(
+            set(dominant_votes),
+            key=lambda name: (dominant_votes.count(name), name),
+        )
+        if rank == 0:
+            # region agent log
+            _agent_log(
+                location=(
+                    "benchmarks/kimi_k3_gate_up_subphase.py:run:dominance"
+                ),
+                message="stable M16 critical-path dominance selected",
+                data={
+                    "dominant_subphase": dominant,
+                    "repeat_votes": dominant_votes,
+                },
+                hypothesis_id="A,B,C,D,E",
+            )
+            # endregion
+
+        kernel_names = runtime.profiled_kernel_names(
+            lambda: runtime.decode_device_step(
+                workspace, pool[0].weights, pool[0].hidden
+            )
+        )
     grid_ctas, threads, dynamic_shared = (
         extension._kimi_k3_decode_grid_shape()
     )
@@ -486,6 +491,7 @@ def run(
     result = {
         "tokens": TOKENS,
         "hypotheses": HYPOTHESES,
+        "benchmark_candidate": "split_gate_up_activation_atoms",
         "correctness": correctness,
         "latency_repeats": [
             {
@@ -515,6 +521,7 @@ def run(
                 "warmup_count": warmup_count,
                 "sample_count": sample_count,
                 "repeats": repeats,
+                "benchmark_candidate": "split_gate_up_activation_atoms",
                 "latency_instrumentation": "disabled",
                 "subphase_instrumentation": "dedicated launches only",
                 "aggregation": "rank-max per-CTA critical path",

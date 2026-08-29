@@ -93,6 +93,8 @@ __device__ __forceinline__ float decode_route_weight(
 // ---------------------------------------------------------------------------
 
 /// One shared tile row's two sixteen-byte atoms.
+inline constexpr int kActivationAtomsPerRow = 2;
+
 __device__ __forceinline__ uint4 *atom_of(
     mixed_operand_tile &tile,
     const int row,
@@ -144,14 +146,25 @@ __device__ __forceinline__ void stage_scale_quad(
         scale_shared.data)[scale_factor_1x_offset(row, 0) / 4] = quad;
 }
 
+/// Stage one MXFP8 activation atom: sixteen live bytes.
+__device__ __forceinline__ void stage_activation_atom(
+    mixed_operand_tile &tile,
+    const int row,
+    const int atom,
+    const std::uint8_t *__restrict__ source
+) {
+    *atom_of(tile, row, atom) =
+        *reinterpret_cast<const uint4 *>(source);
+}
+
 /// Stage one MXFP8 activation row: thirty-two live bytes, two atoms.
 __device__ __forceinline__ void stage_activation_row(
     mixed_operand_tile &tile,
     const int row,
     const std::uint8_t *__restrict__ source
 ) {
-    *atom_of(tile, row, 0) = *reinterpret_cast<const uint4 *>(source);
-    *atom_of(tile, row, 1) = *reinterpret_cast<const uint4 *>(source + 16);
+    stage_activation_atom(tile, row, 0, source);
+    stage_activation_atom(tile, row, 1, source + 16);
 }
 
 /// Stage one MXFP4 weight row: sixteen packed bytes, eight per atom.

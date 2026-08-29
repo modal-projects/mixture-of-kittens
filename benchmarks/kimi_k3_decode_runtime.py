@@ -78,6 +78,22 @@ def phase_profiling() -> Iterator[None]:
             os.environ["MOK_KIMI_K3_ENABLE_GRID_TUNING"] = previous_guard
 
 
+@contextlib.contextmanager
+def gate_up_activation_atom_staging() -> Iterator[None]:
+    """Enable the split-atom gate/up staging candidate for one benchmark."""
+    previous_guard = os.environ.get("MOK_KIMI_K3_ENABLE_GRID_TUNING")
+    os.environ["MOK_KIMI_K3_ENABLE_GRID_TUNING"] = "1"
+    _C._kimi_k3_decode_set_gate_up_activation_atom_staging(True)
+    try:
+        yield
+    finally:
+        _C._kimi_k3_decode_set_gate_up_activation_atom_staging(False)
+        if previous_guard is None:
+            os.environ.pop("MOK_KIMI_K3_ENABLE_GRID_TUNING", None)
+        else:
+            os.environ["MOK_KIMI_K3_ENABLE_GRID_TUNING"] = previous_guard
+
+
 def phase_clock_cycles(
     workspace: KimiK3DecodeWorkspace,
 ) -> dict[str, int]:

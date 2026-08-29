@@ -52,6 +52,7 @@ static __device__ void routed_gate_up_unit(
     const int assignment_begin,
     const int batch_rows,
     const int output_tile,
+    const bool split_activation_atoms,
     const PhaseClocks clocks
 ) {
     using namespace kittens;
@@ -208,20 +209,45 @@ static __device__ void routed_gate_up_unit(
         clocks.lap_gate_up_subphase(
             unit_subphases, kGateUpScaleStageCopy, subphase_mark);
 
-        // The batch is at most 128 rows and usually one, so the activation is
-        // spread over whatever threads its rows and groups need.
+        // The benchmark candidate gives one thread to each sixteen-byte atom.
+        // At M16 that makes a one-row round's sixteen adjacent global atoms one
+        // coalesced warp instruction instead of eight lanes each issuing two.
+        // The production mapping remains the established one-thread-per-row
+        // path unless the guarded benchmark launch requests the candidate.
         subphase_mark = clocks.now();
-        for (int index = thread; index < rows * kGateUpRoundGroups;
-             index += kDecodeCtaThreads) {
-            const int row = index / kGateUpRoundGroups;
-            const int slot = index % kGateUpRoundGroups;
-            const int token =
-                scratch.assignment_tokens[assignment_begin + row];
-            stage_activation_row(
-                activation_tile[slot], row,
-                scratch.latent_mxfp8
-                    + static_cast<long long>(token) * kLatentSize
-                    + (group_base + slot) * kMmaK);
+        if (split_activation_atoms) {
+            constexpr int atoms_per_round =
+                kGateUpRoundGroups * kActivationAtomsPerRow;
+            for (int index = thread;
+                 index
+                     < rows * kGateUpRoundGroups * kActivationAtomsPerRow;
+                 index += kDecodeCtaThreads) {
+                const int row = index / atoms_per_round;
+                const int within_row = index % atoms_per_round;
+                const int slot = within_row / kActivationAtomsPerRow;
+                const int atom = within_row % kActivationAtomsPerRow;
+                const int token =
+                    scratch.assignment_tokens[assignment_begin + row];
+                stage_activation_atom(
+                    activation_tile[slot], row, atom,
+                    scratch.latent_mxfp8
+                        + static_cast<long long>(token) * kLatentSize
+                        + (group_base + slot) * kMmaK
+                        + atom * static_cast<int>(sizeof(uint4)));
+            }
+        } else {
+            for (int index = thread; index < rows * kGateUpRoundGroups;
+                 index += kDecodeCtaThreads) {
+                const int row = index / kGateUpRoundGroups;
+                const int slot = index % kGateUpRoundGroups;
+                const int token =
+                    scratch.assignment_tokens[assignment_begin + row];
+                stage_activation_row(
+                    activation_tile[slot], row,
+                    scratch.latent_mxfp8
+                        + static_cast<long long>(token) * kLatentSize
+                        + (group_base + slot) * kMmaK);
+            }
         }
         clocks.lap_gate_up_subphase(
             unit_subphases, kGateUpActivationStage, subphase_mark);
@@ -574,7 +600,7 @@ void kimi_k3_routed_experts_kernel(
                     shared_raw, tensor_pool, expert_w1_packed, expert_w1_scale,
                     expert_w3_packed, expert_w3_scale, scratch, expert,
                     assignment_begin, batch_rows, output_tile,
-                    PhaseClocks{nullptr});
+                    false, PhaseClocks{nullptr});
             }
 
             for (int output_tile = 0; output_tile < kDownTiles;

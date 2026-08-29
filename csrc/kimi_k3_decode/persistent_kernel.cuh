@@ -276,6 +276,40 @@ inline bool benchmark_phase_profile_for_testing() {
     return benchmark_phase_profile_enabled();
 }
 
+/// Whether a dedicated benchmark splits MXFP8 activation rows by atom.
+///
+/// Production keeps the validated row-owned staging path. The candidate is
+/// available only behind the same explicit process guard as phase profiling,
+/// and defaults off even in a guarded process until the private binding opts
+/// in.
+static __host__ std::atomic<int> &
+benchmark_gate_up_activation_atom_staging_storage() {
+    static std::atomic<int> candidate{0};
+    return candidate;
+}
+
+inline bool benchmark_gate_up_activation_atom_staging_enabled() {
+    if (!benchmark_grid_tuning_enabled()) return false;
+    return benchmark_gate_up_activation_atom_staging_storage().load(
+               std::memory_order_relaxed)
+        != 0;
+}
+
+inline void set_benchmark_gate_up_activation_atom_staging_for_testing(
+    const bool enabled
+) {
+    TORCH_CHECK(
+        benchmark_grid_tuning_enabled(),
+        "MoK: Kimi K3 activation atom staging is benchmark-only; set "
+        "MOK_KIMI_K3_ENABLE_GRID_TUNING=1 in a dedicated benchmark process");
+    benchmark_gate_up_activation_atom_staging_storage().store(
+        enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+inline bool benchmark_gate_up_activation_atom_staging_for_testing() {
+    return benchmark_gate_up_activation_atom_staging_enabled();
+}
+
 /// The accumulators' scratch band and their names, for the reader.
 inline std::tuple<std::int64_t, std::vector<std::string>>
 phase_clock_metadata_for_testing() {
@@ -396,7 +430,8 @@ void kimi_k3_decode_persistent_kernel(
     int *__restrict__ error_flag,
     const int tp_rank,
     const int active_tokens,
-    const int profile_phases
+    const int profile_phases,
+    const int split_gate_up_activation_atoms
 ) {
     extern __shared__ __align__(16) int shared_raw[];
     std::uint8_t *const shared = reinterpret_cast<std::uint8_t *>(shared_raw);
@@ -614,7 +649,8 @@ void kimi_k3_decode_persistent_kernel(
                     expert_w1_scale, expert_w3_packed, expert_w3_scale,
                     scratch, expert, begin,
                     scratch.expert_offsets[expert + 1] - begin,
-                    routed % routed_units_per_expert, clocks);
+                    routed % routed_units_per_expert,
+                    split_gate_up_activation_atoms != 0, clocks);
                 __syncthreads();
                 publish_count_at(&scratch.expert_counts[expert]);
                 mark = clocks.lap(kClockRoutedGateUp, mark);
@@ -912,6 +948,7 @@ struct LaunchArguments {
     int available_sms;
     int grid_ctas;
     int profile_phases;
+    int split_gate_up_activation_atoms;
 };
 
 template<bool TENSOR_PATH>
@@ -967,7 +1004,8 @@ static __host__ void launch_persistent(
             reinterpret_cast<int *>(arguments.error_flag.data_ptr()),
             arguments.tp_rank,
             arguments.active_tokens,
-            arguments.profile_phases);
+            arguments.profile_phases,
+            arguments.split_gate_up_activation_atoms);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

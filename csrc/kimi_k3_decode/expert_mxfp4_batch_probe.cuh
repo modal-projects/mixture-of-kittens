@@ -593,7 +593,7 @@ void expert_probe_kernel(
             routed_gate_up_unit(
                 shared_raw, tensor_pool, expert_w1_packed, expert_w1_scale,
                 expert_w3_packed, expert_w3_scale, scratch, expert, 0, rows,
-                output_tile, PhaseClocks{nullptr});
+                output_tile, false, PhaseClocks{nullptr});
         }
     }
     for (int output_tile = 0; output_tile < kDownTiles; ++output_tile) {
