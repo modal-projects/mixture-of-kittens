@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import contextlib
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import pytest
 import torch
@@ -38,6 +38,7 @@ from mok.kimi_k3 import (
     kimi_k3_router_reference,
 )
 
+from . import kimi_k3_decode_support as decode_support
 from .kimi_k3_decode_support import (
     ACTIVE_EXPERT_UNITS,
     BLOCK8_TOKENS,
@@ -437,6 +438,45 @@ def test_the_whole_step_is_exactly_one_persistent_kernel_launch(
     assert PERSISTENT_KERNEL in names[0], names
     for private in PRIVATE_STAGE_KERNELS:
         assert all(private not in name for name in names), names
+
+
+def test_one_launch_profiler_retries_an_empty_rank_trace(
+    monkeypatch: pytest.MonkeyPatch,
+    workspace: KimiK3DecodeWorkspace,
+    weights: KimiK3DecodeWeights,
+    tp8_context: tuple[int, int, torch.device],
+) -> None:
+    """One lost rank-local trace makes every rank repeat the same observation."""
+    rank, _, device = tp8_context
+    hidden = hidden_states(device, CORE_TOKENS)
+    _decode(workspace, weights, hidden)
+    _synchronize_ranks(workspace)
+
+    original = decode_support._profiled_kernel_names_once
+    attempts = 0
+
+    def drop_rank_two_first_trace(
+        call: Callable[[], object],
+    ) -> list[str]:
+        nonlocal attempts
+        names = original(call)
+        attempts += 1
+        if rank == 2 and attempts == 1:
+            return []
+        return names
+
+    monkeypatch.setattr(
+        decode_support,
+        "_profiled_kernel_names_once",
+        drop_rank_two_first_trace,
+    )
+    names = decode_support.profiled_kernel_names(
+        lambda: _decode(workspace, weights, hidden)
+    )
+
+    assert attempts == 2
+    assert len(names) == 1, names
+    assert PERSISTENT_KERNEL in names[0], names
 
 
 def test_the_persistent_grid_is_proven_resident_before_it_is_launched(
