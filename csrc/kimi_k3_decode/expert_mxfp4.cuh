@@ -320,12 +320,6 @@ static __device__ void routed_gate_up_unit(
         compute_phase ^= 1;
     }
 
-    store_accumulator(first_accumulator, first_result_shared);
-    store_accumulator(second_accumulator, second_result_shared);
-    quantize_situ_tile(
-        first_result_shared, second_result_shared, scratch, assignment_begin,
-        rows, output_base);
-    __syncthreads();
     if (clocks.enabled() && thread == 0) {
         clocks.add_gate_up_subphase(kGateUpWeightGlobalLoad,
             unit_subphases[kGateUpWeightGlobalLoad]);
@@ -341,6 +335,13 @@ static __device__ void routed_gate_up_unit(
             unit_subphases[kGateUpUnitSetup]);
         clocks.add_gate_up_subphase(kGateUpUnits, 1ull);
     }
+
+    store_accumulator(first_accumulator, first_result_shared);
+    store_accumulator(second_accumulator, second_result_shared);
+    quantize_situ_tile(
+        first_result_shared, second_result_shared, scratch, assignment_begin,
+        rows, output_base);
+    __syncthreads();
 }
 
 /// Contract one expert batch's down tile and weight it into the accumulator.
