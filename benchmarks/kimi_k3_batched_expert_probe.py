@@ -49,6 +49,7 @@ def _debug_log(
         "data": data,
         "timestamp": time.time_ns() // 1_000_000,
     }
+    DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with DEBUG_LOG_PATH.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(payload, sort_keys=True) + "\n")
 

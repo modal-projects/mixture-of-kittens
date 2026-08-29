@@ -3,9 +3,28 @@
 from __future__ import annotations
 
 import importlib
+import json
 from pathlib import Path
 
 import pytest
+
+
+def test_debug_log_creates_missing_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = importlib.import_module(
+        "benchmarks.kimi_k3_batched_expert_probe"
+    )
+    debug_log_path = tmp_path / "missing" / "debug.log"
+    monkeypatch.setattr(probe, "DEBUG_LOG_PATH", debug_log_path)
+
+    probe._debug_log("A", "test:debug_log", "probe entry", {"rows": [1]})
+
+    payload = json.loads(debug_log_path.read_text(encoding="utf-8"))
+    assert payload["hypothesisId"] == "A"
+    assert payload["message"] == "probe entry"
+    assert payload["data"] == {"rows": [1]}
 
 
 def test_probe_rows_are_exactly_the_native_token_columns() -> None:
