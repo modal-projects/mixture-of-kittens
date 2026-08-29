@@ -105,10 +105,10 @@ def test_grouped_pipeline_reuses_activation_across_expert_output_tiles() -> None
     down = _function_body(grouped, "void grouped_down_unit(")
     for body in (gate_up, down):
         assert "assignment_offset += kGroupedN" in body
-        assert "stage_grouped_activation(" in body
-        assert "weight_tile[2]" in body
+        assert "stage_grouped_activation<" in body
+        assert "(&weight_tile)[2]" in body
         assert "next_buffer = (round + 1) & 1" in body
-        assert body.index("stage_grouped_activation(") < body.index(
+        assert body.index("stage_grouped_activation<") < body.index(
             "for (int tile = 0; tile < tile_count; ++tile)"
         )
 
@@ -133,10 +133,11 @@ def test_grouped_pipeline_is_a_guarded_separate_persistent_instantiation() -> No
     assert kernel.count("if constexpr (GROUPED_PIPELINE)") == 2
     assert "grouped_gate_up_unit(" in kernel
     assert "grouped_down_unit(" in kernel
-    assert "launch_persistent<TENSOR_PATH, false>" in persistent
-    assert "launch_persistent<TENSOR_PATH, true>" in persistent
-    assert (
-        "benchmark_grouped_pipeline_enabled()"
-        " ? launch_grouped_decode(arguments)"
-        " : launch_production_decode(arguments)"
-    ) in persistent.replace("\n", "").replace("    ", "")
+    assert "launch_persistent<true, false>(" in persistent
+    assert "launch_persistent<false, false>(" in persistent
+    assert "launch_persistent<true, true>(" in persistent
+    assert "launch_persistent<false, true>(" in persistent
+    launch = _function_body(persistent, "void launch_decode(")
+    assert "const bool grouped = benchmark_grouped_pipeline_enabled();" in launch
+    assert launch.count("launch_grouped_decode<") == 2
+    assert launch.count("launch_production_decode<") == 2

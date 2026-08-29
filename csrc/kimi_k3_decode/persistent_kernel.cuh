@@ -3,6 +3,7 @@
 #include "kittens.cuh"
 
 #include "expert_mxfp4.cuh"
+#include "expert_mxfp4_grouped.cuh"
 #include "persistent_sync.cuh"
 #include "router.cuh"
 #include "shared.cuh"
@@ -263,6 +264,38 @@ inline bool benchmark_phase_profile_for_testing() {
     return benchmark_phase_profile_enabled();
 }
 
+/// Select the grouped expert pipeline only in a dedicated benchmark process.
+static __host__ std::atomic<int> &benchmark_grouped_pipeline_storage() {
+    static std::atomic<int> grouped{0};
+    return grouped;
+}
+
+inline bool benchmark_grouped_pipeline_guard_enabled() {
+    const char *const enabled =
+        std::getenv("MOK_KIMI_K3_ENABLE_GROUPED_PIPELINE");
+    return enabled != nullptr && std::strcmp(enabled, "1") == 0;
+}
+
+inline bool benchmark_grouped_pipeline_enabled() {
+    return benchmark_grouped_pipeline_guard_enabled()
+        && benchmark_grouped_pipeline_storage().load(
+               std::memory_order_relaxed) != 0;
+}
+
+inline void set_benchmark_grouped_pipeline_for_testing(const bool enabled) {
+    TORCH_CHECK(
+        benchmark_grouped_pipeline_guard_enabled(),
+        "MoK: Kimi K3 grouped expert pipeline is benchmark-only; set "
+        "MOK_KIMI_K3_ENABLE_GROUPED_PIPELINE=1 in a dedicated benchmark "
+        "process");
+    benchmark_grouped_pipeline_storage().store(
+        enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+inline bool benchmark_grouped_pipeline_for_testing() {
+    return benchmark_grouped_pipeline_enabled();
+}
+
 /// The accumulators' scratch band and their names, for the reader.
 inline std::tuple<std::int64_t, std::vector<std::string>>
 phase_clock_metadata_for_testing() {
@@ -342,7 +375,7 @@ using layouts_t = std::conditional_t<TENSOR_PATH, TensorLayouts,
 // The single production kernel.
 // ---------------------------------------------------------------------------
 
-template<bool TENSOR_PATH>
+template<bool TENSOR_PATH, bool GROUPED_PIPELINE>
 __global__ __launch_bounds__(kDecodeCtaThreads, 1)
 void kimi_k3_decode_persistent_kernel(
     const __nv_bfloat16 *__restrict__ hidden_states,
@@ -534,8 +567,11 @@ void kimi_k3_decode_persistent_kernel(
         constexpr int shared_units = TENSOR_PATH
             ? 2 * shared_experts::kTensorGateCtas
             : shared_experts::kCoreGateCtas;
-        const int units =
-            shared_units + expert_units * expert_mxfp4::kGateUpTiles;
+        constexpr int routed_units_per_expert =
+            GROUPED_PIPELINE
+                ? expert_mxfp4::grouped_pipeline::kGroupedGateUpUnits
+                : expert_mxfp4::kGateUpTiles;
+        const int units = shared_units + expert_units * routed_units_per_expert;
         int batch_begin;
         while ((batch_begin = claim_unit_batch(
                     scratch, kGateUpQueue, units, routed_batch, &claim_slot,
@@ -565,15 +601,24 @@ void kimi_k3_decode_persistent_kernel(
                     continue;
                 }
                 const int routed = unit - shared_units;
-                const int expert =
-                    scratch.unit_expert[
-                        routed / expert_mxfp4::kGateUpTiles];
+                const int expert = scratch.unit_expert[
+                    routed / routed_units_per_expert];
                 const int begin = scratch.expert_offsets[expert];
-                expert_mxfp4::routed_gate_up_unit(
-                    shared_raw, tensor_pool, expert_w1_packed, expert_w1_scale,
-                    expert_w3_packed, expert_w3_scale, scratch, expert, begin,
-                    scratch.expert_offsets[expert + 1] - begin,
-                    routed % expert_mxfp4::kGateUpTiles, clocks);
+                if constexpr (GROUPED_PIPELINE) {
+                    expert_mxfp4::grouped_pipeline::grouped_gate_up_unit(
+                        shared_raw, tensor_pool, expert_w1_packed,
+                        expert_w1_scale, expert_w3_packed, expert_w3_scale,
+                        scratch, expert, begin,
+                        scratch.expert_offsets[expert + 1] - begin,
+                        routed % routed_units_per_expert, clocks);
+                } else {
+                    expert_mxfp4::routed_gate_up_unit(
+                        shared_raw, tensor_pool, expert_w1_packed,
+                        expert_w1_scale, expert_w3_packed, expert_w3_scale,
+                        scratch, expert, begin,
+                        scratch.expert_offsets[expert + 1] - begin,
+                        routed % routed_units_per_expert, clocks);
+                }
                 __syncthreads();
                 mark = clocks.lap(kClockRoutedGateUp, mark);
             }
@@ -599,8 +644,11 @@ void kimi_k3_decode_persistent_kernel(
             ? shared_experts::kTensorDownCtas
             : shared_experts::kCoreDownCtas;
         constexpr int shared_units = activation_units + shared_down_units;
-        const int units =
-            shared_units + expert_units * expert_mxfp4::kDownTiles;
+        constexpr int routed_units_per_expert =
+            GROUPED_PIPELINE
+                ? expert_mxfp4::grouped_pipeline::kGroupedDownUnits
+                : expert_mxfp4::kDownTiles;
+        const int units = shared_units + expert_units * routed_units_per_expert;
         int batch_begin;
         while ((batch_begin = claim_unit_batch(
                     scratch, kDownQueue, units, routed_batch, &claim_slot,
@@ -632,13 +680,23 @@ void kimi_k3_decode_persistent_kernel(
                 }
                 const int routed = unit - shared_units;
                 const int expert =
-                    scratch.unit_expert[routed / expert_mxfp4::kDownTiles];
+                    scratch.unit_expert[routed / routed_units_per_expert];
                 const int begin = scratch.expert_offsets[expert];
-                expert_mxfp4::routed_down_unit(
-                    shared_raw, tensor_pool, expert_w2_packed, expert_w2_scale,
-                    scratch, expert, begin,
-                    scratch.expert_offsets[expert + 1] - begin,
-                    routed % expert_mxfp4::kDownTiles, active_tokens, clocks);
+                if constexpr (GROUPED_PIPELINE) {
+                    expert_mxfp4::grouped_pipeline::grouped_down_unit(
+                        shared_raw, tensor_pool, expert_w2_packed,
+                        expert_w2_scale, scratch, expert, begin,
+                        scratch.expert_offsets[expert + 1] - begin,
+                        routed % routed_units_per_expert, active_tokens,
+                        clocks);
+                } else {
+                    expert_mxfp4::routed_down_unit(
+                        shared_raw, tensor_pool, expert_w2_packed,
+                        expert_w2_scale, scratch, expert, begin,
+                        scratch.expert_offsets[expert + 1] - begin,
+                        routed % routed_units_per_expert, active_tokens,
+                        clocks);
+                }
                 __syncthreads();
                 mark = clocks.lap(kClockRoutedDown, mark);
             }
@@ -748,7 +806,7 @@ static __host__ std::int64_t shared_memory_reservations_for_testing(
 /// graph capture would have to record. The measured occupancy is then checked
 /// on every call, so a device that cannot host the grid is rejected every time
 /// rather than only on the first launch of a process.
-template<bool TENSOR_PATH>
+template<bool TENSOR_PATH, bool GROUPED_PIPELINE = false>
 static __host__ int resident_blocks_per_sm() {
     static std::array<std::atomic<int>, kMaxCudaDevices> measured{};
     static std::array<std::once_flag, kMaxCudaDevices> reserved;
@@ -758,18 +816,25 @@ static __host__ int resident_blocks_per_sm() {
                 "MoK: kimi_k3_decode saw an unexpected device ordinal ",
                 device);
     std::call_once(reserved[static_cast<std::size_t>(device)], [device] {
+        constexpr int shared_bytes =
+            GROUPED_PIPELINE
+                ? expert_mxfp4::grouped_pipeline::kGroupedPersistentSharedBytes
+                : kPersistentSharedBytes;
         C10_CUDA_CHECK(cudaFuncSetAttribute(
-            kimi_k3_decode_persistent_kernel<TENSOR_PATH>,
+            kimi_k3_decode_persistent_kernel<TENSOR_PATH, GROUPED_PIPELINE>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
-            kPersistentSharedBytes));
+            shared_bytes));
         int blocks = 0;
         C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &blocks, kimi_k3_decode_persistent_kernel<TENSOR_PATH>,
-            kDecodeCtaThreads, kPersistentSharedBytes));
+            &blocks,
+            kimi_k3_decode_persistent_kernel<TENSOR_PATH, GROUPED_PIPELINE>,
+            kDecodeCtaThreads, shared_bytes));
         measured[static_cast<std::size_t>(device)].store(
             blocks, std::memory_order_relaxed);
-        shared_memory_reservations()[static_cast<std::size_t>(device)]
-            .fetch_add(1, std::memory_order_relaxed);
+        if constexpr (!GROUPED_PIPELINE) {
+            shared_memory_reservations()[static_cast<std::size_t>(device)]
+                .fetch_add(1, std::memory_order_relaxed);
+        }
     });
     return measured[static_cast<std::size_t>(device)].load(
         std::memory_order_relaxed);
@@ -813,6 +878,15 @@ inline std::int64_t resident_blocks_per_sm_for_testing(
                        : resident_blocks_per_sm<false>();
 }
 
+inline std::tuple<std::int64_t, std::int64_t>
+grouped_pipeline_resource_for_testing(const bool tensor_path) {
+    return {
+        expert_mxfp4::grouped_pipeline::kGroupedPersistentSharedBytes,
+        tensor_path ? resident_blocks_per_sm<true, true>()
+                    : resident_blocks_per_sm<false, true>(),
+    };
+}
+
 /// Every pointer, alias, and count one persistent launch needs.
 ///
 /// The kernel takes twenty-odd arguments and the two capacity paths pass the
@@ -849,13 +923,14 @@ struct LaunchArguments {
     int profile_phases;
 };
 
-template<bool TENSOR_PATH>
+template<bool TENSOR_PATH, bool GROUPED_PIPELINE>
 static __host__ void launch_persistent(
     const LaunchArguments &arguments,
     const layouts_t<TENSOR_PATH> &layouts
 ) {
     validate_grid_residency(
-        arguments.available_sms, resident_blocks_per_sm<TENSOR_PATH>(),
+        arguments.available_sms,
+        resident_blocks_per_sm<TENSOR_PATH, GROUPED_PIPELINE>(),
         arguments.grid_ctas);
 
     const auto bf16 = [](const at::Tensor &tensor) {
@@ -865,8 +940,12 @@ static __host__ void launch_persistent(
         return reinterpret_cast<const std::uint8_t *>(tensor.data_ptr());
     };
 
-    kimi_k3_decode_persistent_kernel<TENSOR_PATH>
-        <<<arguments.grid_ctas, kDecodeCtaThreads, kPersistentSharedBytes,
+    constexpr int shared_bytes =
+        GROUPED_PIPELINE
+            ? expert_mxfp4::grouped_pipeline::kGroupedPersistentSharedBytes
+            : kPersistentSharedBytes;
+    kimi_k3_decode_persistent_kernel<TENSOR_PATH, GROUPED_PIPELINE>
+        <<<arguments.grid_ctas, kDecodeCtaThreads, shared_bytes,
            at::cuda::getCurrentCUDAStream()>>>(
             bf16(arguments.hidden_states),
             bf16(arguments.router_weight),
@@ -958,13 +1037,46 @@ static __host__ TensorLayouts tensor_layouts(
     };
 }
 
-/// Run one whole TP8 Kimi K3 decode step in a single launch.
+template<bool TENSOR_PATH>
+static __host__ void launch_production_decode(
+    const LaunchArguments &arguments
+) {
+    if constexpr (TENSOR_PATH) {
+        launch_persistent<true, false>(
+            arguments, tensor_layouts(arguments));
+    } else {
+        launch_persistent<false, false>(arguments, NoTensorLayouts{});
+    }
+}
+
+template<bool TENSOR_PATH>
+static __host__ void launch_grouped_decode(
+    const LaunchArguments &arguments
+) {
+    if constexpr (TENSOR_PATH) {
+        launch_persistent<true, true>(
+            arguments, tensor_layouts(arguments));
+    } else {
+        launch_persistent<false, true>(arguments, NoTensorLayouts{});
+    }
+}
+
+/// Run one whole TP8 Kimi K3 decode step in one selected persistent launch.
 static __host__ void launch_decode(const LaunchArguments &arguments) {
+    const bool grouped = benchmark_grouped_pipeline_enabled();
     if (capacity_bucket(arguments.active_tokens) <= kMaxCoreCapacity) {
-        launch_persistent<false>(arguments, NoTensorLayouts{});
+        if (grouped) {
+            launch_grouped_decode<false>(arguments);
+        } else {
+            launch_production_decode<false>(arguments);
+        }
         return;
     }
-    launch_persistent<true>(arguments, tensor_layouts(arguments));
+    if (grouped) {
+        launch_grouped_decode<true>(arguments);
+    } else {
+        launch_production_decode<true>(arguments);
+    }
 }
 
 }  // namespace persistent

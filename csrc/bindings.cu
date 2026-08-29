@@ -85,6 +85,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &kimi_k3_decode::persistent::benchmark_phase_profile_for_testing);
     m.def("_kimi_k3_decode_phase_clock_metadata",
           &kimi_k3_decode::persistent::phase_clock_metadata_for_testing);
+    m.def(
+        "_kimi_k3_decode_set_grouped_pipeline",
+        &kimi_k3_decode::persistent::
+            set_benchmark_grouped_pipeline_for_testing,
+        "", pybind11::arg("enabled"));
+    m.def(
+        "_kimi_k3_decode_grouped_pipeline",
+        &kimi_k3_decode::persistent::
+            benchmark_grouped_pipeline_for_testing);
+    m.def(
+        "_kimi_k3_decode_grouped_pipeline_resource",
+        &kimi_k3_decode::persistent::
+            grouped_pipeline_resource_for_testing,
+        "", pybind11::arg("tensor_path"));
     m.def("_kimi_k3_decode_benchmark_grids", []() {
         const auto &grids =
             kimi_k3_decode::persistent::kBenchmarkGridCtas;
