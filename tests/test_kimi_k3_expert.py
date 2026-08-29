@@ -1239,11 +1239,11 @@ def _expert_call_arguments(
 # breaks that alignment, and one nonzero element offset that preserves it.
 _EXPERT_TENSOR_CASES = (
     ("latent_x", 16, 1, 8),
-    ("expert_w1_packed", 16, 1, 16),
+    ("expert_w1_packed", 32, 1, 32),
     ("expert_w1_scale", 16, 1, 16),
-    ("expert_w3_packed", 16, 1, 16),
+    ("expert_w3_packed", 32, 1, 32),
     ("expert_w3_scale", 16, 1, 16),
-    ("expert_w2_packed", 16, 1, 16),
+    ("expert_w2_packed", 32, 1, 32),
     ("expert_w2_scale", 16, 1, 16),
     ("routed_output", 16, 1, 8),
     ("scratch", ALIGNMENT, 16, ALIGNMENT),

@@ -130,7 +130,7 @@ def test_the_alignment_contract_covers_every_tensor_the_kernel_dereferences(
     contracted = {field for field, _ in _DECODE_ALIGNMENT}
     assert contracted.isdisjoint(_SCALAR_WORD_TENSORS)
     assert contracted | _SCALAR_WORD_TENSORS == tensors
-    assert all(alignment in (16, 256) for _, alignment in _DECODE_ALIGNMENT)
+    assert all(alignment in (16, 32, 256) for _, alignment in _DECODE_ALIGNMENT)
 
 
 def _misaligned(original: torch.Tensor, alignment: int) -> torch.Tensor:
@@ -400,15 +400,13 @@ def _function_body(text: str, signature: str) -> str:
     raise AssertionError(f"{signature} is never closed")
 
 
-def test_gate_up_tma_prefetch_reuses_one_compact_buffer_safely() -> None:
-    """Packed weights use the copy engine without adding a second launch.
+def test_routed_tma_writes_the_mma_layout_and_double_buffers_it() -> None:
+    """Packed weights reach the MMA layout without a thread-copying hop.
 
-    One compact shared buffer is enough: after the CTA expands the current
-    round into the MMA tiles, a barrier makes the compact bytes dead and TMA
-    can overwrite that same buffer with the next round while the tensor core
-    consumes the expanded tiles. Requiring one buffer keeps the routed stage
-    inside the persistent shared-memory budget and guarding the only in-loop
-    issue keeps the last round from reading beyond the weight row.
+    CUDA's aligned-U4 tensor-map format expands four K32 groups into one
+    128-byte-swizzled row. Two stages are enough to overlap the next direct
+    transfer with the current contraction, while keeping both routed units
+    inside the persistent shared-memory budget.
     """
     body = _function_body(
         _source("expert_mxfp4.cuh"), "void routed_gate_up_unit("
@@ -416,26 +414,32 @@ def test_gate_up_tma_prefetch_reuses_one_compact_buffer_safely() -> None:
     loop = body[body.index("for (int round = 0; round < kGateUpRounds; ++round)"):]
     staging = _source("expert_mxfp4_staging.cuh")
 
-    assert "using packed_weight_tile =" in staging
-    assert "using packed_weight_layout =" in staging
-    assert "tma::load_async(" in staging
-    assert "packed_weight_tile (&first_weight_packed)" in body
-    assert "packed_weight_tile (&second_weight_packed)" in body
-    assert body.count("packed_weight_tile (&") == 2
-    assert "uint4 payload" not in body
-    assert "std::uint32_t scale_words[kGateUpScaleTiles];" in body
+    assert "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B" in staging
+    assert "CU_TENSOR_MAP_SWIZZLE_128B" in staging
+    assert "kDirectWeightGroups = 4" in staging
+    assert "kWeightPipelineStages = 2" in staging
+    assert "using direct_weight_stage =" in staging
+    assert (
+        "direct_weight_stage (&first_weight_stage)[kWeightPipelineStages]"
+        in body
+    )
+    assert (
+        "direct_weight_stage (&second_weight_stage)[kWeightPipelineStages]"
+        in body
+    )
+    assert "packed_weight_tile" not in staging
+    assert "stage_weight_row(" not in body
 
-    # Round zero is primed before the loop. The only later TMA issue is guarded
-    # and targets the same two compact arrays rather than a second buffer.
-    assert body.count("issue_packed_weight_round(") == 2
+    # Round zero is primed before the loop. The only later direct issue is
+    # guarded and targets the alternate stage.
+    assert body.count("issue_direct_weight_round(") == 2
     guarded = re.findall(
         r"if \(round \+ 1 < kGateUpRounds\) \{(?P<block>(?:[^{}]|\{[^{}]*\})*)\}",
         loop,
     )
     assert len(guarded) == 1, loop
-    assert "issue_packed_weight_round(" in guarded[0]
-    assert "first_weight_packed, second_weight_packed" in guarded[0]
-    assert not re.search(r"\bnext_(?:weight_packed|scale_words)\b", body), body
+    assert "issue_direct_weight_round(" in guarded[0]
+    assert "(round + 1) % kWeightPipelineStages" in guarded[0]
 
     persistent = _source("persistent_kernel.cuh")
     kernel = _function_body(
