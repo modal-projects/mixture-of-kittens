@@ -29,6 +29,7 @@ Environment overrides:
 import io
 import os
 import subprocess
+import tarfile
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -370,6 +371,90 @@ def bench_kimi_k3_decode(git_sha: str) -> bytes:
         if first_archive != second_archive:
             raise RuntimeError("normalized benchmark archive is not reproducible")
         return first_archive
+
+
+@app.function(image=B300_IMAGE, gpu="B300", timeout=7_200)
+def bench_kimi_k3_batched_expert_probe(
+    git_sha: str,
+    warmup_count: int = 500,
+    sample_count: int = 1000,
+    repeats: int = 5,
+) -> bytes:
+    """Benchmark the isolated m128x8x32 expert candidate on one B300."""
+    if len(git_sha) != 40:
+        raise ValueError("git_sha must be the full 40-character commit SHA")
+    with tempfile.TemporaryDirectory(
+        prefix="kimi-k3-batched-expert-"
+    ) as directory:
+        output_dir = Path(directory) / "artifacts"
+        command = [
+            "python",
+            "-m",
+            "benchmarks.kimi_k3_batched_expert_probe",
+            "--output-dir",
+            str(output_dir),
+            "--warmup-count",
+            str(warmup_count),
+            "--sample-count",
+            str(sample_count),
+            "--repeats",
+            str(repeats),
+        ]
+        print(f"Launching: {' '.join(command)} on 1 x B300")
+        subprocess.run(
+            command,
+            cwd=REMOTE_ROOT,
+            env={
+                **os.environ,
+                "MOK_GIT_SHA": git_sha,
+                "PYTHONUNBUFFERED": "1",
+            },
+            check=True,
+            timeout=7_100,
+        )
+        expected = {
+            "debug.log",
+            "manifest.json",
+            "raw_samples.json",
+            "results.json",
+        }
+        actual = {path.name for path in output_dir.iterdir()}
+        if actual != expected:
+            raise RuntimeError(
+                "batched expert probe artifacts differ: "
+                f"missing={sorted(expected - actual)}, "
+                f"unexpected={sorted(actual - expected)}"
+            )
+        archive = reproducible_tar_bytes(output_dir)
+        if archive != reproducible_tar_bytes(output_dir):
+            raise RuntimeError("normalized probe archive is not reproducible")
+        return archive
+
+
+@app.local_entrypoint()
+def batched_expert_probe(
+    git_sha: str,
+    output_dir: str = "kimi_k3_batched_expert_probe",
+    warmup_count: int = 500,
+    sample_count: int = 1000,
+    repeats: int = 5,
+) -> None:
+    """Run and unpack the focused one-B300 contraction microbenchmark."""
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    archive = bench_kimi_k3_batched_expert_probe.remote(
+        git_sha,
+        warmup_count=warmup_count,
+        sample_count=sample_count,
+        repeats=repeats,
+    )
+    (destination / "artifacts.tar").write_bytes(archive)
+    with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
+        bundle.extractall(destination, filter="data")
+    print(
+        "batched expert probe artifacts: "
+        f"{sorted(path.name for path in destination.iterdir())}"
+    )
 
 
 def _run_framework_comparison(

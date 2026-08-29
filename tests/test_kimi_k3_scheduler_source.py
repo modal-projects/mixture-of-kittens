@@ -58,3 +58,27 @@ def test_route_selection_fuses_with_scoring_before_assignment_quantization() -> 
     assert "select_token(" in select
     assert "select_after_score_shard(" in kernel
     assert kernel.count("grid_barrier(") == 7
+
+
+def test_batched_expert_probe_is_a_transposed_m128x8x32_microprototype() -> None:
+    """Exercise token columns end to end without touching the production path."""
+    probe = _source("expert_mxfp4_batch_probe.cuh")
+    production = _source("expert_mxfp4.cuh")
+    persistent = _source("persistent_kernel.cuh")
+
+    assert "kBatchProbeM = 128" in probe
+    assert "kBatchProbeN = 8" in probe
+    assert "kBatchProbePhysicalN = 16" in probe
+    assert "(5u << 7)" in probe
+    assert "(0u << 10)" in probe
+    assert "kBatchProbeN / 8" in probe
+    assert "weight_tile[slot], activation_tile[slot]" in probe
+    assert "gate[{column, row}]" in probe
+    assert "up[{column, row}]" in probe
+    assert "result[{column, row}]" in probe
+    assert "routed_gate_up_unit(" in probe
+    assert "routed_down_unit(" in probe
+    assert "batched_gate_up_unit(" in probe
+    assert "batched_down_unit(" in probe
+    assert "batched_gate_up_unit(" not in production
+    assert "batched_down_unit(" not in persistent

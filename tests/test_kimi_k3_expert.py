@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import inspect
 import json
 import math
@@ -755,6 +756,41 @@ def test_single_expert_matches_exact_prepared_weight_reference(
     assert actual.shape == (rows, HIDDEN)
     assert actual.dtype == torch.bfloat16
     _assert_expert_close(actual, expected)
+
+
+@pytest.mark.parametrize("rows", [1, 2, 4, 8])
+def test_transposed_m128x8_probe_matches_the_current_expert_unit(
+    device: torch.device,
+    weights: ExpertWeights,
+    scratch: torch.Tensor,
+    rows: int,
+) -> None:
+    extension = importlib.import_module("mok._C")
+    latent = _random_latent(device, rows, 7300 + rows)
+    baseline = torch.empty_like(latent)
+    candidate = torch.empty_like(latent)
+    arguments = (
+        latent,
+        weights.w1_packed,
+        weights.w1_scale,
+        weights.w3_packed,
+        weights.w3_scale,
+        weights.w2_packed,
+        weights.w2_scale,
+    )
+
+    extension._kimi_k3_batched_expert_probe(
+        *arguments, baseline, scratch, 0, False
+    )
+    extension._kimi_k3_batched_expert_probe(
+        *arguments, candidate, scratch, 0, True
+    )
+
+    assignments = [(0, token, 0, 1.0) for token in range(rows)]
+    expected = _reference(latent, weights, assignments, rows)
+    _assert_expert_close(baseline, expected)
+    _assert_expert_close(candidate, expected)
+    torch.testing.assert_close(candidate, baseline, rtol=0.0, atol=0.0)
 
 
 @pytest.mark.parametrize("active", CAPACITY_BUCKETS)

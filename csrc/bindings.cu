@@ -1,5 +1,6 @@
 #include "kimi_k3_decode/entrypoints.cuh"
 #include "kimi_k3_decode/expert_mxfp4.cuh"
+#include "kimi_k3_decode/expert_mxfp4_batch_probe.cuh"
 #include "megakernel/entrypoints.cuh"
 #include "mxfp8.cuh"
 #include "scheduler.cuh"
@@ -203,6 +204,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &kimi_k3_decode::expert_mxfp4::mixed_mma_probe_entrypoint, "",
           pybind11::arg("a"), pybind11::arg("b_packed"),
           pybind11::arg("b_scale"));
+    m.def(
+        "_kimi_k3_batched_expert_probe",
+        &kimi_k3_decode::expert_mxfp4::batch_probe::
+            batched_expert_probe_entrypoint,
+        "",
+        pybind11::arg("latent_x"),
+        pybind11::arg("expert_w1_packed"),
+        pybind11::arg("expert_w1_scale"),
+        pybind11::arg("expert_w3_packed"),
+        pybind11::arg("expert_w3_scale"),
+        pybind11::arg("expert_w2_packed"),
+        pybind11::arg("expert_w2_scale"),
+        pybind11::arg("output"),
+        pybind11::arg("scratch"),
+        pybind11::arg("expert"),
+        pybind11::arg("use_batch_probe"));
     m.def("all_gather_top_experts", &utils::all_gather_top_experts::all_gather_top_experts_entrypoint, "",
           pybind11::arg("top_experts"), pybind11::arg("all_gather_top_experts_buffer"),
           pybind11::arg("all_gather_top_experts_buffer_multicast_ptr"), pybind11::arg("rank"), pybind11::arg("chunk_bytes"));
