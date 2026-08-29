@@ -955,13 +955,22 @@ def test_a_profiled_launch_reports_its_own_cycles_and_costs_one_barrier(
     assert_decode_close(second_result, expected)
     assert int(workspace.error_flag.item()) == 0
 
-    # Every region of the step is timed, by every CTA that ran it, and the
-    # poison is gone from all of them: the launch reported itself rather than
-    # itself plus whatever the band already held.
+    # Every production region is timed, and the poison is gone from the whole
+    # band: the launch reported itself rather than itself plus whatever the
+    # band already held. The benchmark-only readiness wait stays zero in the
+    # production instantiation.
     assert set(first) == set(_C._kimi_k3_decode_phase_clock_metadata()[1])
-    assert min(first.values()) > 0, first
+    assert first["readiness_wait"] == 0
+    assert min(
+        cycles
+        for name, cycles in first.items()
+        if name != "readiness_wait"
+    ) > 0, first
     for name, cycles in second.items():
-        assert 0 < cycles < poison_floor, (name, cycles)
+        if name == "readiness_wait":
+            assert cycles == 0
+        else:
+            assert 0 < cycles < poison_floor, (name, cycles)
 
     # Profiling is off again, so the band stops moving and the launch is back
     # to the six generations a measured replay spends.
