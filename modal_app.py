@@ -38,6 +38,7 @@ from pathlib import Path
 import modal
 
 from benchmarks.compare_kimi_k3_frameworks import (
+    combine_archives,
     comparison_artifact_files,
     pinned_image_reference,
 )
@@ -313,34 +314,21 @@ def _run_kimi_k3_torchrun(
 
 
 @app.function(image=B300_IMAGE, gpu="B300:8", timeout=14_400)
-def test_kimi_k3_decode(tests: str = "") -> None:
+def test_kimi_k3_decode() -> None:
     """Run TP8 decode correctness plus SM103 resource and launch checks."""
-    Path("/opt/cursor/logs").mkdir(parents=True, exist_ok=True)
-    test_files = (
-        tests.split(",")
-        if tests
-        else sorted(
-            str(path)
-            for path in Path("tests").glob("test_kimi_k3*.py")
-        )
+    test_files = sorted(
+        str(path)
+        for path in Path("tests").glob("test_kimi_k3*.py")
     )
-    try:
-        _run_kimi_k3_torchrun(
-            [
-                "-m",
-                "pytest",
-                "-q",
-                *test_files,
-            ],
-            timeout=14_100,
-        )
-    finally:
-        # region agent log
-        debug_log = Path("/opt/cursor/logs/debug.log")
-        if debug_log.is_file():
-            print("AGENT_DEBUG_LOG")
-            print(debug_log.read_text(encoding="utf-8"), end="")
-        # endregion
+    _run_kimi_k3_torchrun(
+        [
+            "-m",
+            "pytest",
+            "-q",
+            *test_files,
+        ],
+        timeout=14_100,
+    )
 
 
 @app.function(image=B300_IMAGE, gpu="B300:8", timeout=86_400)
@@ -501,51 +489,6 @@ def diagnose_kimi_k3_batched_expert_probe(
     }
 
 
-@app.function(image=B300_IMAGE, gpu="B300:8", timeout=14_400)
-def bench_kimi_k3_grouped_pipeline(
-    git_sha: str,
-    warmup_count: int = 500,
-    sample_count: int = 1000,
-    repeats: int = 5,
-) -> bytes:
-    """Compare the guarded grouped expert pipeline at M16 and M128."""
-    if len(git_sha) != 40:
-        raise ValueError("git_sha must be the full 40-character commit SHA")
-    with tempfile.TemporaryDirectory(
-        prefix="kimi-k3-grouped-pipeline-"
-    ) as directory:
-        output_dir = Path(directory) / "artifacts"
-        _run_kimi_k3_torchrun(
-            [
-                "-m",
-                "benchmarks.kimi_k3_grouped_pipeline",
-                "--output-dir",
-                str(output_dir),
-                "--warmup-count",
-                str(warmup_count),
-                "--sample-count",
-                str(sample_count),
-                "--repeats",
-                str(repeats),
-            ],
-            timeout=14_100,
-            environment={"MOK_GIT_SHA": git_sha},
-        )
-        expected = {"manifest.json", "results.json", "raw_samples.json"}
-        actual = {path.name for path in output_dir.iterdir()}
-        if not expected <= actual:
-            raise RuntimeError(
-                "grouped pipeline artifacts are incomplete: "
-                f"missing={sorted(expected - actual)}"
-            )
-        archive = reproducible_tar_bytes(output_dir)
-        if archive != reproducible_tar_bytes(output_dir):
-            raise RuntimeError(
-                "normalized grouped pipeline archive is not reproducible"
-            )
-        return archive
-
-
 @app.local_entrypoint()
 def batched_expert_probe(
     git_sha: str,
@@ -592,53 +535,6 @@ def batched_expert_diagnostic(
     )
     Path(output_path).write_text(rendered, encoding="utf-8")
     print(rendered, end="")
-
-
-@app.local_entrypoint()
-def grouped_pipeline(
-    git_sha: str,
-    output_dir: str = "kimi_k3_grouped_pipeline",
-    warmup_count: int = 500,
-    sample_count: int = 1000,
-    repeats: int = 5,
-) -> None:
-    """Run and unpack the exact M16/M128 grouped-pipeline comparison."""
-    # region agent log
-    with open("/opt/cursor/logs/debug.log", "a", encoding="utf-8") as debug_file:
-        debug_file.write(json.dumps({"hypothesisId": "A,E", "location": "modal_app.py:grouped_pipeline:entry", "message": "grouped reproduction started", "data": {"git_sha": git_sha, "output_dir": output_dir, "warmup_count": warmup_count, "sample_count": sample_count, "repeats": repeats}, "timestamp": __import__("time").time_ns() // 1_000_000}) + "\n")
-    # endregion
-    destination = Path(output_dir)
-    destination.mkdir(parents=True, exist_ok=True)
-    archive = bench_kimi_k3_grouped_pipeline.remote(
-        git_sha,
-        warmup_count=warmup_count,
-        sample_count=sample_count,
-        repeats=repeats,
-    )
-    # region agent log
-    with open("/opt/cursor/logs/debug.log", "a", encoding="utf-8") as debug_file:
-        debug_file.write(json.dumps({"hypothesisId": "A,B,C,D,E", "location": "modal_app.py:grouped_pipeline:remote", "message": "remote build and benchmark returned", "data": {"archive_bytes": len(archive)}, "timestamp": __import__("time").time_ns() // 1_000_000}) + "\n")
-    # endregion
-    (destination / "artifacts.tar").write_bytes(archive)
-    with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
-        bundle.extractall(destination, filter="data")
-    # region agent log
-    with open("/opt/cursor/logs/debug.log", "a", encoding="utf-8") as debug_file:
-        debug_file.write(json.dumps({"hypothesisId": "E", "location": "modal_app.py:grouped_pipeline:extract", "message": "grouped artifacts extracted", "data": {"artifacts": sorted(path.name for path in destination.iterdir())}, "timestamp": __import__("time").time_ns() // 1_000_000}) + "\n")
-    # endregion
-    results = json.loads((destination / "results.json").read_text(encoding="utf-8"))
-    # region agent log
-    with open("/opt/cursor/logs/debug.log", "a", encoding="utf-8") as debug_file:
-        debug_file.write(json.dumps({"hypothesisId": "A,B,C,D,E", "location": "modal_app.py:grouped_pipeline:results", "message": "grouped numerical performance and phase verdict", "data": {"passed": results["passed"], "rows": [{"tokens": row["tokens"], "passed": row["passed"], "numerically_correct": row["numerically_correct"], "improvement_fraction": row["improvement_fraction"]} for row in results["rows"]], "phase_categories": {tokens: {variant: profile["categories"] for variant, profile in variants.items()} for tokens, variants in results["phase_profiles"].items()}}, "timestamp": __import__("time").time_ns() // 1_000_000}) + "\n")
-    # endregion
-    # region agent log
-    with open("/opt/cursor/logs/debug.log", "a", encoding="utf-8") as debug_file:
-        debug_file.write(json.dumps({"hypothesisId": "A,B,C,D", "location": "modal_app.py:grouped_pipeline:phase_isolation", "message": "down-only phase isolation verdict", "data": {"variants": {tokens: sorted(variants) for tokens, variants in results["phase_profiles"].items()}, "phase_regions": {tokens: {variant: {name: profile["cycles"].get(name, 0) for name in ("routed_gate_up", "routed_gate_up_stage", "routed_gate_up_mma", "routed_down", "routed_down_stage", "routed_down_mma", "grid_barrier")} for variant, profile in variants.items()} for tokens, variants in results["phase_profiles"].items()}, "launch_names": results["launch_names"]}, "timestamp": __import__("time").time_ns() // 1_000_000}) + "\n")
-    # endregion
-    print(
-        "grouped pipeline artifacts: "
-        f"{sorted(path.name for path in destination.iterdir())}"
-    )
 
 
 def _run_framework_comparison(
@@ -781,11 +677,6 @@ def compare(
     before the verdict is signalled, so a failing gate leaves a complete run
     behind rather than an aborted one.
     """
-    import json
-    import tarfile
-
-    from benchmarks.compare_kimi_k3_frameworks import combine_archives
-
     entrypoints = {"vllm": compare_vllm, "sglang": compare_sglang}
     root = Path(output_dir)
     handles = {

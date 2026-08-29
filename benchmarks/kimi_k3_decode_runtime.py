@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterator
 import torch
 import torch.distributed as dist
 
+from mok import _C
 from mok.kimi_k3 import (
     KIMI_K3_LATENT_SIZE,
     KIMI_K3_ROUTED_INTERMEDIATE_SIZE,
@@ -64,8 +65,6 @@ def phase_profiling() -> Iterator[None]:
     The extension refuses the switch outside a benchmark process, so the guard
     is set here rather than expected of the caller.
     """
-    from mok import _C
-
     previous_guard = os.environ.get("MOK_KIMI_K3_ENABLE_GRID_TUNING")
     os.environ["MOK_KIMI_K3_ENABLE_GRID_TUNING"] = "1"
     _C._kimi_k3_decode_set_phase_profile(True)
@@ -79,39 +78,6 @@ def phase_profiling() -> Iterator[None]:
             os.environ["MOK_KIMI_K3_ENABLE_GRID_TUNING"] = previous_guard
 
 
-@contextlib.contextmanager
-def benchmark_decode_variant(
-    *,
-    grouped_pipeline: bool,
-    grid_ctas: int,
-) -> Iterator[None]:
-    """Select one guarded persistent-kernel variant for capture or replay."""
-    from mok import _C
-
-    guards = {
-        "MOK_KIMI_K3_ENABLE_GRID_TUNING":
-            os.environ.get("MOK_KIMI_K3_ENABLE_GRID_TUNING"),
-        "MOK_KIMI_K3_ENABLE_GROUPED_PIPELINE":
-            os.environ.get("MOK_KIMI_K3_ENABLE_GROUPED_PIPELINE"),
-    }
-    os.environ["MOK_KIMI_K3_ENABLE_GRID_TUNING"] = "1"
-    os.environ["MOK_KIMI_K3_ENABLE_GROUPED_PIPELINE"] = "1"
-    _C._kimi_k3_decode_set_benchmark_grid(grid_ctas)
-    _C._kimi_k3_decode_set_grouped_pipeline(grouped_pipeline)
-    try:
-        yield
-    finally:
-        _C._kimi_k3_decode_set_grouped_pipeline(False)
-        _C._kimi_k3_decode_set_benchmark_grid(
-            _C._kimi_k3_decode_grid_shape()[0]
-        )
-        for name, previous in guards.items():
-            if previous is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = previous
-
-
 def phase_clock_cycles(
     workspace: KimiK3DecodeWorkspace,
 ) -> dict[str, int]:
@@ -121,8 +87,6 @@ def phase_clock_cycles(
     so the useful comparison is between regions of one launch rather than
     against wall time.
     """
-    from mok import _C
-
     begin, names = _C._kimi_k3_decode_phase_clock_metadata()
     # `.cpu()` rebases the slice on its own storage, which is what lets the
     # uint8 bytes be reinterpreted as the 64-bit counters they hold.
