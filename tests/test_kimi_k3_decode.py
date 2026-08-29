@@ -592,7 +592,7 @@ def test_the_grid_claims_only_occupied_experts(
     for counter, units in (
         (GATE_UP_QUEUE, gate_up_units),
         (DOWN_QUEUE, down_units),
-        (ROUTE_LATENT_QUEUE, tokens + TENSOR_PROJECTION_UNITS),
+        (ROUTE_LATENT_QUEUE, tokens * SCORE_SHARDS + TENSOR_PROJECTION_UNITS),
     ):
         drained = int(counters[counter].item())
         assert units <= drained <= units + PERSISTENT_CTAS, (counter, drained)
