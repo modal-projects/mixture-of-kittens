@@ -140,7 +140,7 @@ def test_modal_exposes_a_focused_single_b300_probe() -> None:
     assert 'gpu="B300"' in source
 
 
-def test_grouped_pipeline_benchmark_is_exactly_m16_and_m128() -> None:
+def test_grouped_down_benchmark_is_a_same_grid_m16_m128_ab() -> None:
     benchmark = importlib.import_module(
         "benchmarks.kimi_k3_grouped_pipeline"
     )
@@ -149,10 +149,11 @@ def test_grouped_pipeline_benchmark_is_exactly_m16_and_m128() -> None:
     ).read_text(encoding="utf-8")
 
     assert benchmark.TOKENS == (16, 128)
+    assert len(benchmark.VARIANTS) == 2
     assert benchmark.BASELINE.name == "baseline_148"
-    assert benchmark.CANDIDATE.name == "grouped_128"
+    assert benchmark.CANDIDATE.name == "grouped_down_148"
     assert benchmark.CANDIDATE.grouped_pipeline is True
-    assert benchmark.CANDIDATE.grid_ctas == 128
+    assert benchmark.CANDIDATE.grid_ctas == benchmark.BASELINE.grid_ctas == 148
     assert "def bench_kimi_k3_grouped_pipeline(" in modal_source
     assert "def grouped_pipeline(" in modal_source
     assert '"benchmarks.kimi_k3_grouped_pipeline"' in modal_source

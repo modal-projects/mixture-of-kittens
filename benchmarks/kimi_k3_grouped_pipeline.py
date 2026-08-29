@@ -1,4 +1,4 @@
-"""Compare the benchmark-only grouped expert pipeline with the shipped path."""
+"""Compare grouped routed-down with the shipped persistent path."""
 
 from __future__ import annotations
 
@@ -43,12 +43,10 @@ class Variant:
 
 VARIANTS = (
     Variant("baseline_148", False, 148),
-    Variant("baseline_128", False, 128),
-    Variant("grouped_128", True, 128),
-    Variant("grouped_148", True, 148),
+    Variant("grouped_down_148", True, 148),
 )
 BASELINE = VARIANTS[0]
-CANDIDATE = VARIANTS[2]
+CANDIDATE = VARIANTS[1]
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -469,7 +467,7 @@ def run(
                 "sample_count": sample_count,
                 "repeats": repeats,
                 "variants": [dataclasses.asdict(value) for value in VARIANTS],
-                "candidate_status": "benchmark_only",
+                "candidate_status": "benchmark_only_grouped_down",
             },
         )
         _write_json(output_dir / "results.json", result)

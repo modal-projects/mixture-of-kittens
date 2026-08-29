@@ -97,6 +97,7 @@ def test_grouped_pipeline_reuses_activation_across_expert_output_tiles() -> None
     assert "kGroupedM = 128" in grouped
     assert "kGroupedN = 8" in grouped
     assert "kGroupedPhysicalN = 16" in grouped
+    assert "kGroupedDownPersistentSharedBytes = 160 * 1024" in grouped
     assert "(5u << 7)" in grouped
     assert "(0u << 10)" in grouped
     assert "kMmaK = 32" not in grouped
@@ -118,8 +119,8 @@ def test_grouped_pipeline_reuses_activation_across_expert_output_tiles() -> None
     assert "accumulate_grouped_down(" in down
 
 
-def test_grouped_pipeline_is_a_guarded_separate_persistent_instantiation() -> None:
-    """The benchmark switch must not alter the default production launch."""
+def test_grouped_down_is_a_guarded_separate_persistent_instantiation() -> None:
+    """The benchmark switch must change down without changing gate/up."""
     persistent = _source("persistent_kernel.cuh")
     kernel = _function_body(
         persistent,
@@ -129,9 +130,10 @@ def test_grouped_pipeline_is_a_guarded_separate_persistent_instantiation() -> No
     assert "MOK_KIMI_K3_ENABLE_GROUPED_PIPELINE" in persistent
     assert "set_benchmark_grouped_pipeline_for_testing(" in persistent
     assert "benchmark_grouped_pipeline_enabled()" in persistent
-    assert "template<bool TENSOR_PATH, bool GROUPED_PIPELINE>" in persistent
-    assert kernel.count("if constexpr (GROUPED_PIPELINE)") == 2
-    assert "grouped_gate_up_unit(" in kernel
+    assert "template<bool TENSOR_PATH, bool GROUPED_DOWN>" in persistent
+    assert kernel.count("if constexpr (GROUPED_DOWN)") == 1
+    assert "grouped_gate_up_unit(" not in kernel
+    assert kernel.count("routed_gate_up_unit(") == 1
     assert "grouped_down_unit(" in kernel
     assert "launch_persistent<true, false>(" in persistent
     assert "launch_persistent<false, false>(" in persistent

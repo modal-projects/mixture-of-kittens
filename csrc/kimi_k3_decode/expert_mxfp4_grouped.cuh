@@ -632,12 +632,14 @@ static __device__ void grouped_down_unit(
     }
 }
 
-// Gate/up needs 16 KiB of shared activation, 192 KiB of double-buffered
-// weights, and 7 KiB of scales. Leave the remaining 3 KiB of SM103's 227 KiB
-// budget for the kernel's static semaphores and latches.
-inline constexpr int kGroupedPersistentSharedBytes = 224 * 1024;
+// The isolated grouped-down candidate needs 16 KiB of shared activation,
+// 128 KiB of double-buffered weights, and 5 KiB of scales. Keep its launch
+// reservation close to that footprint so the A/B does not carry the rejected
+// grouped gate/up path's 224 KiB reservation as a confound.
+inline constexpr int kGroupedDownPersistentSharedBytes = 160 * 1024;
 
-static_assert(kGroupedPersistentSharedBytes < kittens::MAX_SHARED_MEMORY);
+static_assert(
+    kGroupedDownPersistentSharedBytes < kittens::MAX_SHARED_MEMORY);
 
 }  // namespace grouped_pipeline
 }  // namespace expert_mxfp4
