@@ -15,6 +15,11 @@ inline constexpr int kTopK = 16;
 inline constexpr int kTensorParallelSize = 8;
 inline constexpr int kMaxTokens = 128;
 inline constexpr int kMaxRoutes = kMaxTokens * kTopK;
+inline constexpr float kRoutedAccumulatorScale = 0x1p24f;
+inline constexpr float kRoutedAccumulatorScaleInverse = 0x1p-24f;
+
+static_assert(
+    kRoutedAccumulatorScale * kRoutedAccumulatorScaleInverse == 1.0f);
 
 // The counters occupy one 256-byte scratch region either way, so the persistent
 // kernel's own slots come out of headroom that was already reserved.
@@ -63,6 +68,10 @@ inline constexpr int kSituScaleBytes =
     kSituMxfp8Bytes
     + scratch_byte_region_bytes(
         kMaxRoutes * (kRoutedIntermediateSize / kTensorParallelSize));
+// Production routed-down contributions use a Q24 signed 64-bit sum. Integer
+// addition is order-independent, so expert CTAs can accumulate concurrently
+// without making rank-skewed launches choose different floating-point orders.
+// Private expert-stage tests retain the float view of the same aligned region.
 inline constexpr int kRoutedAccumulatorBytes =
     kSituScaleBytes
     + scratch_byte_region_bytes(
@@ -70,7 +79,8 @@ inline constexpr int kRoutedAccumulatorBytes =
         * (kRoutedIntermediateSize / kTensorParallelSize / 32));
 inline constexpr int kSharedGateBytes =
     kRoutedAccumulatorBytes
-    + scratch_byte_region_bytes(kMaxTokens * kLatentSize * sizeof(float));
+    + scratch_byte_region_bytes(
+        kMaxTokens * kLatentSize * sizeof(long long));
 inline constexpr int kSharedUpBytes =
     kSharedGateBytes
     + scratch_byte_region_bytes(
@@ -130,15 +140,15 @@ static_assert(kLatentScaleBytes == 499200);
 static_assert(kSituMxfp8Bytes == 513536);
 static_assert(kSituScaleBytes == 1299968);
 static_assert(kRoutedAccumulatorBytes == 1324544);
-static_assert(kSharedGateBytes == 3159552);
-static_assert(kSharedUpBytes == 3356160);
-static_assert(kSharedActivatedBytes == 3552768);
-static_assert(kTailNormalizedBytes == 3749376);
-static_assert(kTailSharedShardBytes == 4666880);
-static_assert(kLatentXBytes == 4896256);
-static_assert(kUnitExpertBytes == 5813760);
-static_assert(kRouterScoreBytes == 5817344);
-static_assert(SCRATCH_BYTES == 6276096);
+static_assert(kSharedGateBytes == 4994560);
+static_assert(kSharedUpBytes == 5191168);
+static_assert(kSharedActivatedBytes == 5387776);
+static_assert(kTailNormalizedBytes == 5584384);
+static_assert(kTailSharedShardBytes == 6501888);
+static_assert(kLatentXBytes == 6731264);
+static_assert(kUnitExpertBytes == 7648768);
+static_assert(kRouterScoreBytes == 7652352);
+static_assert(SCRATCH_BYTES == 8111104);
 
 // Generation-tagged completion counters. Each role's last CTA clears its arrival
 // counter and bumps its generation, so a reused workspace never needs a host reset.
@@ -278,7 +288,6 @@ inline constexpr int kErrorTailShardReduce = 5;
 inline constexpr int kErrorTailDrainExit = 6;
 inline constexpr int kErrorPersistentGridBarrier = 7;
 inline constexpr int kErrorPersistentActivation = 8;
-inline constexpr int kErrorPersistentDownOrder = 9;
 
 /// One bounded wait, named by the code it reports and the slots it writes.
 struct TimeoutSite {
@@ -310,14 +319,12 @@ inline constexpr TimeoutSite kTimeoutSites[] = {
      kPersistentTimeoutPhase, kGridGeneration},
     {"persistent_shared_activation", kErrorPersistentActivation,
      kPersistentTimeoutPhase, kActivationArrivals},
-    {"persistent_down_order", kErrorPersistentDownOrder,
-     kPersistentTimeoutPhase, kDownQueue},
 };
 
 inline constexpr int kTimeoutSiteCount =
     static_cast<int>(sizeof(kTimeoutSites) / sizeof(kTimeoutSites[0]));
 
-static_assert(kTimeoutSiteCount == 9);
+static_assert(kTimeoutSiteCount == 8);
 static_assert(kTimeoutSites[kTimeoutSiteCount - 1].code == kTimeoutSiteCount,
               "the timeout codes must be a dense nonzero range");
 
@@ -335,6 +342,7 @@ struct Scratch {
     std::uint8_t *situ_mxfp8;
     std::uint8_t *situ_scale;
     float *routed_accumulator;
+    long long *routed_accumulator_fixed;
     __nv_bfloat16 *shared_gate;
     __nv_bfloat16 *shared_up;
     __nv_bfloat16 *shared_activated;
@@ -343,7 +351,6 @@ struct Scratch {
     __nv_bfloat16 *latent_x;
     int *unit_expert;
     float *router_scores;
-    int *down_progress;
 };
 
 __host__ __device__ inline Scratch scratch_view(std::uint8_t *base) {
@@ -360,6 +367,7 @@ __host__ __device__ inline Scratch scratch_view(std::uint8_t *base) {
         base + kSituMxfp8Bytes,
         base + kSituScaleBytes,
         reinterpret_cast<float *>(base + kRoutedAccumulatorBytes),
+        reinterpret_cast<long long *>(base + kRoutedAccumulatorBytes),
         reinterpret_cast<__nv_bfloat16 *>(base + kSharedGateBytes),
         reinterpret_cast<__nv_bfloat16 *>(base + kSharedUpBytes),
         reinterpret_cast<__nv_bfloat16 *>(base + kSharedActivatedBytes),
@@ -368,7 +376,6 @@ __host__ __device__ inline Scratch scratch_view(std::uint8_t *base) {
         reinterpret_cast<__nv_bfloat16 *>(base + kLatentXBytes),
         reinterpret_cast<int *>(base + kUnitExpertBytes),
         reinterpret_cast<float *>(base + kRouterScoreBytes),
-        reinterpret_cast<int *>(base + kRouterScoreBytes),
     };
 }
 

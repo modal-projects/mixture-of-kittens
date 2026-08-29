@@ -735,18 +735,20 @@ def test_rotating_rank_skew_leaves_the_step_bit_identical(
     torch.cuda.synchronize(device)
     assert_decode_close(baseline, expected)
     baseline_routed = _region(
-        workspace.scratch, "routed_accumulator", torch.float32
+        workspace.scratch, "routed_accumulator", torch.int64
     )[: tokens * LATENT].clone()
     # region agent log
     with open("/opt/cursor/logs/debug.log", "a", encoding="utf-8") as debug_file:
         debug_file.write(json.dumps({
-            "hypothesisId": "D2,D4",
+            "hypothesisId": "F2,F4",
             "location": "tests/test_kimi_k3_decode.py:skew_baseline",
             "message": "rank-skew baseline completed",
             "data": {
                 "rank": rank,
                 "gate_up_counter": int(_phase(workspace.scratch)[GATE_UP_QUEUE].item()),
                 "down_counter": int(_phase(workspace.scratch)[DOWN_QUEUE].item()),
+                "fixed_min": int(baseline_routed.min().item()),
+                "fixed_max": int(baseline_routed.max().item()),
             },
             "timestamp": time.time_ns() // 1_000_000,
         }) + "\n")
@@ -761,7 +763,7 @@ def test_rotating_rank_skew_leaves_the_step_bit_identical(
         # region agent log
         with open("/opt/cursor/logs/debug.log", "a", encoding="utf-8") as debug_file:
             debug_file.write(json.dumps({
-                "hypothesisId": "D1,D2,D3,D4",
+                "hypothesisId": "F1,F2,F4",
                 "location": "tests/test_kimi_k3_decode.py:skew_comparison",
                 "message": "rank-skew replay compared with baseline",
                 "data": {
@@ -781,7 +783,7 @@ def test_rotating_rank_skew_leaves_the_step_bit_identical(
             }) + "\n")
         # endregion
         routed_difference = (
-            _region(workspace.scratch, "routed_accumulator", torch.float32)[
+            _region(workspace.scratch, "routed_accumulator", torch.int64)[
                 : tokens * LATENT
             ]
             - baseline_routed
@@ -789,7 +791,7 @@ def test_rotating_rank_skew_leaves_the_step_bit_identical(
         # region agent log
         with open("/opt/cursor/logs/debug.log", "a", encoding="utf-8") as debug_file:
             debug_file.write(json.dumps({
-                "hypothesisId": "D1,D3",
+                "hypothesisId": "F2",
                 "location": "tests/test_kimi_k3_decode.py:skew_routed_accumulator",
                 "message": "rank-skew routed accumulator compared with baseline",
                 "data": {

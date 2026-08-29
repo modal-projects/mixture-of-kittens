@@ -72,7 +72,10 @@ def _scratch_layout() -> dict[str, tuple[int, int]]:
         ("latent_scale", KIMI_K3_MAX_TOKENS * (KIMI_K3_LATENT_SIZE // 32) // 4),
         ("situ_mxfp8", KIMI_K3_MAX_ROUTES * 384 // 4),
         ("situ_scale", KIMI_K3_MAX_ROUTES * (384 // 32) // 4),
-        ("routed_accumulator", KIMI_K3_MAX_TOKENS * KIMI_K3_LATENT_SIZE),
+        (
+            "routed_accumulator",
+            KIMI_K3_MAX_TOKENS * KIMI_K3_LATENT_SIZE * 2,
+        ),
         ("shared_gate", KIMI_K3_MAX_TOKENS * 768 // 2),
         ("shared_up", KIMI_K3_MAX_TOKENS * 768 // 2),
         ("shared_activated", KIMI_K3_MAX_TOKENS * 768 // 2),
@@ -310,7 +313,7 @@ def test_workspace_bytes_matches_the_documented_scratch_layout(
 ) -> None:
     from mok import _C
 
-    assert SCRATCH_BYTES == 6_276_096
+    assert SCRATCH_BYTES == 8_111_104
     assert _C.kimi_k3_decode_workspace_bytes() == SCRATCH_BYTES
     assert SCRATCH_LAYOUT["phase"][0] == 0
     assert SCRATCH_LAYOUT["expert_ids"][0] * 4 % SCRATCH_ALIGNMENT == 0
@@ -324,11 +327,11 @@ def test_workspace_bytes_matches_the_documented_scratch_layout(
     assert SCRATCH_LAYOUT["situ_mxfp8"][0] * 4 == 513_536
     assert SCRATCH_LAYOUT["situ_scale"][0] * 4 == 1_299_968
     assert SCRATCH_LAYOUT["routed_accumulator"][0] * 4 == 1_324_544
-    assert SCRATCH_LAYOUT["shared_gate"][0] * 4 == 3_159_552
-    assert SCRATCH_LAYOUT["shared_up"][0] * 4 == 3_356_160
-    assert SCRATCH_LAYOUT["shared_activated"][0] * 4 == 3_552_768
-    assert SCRATCH_LAYOUT["tail_normalized"][0] * 4 == 3_749_376
-    assert SCRATCH_LAYOUT["tail_shared_shard"][0] * 4 == 4_666_880
+    assert SCRATCH_LAYOUT["shared_gate"][0] * 4 == 4_994_560
+    assert SCRATCH_LAYOUT["shared_up"][0] * 4 == 5_191_168
+    assert SCRATCH_LAYOUT["shared_activated"][0] * 4 == 5_387_776
+    assert SCRATCH_LAYOUT["tail_normalized"][0] * 4 == 5_584_384
+    assert SCRATCH_LAYOUT["tail_shared_shard"][0] * 4 == 6_501_888
 
 
 @pytest.mark.parametrize("tokens", [1, 8, 16, 128])

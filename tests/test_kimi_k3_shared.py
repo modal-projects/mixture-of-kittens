@@ -57,7 +57,7 @@ def _scratch_layout() -> dict[str, tuple[int, int]]:
         ("latent_scale", MAX_TOKENS * (LATENT // GROUP)),
         ("situ_mxfp8", MAX_TOKENS * 16 * 384),
         ("situ_scale", MAX_TOKENS * 16 * (384 // GROUP)),
-        ("routed_accumulator", MAX_TOKENS * LATENT * 4),
+        ("routed_accumulator", MAX_TOKENS * LATENT * 8),
         ("shared_gate", MAX_TOKENS * INTERMEDIATE * 2),
         ("shared_up", MAX_TOKENS * INTERMEDIATE * 2),
         ("shared_activated", MAX_TOKENS * INTERMEDIATE * 2),
@@ -293,13 +293,13 @@ def _assert_active_intermediates(
 def test_workspace_bytes_matches_shared_scratch_source_of_truth(
     device: torch.device,
 ) -> None:
-    assert SCRATCH_BYTES == 6_276_096
+    assert SCRATCH_BYTES == 8_111_104
     assert _C.kimi_k3_decode_workspace_bytes() == SCRATCH_BYTES
-    assert SCRATCH_LAYOUT["shared_gate"] == (3_159_552, 196_608)
-    assert SCRATCH_LAYOUT["shared_up"] == (3_356_160, 196_608)
-    assert SCRATCH_LAYOUT["shared_activated"] == (3_552_768, 196_608)
-    assert SCRATCH_LAYOUT["tail_normalized"] == (3_749_376, 917_504)
-    assert SCRATCH_LAYOUT["tail_shared_shard"] == (4_666_880, 229_376)
+    assert SCRATCH_LAYOUT["shared_gate"] == (4_994_560, 196_608)
+    assert SCRATCH_LAYOUT["shared_up"] == (5_191_168, 196_608)
+    assert SCRATCH_LAYOUT["shared_activated"] == (5_387_776, 196_608)
+    assert SCRATCH_LAYOUT["tail_normalized"] == (5_584_384, 917_504)
+    assert SCRATCH_LAYOUT["tail_shared_shard"] == (6_501_888, 229_376)
     for name, (offset, _) in SCRATCH_LAYOUT.items():
         if name != "total_bytes":
             assert offset % ALIGNMENT == 0, name

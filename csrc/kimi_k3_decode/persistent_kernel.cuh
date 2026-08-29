@@ -445,7 +445,7 @@ void kimi_k3_decode_persistent_kernel(
     for (int index = block * kDecodeCtaThreads + thread;
          index < routed_values;
          index += grid_ctas * kDecodeCtaThreads) {
-        scratch.routed_accumulator[index] = 0.0f;
+        scratch.routed_accumulator_fixed[index] = 0;
     }
     mark = clocks.lap(kClockQueueClear, mark);
     grid_barrier(scratch, error_flag, grid, grid_ctas);
@@ -514,13 +514,6 @@ void kimi_k3_decode_persistent_kernel(
         router::build_expert_units(shared, scratch);
         __syncthreads();
         mark = clocks.lap(kClockAssignments, mark);
-    }
-    const int down_chains =
-        active_tokens * expert_mxfp4::grouped_pipeline::kGroupedDownUnits;
-    for (int index = block * kDecodeCtaThreads + thread;
-         index < down_chains;
-         index += grid_ctas * kDecodeCtaThreads) {
-        scratch.down_progress[index] = 0;
     }
     expert_mxfp4::quantize_latent_rows(
         scratch.latent_x, scratch, active_tokens, block, grid_ctas);
@@ -652,7 +645,7 @@ void kimi_k3_decode_persistent_kernel(
                     shared_raw, tensor_pool, expert_w2_packed,
                     expert_w2_scale, scratch, expert, begin,
                     scratch.expert_offsets[expert + 1] - begin,
-                    routed % routed_units_per_expert, error_flag, clocks);
+                    routed % routed_units_per_expert, clocks);
                 __syncthreads();
                 mark = clocks.lap(kClockRoutedDown, mark);
             }
@@ -674,7 +667,9 @@ void kimi_k3_decode_persistent_kernel(
         collective_buffer[
             static_cast<long long>(row) * shared_experts::kCollectiveColumns
             + index - row * kLatentSize] =
-                __float2bfloat16(scratch.routed_accumulator[index]);
+                __float2bfloat16(
+                    __ll2float_rn(scratch.routed_accumulator_fixed[index])
+                    * kRoutedAccumulatorScaleInverse);
     }
     // The barrier releases at system scope, so this rank's whole collective
     // buffer is visible to its peers before its coordinator opens the entry

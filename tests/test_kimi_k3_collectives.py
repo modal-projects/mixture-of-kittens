@@ -68,11 +68,11 @@ from .kimi_k3_tail_support import (
 def test_tail_scratch_layout_matches_the_compiled_source_of_truth(
     workspace: KimiK3DecodeWorkspace,
 ) -> None:
-    assert SCRATCH_BYTES == 6_276_096
+    assert SCRATCH_BYTES == 8_111_104
     assert _C.kimi_k3_decode_workspace_bytes() == SCRATCH_BYTES
     assert workspace.scratch.numel() == SCRATCH_BYTES
-    assert SCRATCH_LAYOUT["tail_normalized"] == (3_749_376, 917_504)
-    assert SCRATCH_LAYOUT["tail_shared_shard"] == (4_666_880, 229_376)
+    assert SCRATCH_LAYOUT["tail_normalized"] == (5_584_384, 917_504)
+    assert SCRATCH_LAYOUT["tail_shared_shard"] == (6_501_888, 229_376)
     for name, (offset, _) in SCRATCH_LAYOUT.items():
         if name != "total_bytes":
             assert offset % ALIGNMENT == 0, name

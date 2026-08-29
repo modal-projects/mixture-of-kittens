@@ -123,7 +123,7 @@ def _scratch_layout() -> dict[str, tuple[int, int]]:
         ("latent_scale", MAX_TOKENS * (LATENT // 32)),
         ("situ_mxfp8", MAX_TOKENS * 16 * 384),
         ("situ_scale", MAX_TOKENS * 16 * (384 // 32)),
-        ("routed_accumulator", MAX_TOKENS * LATENT * 4),
+        ("routed_accumulator", MAX_TOKENS * LATENT * 8),
         ("shared_gate", MAX_TOKENS * 768 * 2),
         ("shared_up", MAX_TOKENS * 768 * 2),
         ("shared_activated", MAX_TOKENS * 768 * 2),

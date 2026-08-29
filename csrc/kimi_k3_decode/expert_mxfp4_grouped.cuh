@@ -200,64 +200,36 @@ __device__ __forceinline__ void store_grouped_accumulator(
     }
 }
 
-__device__ __forceinline__ void accumulate_grouped_down_ordered(
+__device__ __forceinline__ void accumulate_grouped_down_fixed(
     const grouped_result_tile (&result)[kGroupedDownWidth],
     const Scratch &scratch,
     const int assignment_begin,
     const int batch_rows,
-    const int expert,
-    const int output_group,
     const int tile_start,
-    const int tile_count,
-    int *__restrict__ const error_flag
+    const int tile_count
 ) {
     const int thread = static_cast<int>(threadIdx.x);
-    for (int row = 0; row < batch_rows; ++row) {
+    const int columns = tile_count * kMmaN;
+    for (int index = thread; index < batch_rows * columns;
+         index += kDecodeCtaThreads) {
+        const int row = index / columns;
+        const int within_row = index % columns;
+        const int tile = within_row / kMmaN;
+        const int column = within_row % kMmaN;
         const int assignment = assignment_begin + row;
         const int token = scratch.assignment_tokens[assignment];
-        const int progress_index =
-            token * kGroupedDownUnits + output_group;
-        if (thread == 0) {
-            int order = 0;
-            for (int slot = 0; slot < kTopK; ++slot) {
-                order += scratch.expert_ids[token * kTopK + slot] < expert;
-            }
-            const std::uint64_t started = clock64();
-            while (persistent::load_relaxed_gpu(
-                       &scratch.down_progress[progress_index])
-                   < static_cast<std::uint32_t>(order)) {
-                if (persistent::wait_timed_out(started, clock64())) {
-                    persistent::record_timeout_and_trap(
-                        scratch, error_flag, kDownQueue,
-                        kErrorPersistentDownOrder);
-                }
-                __nanosleep(64);
-            }
-        }
-        __syncthreads();
-        __threadfence();
-
+        const int output_base = (tile_start + tile) * kMmaN;
         const float route_weight =
             decode_route_weight(scratch, assignment);
-        for (int index = thread; index < tile_count * kMmaN;
-             index += kDecodeCtaThreads) {
-            const int tile = index / kMmaN;
-            const int column = index % kMmaN;
-            const int output_base = (tile_start + tile) * kMmaN;
-            scratch.routed_accumulator[
-                static_cast<long long>(token) * kLatentSize
-                + output_base + column] +=
-                    result[tile][{column, row}] * route_weight;
-        }
-        __threadfence();
-        __syncthreads();
-        if (thread == 0) {
-            atomicAdd(
-                reinterpret_cast<unsigned int *>(
-                    &scratch.down_progress[progress_index]),
-                1u);
-        }
-        __syncthreads();
+        const long long contribution = __float2ll_rn(
+            result[tile][{column, row}]
+            * route_weight * kRoutedAccumulatorScale);
+        atomicAdd(
+            reinterpret_cast<unsigned long long *>(
+                &scratch.routed_accumulator_fixed[
+                    static_cast<long long>(token) * kLatentSize
+                    + output_base + column]),
+            static_cast<unsigned long long>(contribution));
     }
 }
 
@@ -271,7 +243,6 @@ static __device__ void grouped_down_unit(
     const int assignment_begin,
     const int batch_rows,
     const int output_group,
-    int *__restrict__ const error_flag,
     const PhaseClocks clocks
 ) {
     using namespace kittens;
@@ -385,9 +356,9 @@ static __device__ void grouped_down_unit(
             store_grouped_accumulator(accumulator(tile), result[tile]);
         }
         __syncthreads();
-        accumulate_grouped_down_ordered(
-            result, scratch, batch_begin, rows, expert, output_group,
-            tile_start, tile_count, error_flag);
+        accumulate_grouped_down_fixed(
+            result, scratch, batch_begin, rows, tile_start, tile_count);
+        __syncthreads();
     }
 }
 
