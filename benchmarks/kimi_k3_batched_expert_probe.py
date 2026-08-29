@@ -316,6 +316,79 @@ def _manifest(
     }
 
 
+def run_focused(
+    *,
+    rows: int,
+    variant: str,
+) -> dict[str, object]:
+    """Run setup or one rows<=8 launch with an immediate synchronization."""
+    if rows < 1 or rows > max(PROBE_ROWS):
+        raise ValueError("focused probe rows must be between 1 and 8")
+    if variant not in ("setup", "baseline", "candidate", "both"):
+        raise ValueError(
+            "focused probe variant must be setup, baseline, candidate, or both"
+        )
+    if not torch.cuda.is_available():
+        raise RuntimeError("the batched expert probe requires CUDA")
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
+    if torch.cuda.get_device_capability(device) != (10, 3):
+        raise RuntimeError("the batched expert probe requires an SM103 B300")
+    extension = _extension()
+    weights = _weight_pool(device, 1)
+    generator = torch.Generator(device=device).manual_seed(7500)
+    latent = (
+        torch.randn(
+            rows,
+            LATENT,
+            dtype=torch.float32,
+            device=device,
+            generator=generator,
+        )
+        * 0.25
+    ).bfloat16()
+    baseline_output = torch.empty_like(latent)
+    candidate_output = torch.empty_like(latent)
+    scratch = torch.empty(SCRATCH_BYTES, dtype=torch.uint8, device=device)
+
+    torch.cuda.synchronize(device)
+    print(f"focused probe setup synchronized: rows={rows}", flush=True)
+    result: dict[str, object] = {
+        "rows": rows,
+        "variant": variant,
+        "setup_synchronized": True,
+    }
+    if variant == "setup":
+        return result
+    if variant == "both":
+        result["numerical"] = _numerical_metrics(
+            extension,
+            latent,
+            weights,
+            baseline_output,
+            candidate_output,
+            scratch,
+            rows,
+        )
+        return result
+
+    output = baseline_output if variant == "baseline" else candidate_output
+    _call(
+        extension,
+        latent,
+        weights,
+        output,
+        scratch,
+        0,
+        variant == "candidate",
+    )
+    torch.cuda.synchronize(device)
+    result["launch_synchronized"] = True
+    result["finite"] = bool(torch.isfinite(output.float()).all())
+    result["checksum"] = float(output.float().sum())
+    return result
+
+
 def run(
     output_dir: Path,
     *,
@@ -577,11 +650,24 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-count", type=int, default=SAMPLE_COUNT)
     parser.add_argument("--repeats", type=int, default=REPEATS)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--focus-rows", type=int)
+    parser.add_argument(
+        "--focus-variant",
+        choices=("setup", "baseline", "candidate", "both"),
+        default="both",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
+    if args.focus_rows is not None:
+        focused = run_focused(
+            rows=args.focus_rows,
+            variant=args.focus_variant,
+        )
+        print(json.dumps(focused, indent=2, sort_keys=True))
+        return
     if args.dry_run:
         manifest = _manifest(
             dry_run=True,

@@ -35,6 +35,19 @@ def test_probe_rows_are_exactly_the_native_token_columns() -> None:
     assert probe.PROBE_ROWS == (1, 2, 4, 8)
 
 
+def test_probe_exposes_rows_one_single_launch_diagnostics() -> None:
+    source = (
+        Path(__file__).parents[1]
+        / "benchmarks"
+        / "kimi_k3_batched_expert_probe.py"
+    ).read_text(encoding="utf-8")
+
+    assert "def run_focused(" in source
+    assert '"setup", "baseline", "candidate", "both"' in source
+    assert '"--focus-rows"' in source
+    assert '"--focus-variant"' in source
+
+
 def test_measurement_requires_a_gain_outside_repeat_dispersion() -> None:
     probe = importlib.import_module(
         "benchmarks.kimi_k3_batched_expert_probe"
@@ -109,6 +122,9 @@ def test_modal_exposes_a_focused_single_b300_probe() -> None:
     )
 
     assert "def bench_kimi_k3_batched_expert_probe(" in source
+    assert "def diagnose_kimi_k3_batched_expert_probe(" in source
     assert "def batched_expert_probe(" in source
+    assert "def batched_expert_diagnostic(" in source
     assert '"benchmarks.kimi_k3_batched_expert_probe"' in source
+    assert '"compute-sanitizer"' in source
     assert 'gpu="B300"' in source

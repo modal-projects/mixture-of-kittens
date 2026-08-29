@@ -431,6 +431,62 @@ def bench_kimi_k3_batched_expert_probe(
         return archive
 
 
+@app.function(image=B300_IMAGE, gpu="B300", timeout=7_200)
+def diagnose_kimi_k3_batched_expert_probe(
+    variant: str = "candidate",
+    rows: int = 1,
+    sanitizer: bool = True,
+) -> dict[str, int | str]:
+    """Run one synchronized probe launch, optionally under CUDA memcheck."""
+    if variant not in ("setup", "baseline", "candidate", "both"):
+        raise ValueError(
+            "variant must be setup, baseline, candidate, or both"
+        )
+    if rows < 1 or rows > 8:
+        raise ValueError("rows must be between 1 and 8")
+    probe_command = [
+        "python",
+        "-m",
+        "benchmarks.kimi_k3_batched_expert_probe",
+        "--focus-rows",
+        str(rows),
+        "--focus-variant",
+        variant,
+    ]
+    command = (
+        [
+            "compute-sanitizer",
+            "--tool",
+            "memcheck",
+            "--error-exitcode",
+            "99",
+            "--show-backtrace",
+            "yes",
+            *probe_command,
+        ]
+        if sanitizer
+        else probe_command
+    )
+    print(f"Launching: {' '.join(command)} on 1 x B300")
+    completed = subprocess.run(
+        command,
+        cwd=REMOTE_ROOT,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+        timeout=7_100,
+    )
+    print(completed.stdout, end="")
+    print(f"focused probe exit code: {completed.returncode}")
+    return {
+        "command": " ".join(command),
+        "exit_code": completed.returncode,
+        "output": completed.stdout,
+    }
+
+
 @app.local_entrypoint()
 def batched_expert_probe(
     git_sha: str,
@@ -455,6 +511,28 @@ def batched_expert_probe(
         "batched expert probe artifacts: "
         f"{sorted(path.name for path in destination.iterdir())}"
     )
+
+
+@app.local_entrypoint()
+def batched_expert_diagnostic(
+    variant: str = "candidate",
+    rows: int = 1,
+    sanitizer: bool = True,
+    output_path: str = "kimi_k3_batched_expert_diagnostic.log",
+) -> None:
+    """Run and persist one focused B300 diagnostic invocation."""
+    result = diagnose_kimi_k3_batched_expert_probe.remote(
+        variant=variant,
+        rows=rows,
+        sanitizer=sanitizer,
+    )
+    rendered = (
+        f"command: {result['command']}\n"
+        f"exit_code: {result['exit_code']}\n"
+        f"{result['output']}"
+    )
+    Path(output_path).write_text(rendered, encoding="utf-8")
+    print(rendered, end="")
 
 
 def _run_framework_comparison(
