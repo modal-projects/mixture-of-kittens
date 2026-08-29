@@ -64,13 +64,20 @@ scale_factor_1x_offset(const int row, const int k_group) {
          + k_group;
 }
 
-template<int SCALE_FACTOR_ID, bool ACCUMULATE>
+/// Issue one K=32 block-scaled contraction into `destination`.
+///
+/// `accumulate` is a run-time predicate rather than a template argument
+/// because a unit now issues a whole round of K groups from one unrolled body:
+/// only the very first issue of a unit clears the accumulator, and branching
+/// the body on that would duplicate every instruction in the round.
+template<int SCALE_FACTOR_ID>
 __device__ __forceinline__ void mixed_mma(
     const mixed_accumulator_tile &destination,
     const mixed_operand_tile &a,
     const mixed_operand_tile &b,
     const kittens::full_tt_fp8e8m0<16> &scale_a,
-    const kittens::full_tt_fp8e8m0<16> &scale_b
+    const kittens::full_tt_fp8e8m0<16> &scale_b,
+    const bool accumulate
 ) {
     kittens::st_descriptor<mixed_operand_tile, kittens::transpose::N> a_desc(a);
     kittens::st_descriptor<mixed_operand_tile, kittens::transpose::N> b_desc(b);
@@ -94,7 +101,7 @@ __device__ __forceinline__ void mixed_mma(
           "r"(instruction),
           "r"(scale_a.addr),
           "r"(scale_b.addr),
-          "n"(ACCUMULATE ? 1 : 0)
+          "r"(accumulate ? 1u : 0u)
     );
 }
 
@@ -264,7 +271,7 @@ void mixed_mma_probe_kernel(
     __syncthreads();
 
     if (thread == 0) {
-        mixed_mma<0, false>(accumulator, a_tile, b_tile, scale_a, scale_b);
+        mixed_mma<0>(accumulator, a_tile, b_tile, scale_a, scale_b, false);
         detail::tcgen05::commit<1>(compute_done);
     }
     wait(compute_done, 0);
@@ -304,101 +311,108 @@ __device__ __forceinline__ float decode_route_weight(
     return scratch.expert_weights[token * kTopK + slot];
 }
 
-__device__ __forceinline__ void load_quantized_activation_tile(
+// ---------------------------------------------------------------------------
+// Operand staging.
+//
+// Every byte a routed unit stages moves in sixteen-byte vectors. A shared tile
+// row is two sixteen-byte swizzle atoms and the swizzle only ever permutes
+// whole atoms, so an atom is contiguous and aligned however the tile is
+// placed, and a whole atom is one store. The measured decode profile put
+// 76.5% of all cycles in the byte-at-a-time staging these replace.
+// ---------------------------------------------------------------------------
+
+/// One shared tile row's two sixteen-byte atoms.
+__device__ __forceinline__ uint4 *atom_of(
     mixed_operand_tile &tile,
-    mixed_scale_tile &scale_shared,
-    const Scratch &scratch,
-    const int assignment_begin,
-    const int batch_rows,
-    const int k_group,
-    const bool situ
+    const int row,
+    const int atom
 ) {
-    const int thread = static_cast<int>(threadIdx.x);
-    const int width = situ ? kRoutedIntermediateSizePerRank : kLatentSize;
-    const std::uint8_t *const values =
-        situ ? scratch.situ_mxfp8 : scratch.latent_mxfp8;
-    const std::uint8_t *const scales =
-        situ ? scratch.situ_scale : scratch.latent_scale;
-    const int groups = width / kMmaK;
+    return reinterpret_cast<uint4 *>(&tile[{row, atom * 16}]);
+}
 
-    for (int index = thread; index < kMmaM * kMmaK;
+/// Fill one operand tile with the bytes no K group ever rewrites.
+///
+/// Two kinds of byte live here for a whole unit. An MXFP4 row only occupies
+/// the front eight bytes of each atom -- the packed layout the MMA reads is
+/// `16U4_ALIGN16B` -- and a batch shorter than the MMA's 128 rows leaves whole
+/// rows out of the contraction. Both are zero for every K group, so writing
+/// them once per unit replaces writing them 112 times.
+__device__ __forceinline__ void clear_operand_tile(mixed_operand_tile &tile) {
+    uint4 *const raw = reinterpret_cast<uint4 *>(tile.data);
+    constexpr int vectors = kMmaM * kMmaK / 16;
+    for (int index = static_cast<int>(threadIdx.x); index < vectors;
          index += kDecodeCtaThreads) {
-        const int row = index / kMmaK;
-        const int column = index % kMmaK;
-        std::uint8_t value = 0;
-        if (row < batch_rows) {
-            const int assignment = assignment_begin + row;
-            const int source_row =
-                situ ? assignment : scratch.assignment_tokens[assignment];
-            value = values[
-                static_cast<long long>(source_row) * width
-                + k_group * kMmaK + column];
-        }
-        *reinterpret_cast<std::uint8_t *>(&tile[{row, column}]) = value;
-    }
-
-    for (int index = thread; index < kScaleRows * kScaleColumns;
-         index += kDecodeCtaThreads) {
-        reinterpret_cast<std::uint8_t *>(scale_shared.data)[index] = 0x7fu;
-    }
-    __syncthreads();
-    for (int row = thread; row < kMmaM; row += kDecodeCtaThreads) {
-        std::uint8_t scale = 0x7fu;
-        if (row < batch_rows) {
-            const int assignment = assignment_begin + row;
-            const int source_row =
-                situ ? assignment : scratch.assignment_tokens[assignment];
-            scale = scales[
-                static_cast<long long>(source_row) * groups + k_group];
-        }
-        reinterpret_cast<std::uint8_t *>(scale_shared.data)
-            [scale_factor_1x_offset(row, 0)] = scale;
+        raw[index] = make_uint4(0u, 0u, 0u, 0u);
     }
 }
 
-__device__ __forceinline__ void load_mxfp4_weight_tile(
-    mixed_operand_tile &tile,
-    mixed_scale_tile &scale_shared,
-    const std::uint8_t *__restrict__ packed,
-    const std::uint8_t *__restrict__ scales,
-    const int expert,
-    const int rows,
-    const int packed_columns,
-    const int scale_columns,
-    const int output_base,
-    const int k_group
-) {
-    const int thread = static_cast<int>(threadIdx.x);
-    for (int index = thread; index < kMmaN * kMmaK;
+/// Fill one scale tile with the unit scale its padding holds for a whole unit.
+///
+/// Only every fourth byte of a `scale_vec::1X` tile is a live scale factor.
+/// The staging below writes a live byte and its three padding bytes as one
+/// word, so this only has to cover the rows a short batch never writes.
+__device__ __forceinline__ void clear_scale_tile(mixed_scale_tile &tile) {
+    std::uint32_t *const raw =
+        reinterpret_cast<std::uint32_t *>(tile.data);
+    constexpr int words = kScaleRows * kScaleColumns / 4;
+    for (int index = static_cast<int>(threadIdx.x); index < words;
          index += kDecodeCtaThreads) {
-        const int row = index / kMmaK;
-        const int shared_column = index % kMmaK;
-        const int column_in_16b_atom = shared_column % 16;
-        std::uint8_t value = 0;
-        if (column_in_16b_atom < 8) {
-            const int packed_column =
-                k_group * (kMmaK / 2)
-                + (shared_column / 16) * 8 + column_in_16b_atom;
-            const long long row_index =
-                static_cast<long long>(expert) * rows + output_base + row;
-            value = packed[row_index * packed_columns + packed_column];
-        }
-        *reinterpret_cast<std::uint8_t *>(
-            &tile[{row, shared_column}]) = value;
+        raw[index] = 0x7f7f7f7fu;
     }
+}
 
-    for (int index = thread; index < kScaleRows * kScaleColumns;
-         index += kDecodeCtaThreads) {
-        reinterpret_cast<std::uint8_t *>(scale_shared.data)[index] = 0x7fu;
-    }
-    __syncthreads();
-    for (int row = thread; row < kMmaN; row += kDecodeCtaThreads) {
-        const long long row_index =
-            static_cast<long long>(expert) * rows + output_base + row;
-        reinterpret_cast<std::uint8_t *>(scale_shared.data)
-            [scale_factor_1x_offset(row, 0)] =
-                scales[row_index * scale_columns + k_group];
-    }
+/// Write one row's live scale factor without disturbing its padding.
+///
+/// `scale_factor_1x_offset` is always a multiple of four and the live byte is
+/// the low byte of that word, so one word store carries the factor and repeats
+/// the unit scale the three padding bytes already held.
+__device__ __forceinline__ void stage_scale(
+    mixed_scale_tile &scale_shared,
+    const int row,
+    const std::uint8_t scale
+) {
+    reinterpret_cast<std::uint32_t *>(
+        scale_shared.data)[scale_factor_1x_offset(row, 0) / 4] =
+            0x7f7f7f00u | static_cast<std::uint32_t>(scale);
+}
+
+/// One byte of a round's eight consecutive scale factors.
+///
+/// The round reads them as one vector and the caller unrolls over `slot`, so
+/// this is a register select rather than an addressed load.
+__device__ __forceinline__ std::uint8_t scale_byte(
+    const uint2 payload,
+    const int slot
+) {
+    const std::uint32_t word = slot < 4 ? payload.x : payload.y;
+    return static_cast<std::uint8_t>(word >> (8 * (slot & 3)));
+}
+
+/// Stage one MXFP8 activation row: thirty-two live bytes, two atoms.
+__device__ __forceinline__ void stage_activation_row(
+    mixed_operand_tile &tile,
+    const int row,
+    const std::uint8_t *__restrict__ source
+) {
+    *atom_of(tile, row, 0) = *reinterpret_cast<const uint4 *>(source);
+    *atom_of(tile, row, 1) = *reinterpret_cast<const uint4 *>(source + 16);
+}
+
+/// Stage one MXFP4 weight row: sixteen packed bytes, eight per atom.
+///
+/// `16U4_ALIGN16B` puts sixteen packed U4 values at the front of each atom, so
+/// the row's first eight source bytes head the first atom and its last eight
+/// head the second. The rest of each atom is the zero `clear_operand_tile`
+/// already wrote and the MMA never reads.
+__device__ __forceinline__ void stage_weight_row(
+    mixed_operand_tile &tile,
+    const int row,
+    const uint4 payload
+) {
+    *reinterpret_cast<uint2 *>(atom_of(tile, row, 0)) =
+        make_uint2(payload.x, payload.y);
+    *reinterpret_cast<uint2 *>(atom_of(tile, row, 1)) =
+        make_uint2(payload.z, payload.w);
 }
 
 __device__ __forceinline__ void store_accumulator(
@@ -548,19 +562,97 @@ __device__ __forceinline__ void accumulate_down_tile(
 // commit before returning: nothing is ever in flight across the boundary.
 // ---------------------------------------------------------------------------
 
-/// Shared bytes one gate/up unit stages, which is the widest of any K3 stage.
+// ---------------------------------------------------------------------------
+// K-group rounds.
+//
+// A unit stages a whole round of K groups, issues every one of the round's
+// contractions, and waits once. Three things follow from that and all three
+// are why it is done this way.
+//
+// The round's global reads of one weight row are contiguous: K group `g` reads
+// packed bytes `[16g, 16g + 16)` of the row, so eight groups is one 128-byte
+// span and twelve is a whole 192-byte W2 row. Its scale reads are contiguous
+// for the same reason, which turns what was one strided byte per group into
+// one vector for the round.
+//
+// The round's reads are also all in flight at once. Sixteen bytes per group
+// per row is one vector register, so a thread issues the round's loads back to
+// back before it consumes any of them, and the memory system sees the whole
+// round's parallelism rather than one group's.
+//
+// And the round amortizes synchronization. The measured profile of the
+// unbatched loop spent 15% of the decode step inside barriers, six per K
+// group; a round costs two whatever its width.
+// ---------------------------------------------------------------------------
+
+/// K groups one gate/up round stages. 112 latent groups is fourteen rounds.
+inline constexpr int kGateUpRoundGroups = 8;
+inline constexpr int kGateUpRounds = kLatentGroups / kGateUpRoundGroups;
+
+/// K groups one down round stages, which is every group the SiTU width has.
+inline constexpr int kDownRoundGroups = kSituGroups;
+inline constexpr int kDownRounds = kSituGroups / kDownRoundGroups;
+
+static_assert(kLatentGroups % kGateUpRoundGroups == 0);
+static_assert(kGateUpRounds == 14);
+static_assert(kDownRounds == 1);
+
+// A round's weight staging is exactly one row of one operand tile per thread.
+static_assert(2 * kMmaN == kDecodeCtaThreads);
+
+/// First tensor-memory column the routed scale factors occupy.
 ///
-/// The allocator aligns each object independently to 1 KiB, so this counts the
-/// padded sizes rather than the raw ones.
-inline constexpr int kGateUpUnitSharedBytes =
-    3 * static_cast<int>(sizeof(mixed_operand_tile))
-    + 3 * 1024
-    + 2 * static_cast<int>(sizeof(mixed_result_tile));
+/// The two 128-column accumulators come first, so the scales start above them
+/// and each `full_tt_fp8e8m0<16>` takes four columns.
+inline constexpr int kRoutedScaleColumnBase = 2 * kMmaN;
+inline constexpr int kRoutedScaleColumns = 4;
+inline constexpr int kGateUpScaleBuffers = 3 * kGateUpRoundGroups;
+inline constexpr int kDownScaleBuffers = 2 * kDownRoundGroups;
+
+static_assert(kRoutedScaleColumnBase
+                  + kRoutedScaleColumns * kGateUpScaleBuffers
+              <= kittens::tensor_allocator<1, 1>::cols);
+static_assert(kRoutedScaleColumnBase
+                  + kRoutedScaleColumns * kDownScaleBuffers
+              <= kittens::tensor_allocator<1, 1>::cols);
 
 static_assert(sizeof(mixed_operand_tile) == 4096);
 static_assert(sizeof(mixed_scale_tile) == 512);
 static_assert(sizeof(mixed_result_tile) == 65536);
-static_assert(kGateUpUnitSharedBytes == 146432);
+
+/// Shared bytes one round of gate/up staging occupies.
+///
+/// The allocator aligns each *array* to 1 KiB, and every tile size here is
+/// already a multiple of 1 KiB, so the arrays pack without padding.
+inline constexpr int kGateUpStagingBytes =
+    kGateUpRoundGroups
+    * (3 * static_cast<int>(sizeof(mixed_operand_tile))
+       + 3 * static_cast<int>(sizeof(mixed_scale_tile)));
+inline constexpr int kDownStagingBytes =
+    kDownRoundGroups
+    * (2 * static_cast<int>(sizeof(mixed_operand_tile))
+       + 2 * static_cast<int>(sizeof(mixed_scale_tile)));
+
+/// Shared bytes one gate/up unit holds, which is the widest of any K3 stage.
+///
+/// A unit's staging and its results never overlap in time -- the results are
+/// read out of tensor memory only after the last contraction of the last round
+/// has retired -- so they are laid over each other from the same base and the
+/// unit costs whichever is larger rather than their sum.
+inline constexpr int kGateUpUnitSharedBytes =
+    kGateUpStagingBytes
+            > 2 * static_cast<int>(sizeof(mixed_result_tile))
+        ? kGateUpStagingBytes
+        : 2 * static_cast<int>(sizeof(mixed_result_tile));
+inline constexpr int kDownUnitSharedBytes =
+    kDownStagingBytes > static_cast<int>(sizeof(mixed_result_tile))
+        ? kDownStagingBytes
+        : static_cast<int>(sizeof(mixed_result_tile));
+
+static_assert(kGateUpStagingBytes == 110592);
+static_assert(kDownStagingBytes == 110592);
+static_assert(kGateUpUnitSharedBytes == 131072);
+static_assert(kDownUnitSharedBytes == 110592);
 
 /// Contract one expert batch's gate and up tiles and stage the SiTU result.
 ///
@@ -582,82 +674,159 @@ static __device__ void routed_gate_up_unit(
     const PhaseClocks clocks
 ) {
     using namespace kittens;
-    tma_swizzle_allocator allocator(shared_raw);
-    mixed_operand_tile (&activation_tile) =
-        allocator.allocate<mixed_operand_tile>();
-    mixed_operand_tile (&first_weight_tile) =
-        allocator.allocate<mixed_operand_tile>();
-    mixed_operand_tile (&second_weight_tile) =
-        allocator.allocate<mixed_operand_tile>();
-    mixed_scale_tile (&activation_scale_shared) =
-        allocator.allocate<mixed_scale_tile>();
-    mixed_scale_tile (&first_scale_shared) =
-        allocator.allocate<mixed_scale_tile>();
-    mixed_scale_tile (&second_scale_shared) =
-        allocator.allocate<mixed_scale_tile>();
+    tma_swizzle_allocator staging(shared_raw);
+    mixed_operand_tile (&activation_tile)[kGateUpRoundGroups] =
+        staging.allocate<mixed_operand_tile, kGateUpRoundGroups>();
+    mixed_operand_tile (&first_weight_tile)[kGateUpRoundGroups] =
+        staging.allocate<mixed_operand_tile, kGateUpRoundGroups>();
+    mixed_operand_tile (&second_weight_tile)[kGateUpRoundGroups] =
+        staging.allocate<mixed_operand_tile, kGateUpRoundGroups>();
+    mixed_scale_tile (&activation_scale_shared)[kGateUpRoundGroups] =
+        staging.allocate<mixed_scale_tile, kGateUpRoundGroups>();
+    mixed_scale_tile (&first_scale_shared)[kGateUpRoundGroups] =
+        staging.allocate<mixed_scale_tile, kGateUpRoundGroups>();
+    mixed_scale_tile (&second_scale_shared)[kGateUpRoundGroups] =
+        staging.allocate<mixed_scale_tile, kGateUpRoundGroups>();
+
+    // The results are laid over the staging, which is dead by the time the
+    // accumulators are read out.
+    tma_swizzle_allocator results(shared_raw);
     mixed_result_tile (&first_result_shared) =
-        allocator.allocate<mixed_result_tile>();
+        results.allocate<mixed_result_tile>();
     mixed_result_tile (&second_result_shared) =
-        allocator.allocate<mixed_result_tile>();
+        results.allocate<mixed_result_tile>();
 
     __shared__ semaphore gate_up_done;
     const int thread = static_cast<int>(threadIdx.x);
     if (thread == 0) init_semaphore(gate_up_done, 0, 1);
-    __syncthreads();
 
     mixed_accumulator_tile first_accumulator =
         tensor_pool.allocate<mixed_accumulator_tile>(0);
     mixed_accumulator_tile second_accumulator =
-        tensor_pool.allocate<mixed_accumulator_tile>(128);
-    auto activation_scale = tensor_pool.allocate<full_tt_fp8e8m0<16>>(256);
-    auto first_scale = tensor_pool.allocate<full_tt_fp8e8m0<16>>(260);
-    auto second_scale = tensor_pool.allocate<full_tt_fp8e8m0<16>>(264);
+        tensor_pool.allocate<mixed_accumulator_tile>(kMmaN);
+    const auto scale_slot = [&](const int buffer) {
+        return tensor_pool.allocate<full_tt_fp8e8m0<16>>(
+            kRoutedScaleColumnBase + buffer * kRoutedScaleColumns);
+    };
 
+    #pragma unroll
+    for (int slot = 0; slot < kGateUpRoundGroups; ++slot) {
+        clear_operand_tile(activation_tile[slot]);
+        clear_operand_tile(first_weight_tile[slot]);
+        clear_operand_tile(second_weight_tile[slot]);
+        clear_scale_tile(activation_scale_shared[slot]);
+    }
+    __syncthreads();
+
+    // One MMA batch is 128 rows and an expert never collects more, because a
+    // token's sixteen routes are sixteen distinct experts. The staging indexes
+    // the tile directly rather than guarding each row, so the bound is taken
+    // here rather than assumed.
+    const int rows = min(batch_rows, kMmaM);
+
+    // One thread owns one row of one of the two weight tiles for the whole
+    // unit, which is what makes a round's reads of that row contiguous.
+    const int weight_half = thread / kMmaN;
+    const int weight_row = thread % kMmaN;
+    const std::uint8_t *const weight_packed =
+        weight_half == 0 ? expert_w1_packed : expert_w3_packed;
+    const std::uint8_t *const weight_scales =
+        weight_half == 0 ? expert_w1_scale : expert_w3_scale;
+    mixed_operand_tile *const weight_tile =
+        weight_half == 0 ? first_weight_tile : second_weight_tile;
+    mixed_scale_tile *const weight_scale_shared =
+        weight_half == 0 ? first_scale_shared : second_scale_shared;
     const int output_base = output_tile * kMmaN;
+    const long long weight_index =
+        static_cast<long long>(expert) * kExpertW1W3PackedRows
+        + output_base + weight_row;
+    const std::uint8_t *const weight_row_bytes =
+        weight_packed + weight_index * kExpertW1W3PackedColumns;
+    const std::uint8_t *const weight_row_scales =
+        weight_scales + weight_index * kExpertW1W3ScaleColumns;
+
     int compute_phase = 0;
     unsigned long long mark = clocks.now();
-    for (int k_group = 0; k_group < kLatentGroups; ++k_group) {
-        load_quantized_activation_tile(
-            activation_tile, activation_scale_shared, scratch,
-            assignment_begin, batch_rows, k_group, false);
-        load_mxfp4_weight_tile(
-            first_weight_tile, first_scale_shared, expert_w1_packed,
-            expert_w1_scale, expert, kExpertW1W3PackedRows,
-            kExpertW1W3PackedColumns, kExpertW1W3ScaleColumns, output_base,
-            k_group);
-        load_mxfp4_weight_tile(
-            second_weight_tile, second_scale_shared, expert_w3_packed,
-            expert_w3_scale, expert, kExpertW1W3PackedRows,
-            kExpertW1W3PackedColumns, kExpertW1W3ScaleColumns, output_base,
-            k_group);
+    for (int round = 0; round < kGateUpRounds; ++round) {
+        const int group_base = round * kGateUpRoundGroups;
+
+        // Every global read of the round is issued before any of them is
+        // consumed, so the round's misses overlap instead of serializing.
+        uint4 payload[kGateUpRoundGroups];
+        #pragma unroll
+        for (int slot = 0; slot < kGateUpRoundGroups; ++slot) {
+            payload[slot] = *reinterpret_cast<const uint4 *>(
+                weight_row_bytes + (group_base + slot) * (kMmaK / 2));
+        }
+        const uint2 scale_payload = *reinterpret_cast<const uint2 *>(
+            weight_row_scales + group_base);
+        #pragma unroll
+        for (int slot = 0; slot < kGateUpRoundGroups; ++slot) {
+            stage_weight_row(
+                weight_tile[slot], weight_row, payload[slot]);
+            stage_scale(
+                weight_scale_shared[slot], weight_row,
+                scale_byte(scale_payload, slot));
+        }
+
+        // The batch is at most 128 rows and usually one, so the activation is
+        // spread over whatever threads its rows and groups need.
+        for (int index = thread; index < rows * kGateUpRoundGroups;
+             index += kDecodeCtaThreads) {
+            const int row = index / kGateUpRoundGroups;
+            const int slot = index % kGateUpRoundGroups;
+            const int group = group_base + slot;
+            const int token =
+                scratch.assignment_tokens[assignment_begin + row];
+            stage_activation_row(
+                activation_tile[slot], row,
+                scratch.latent_mxfp8
+                    + static_cast<long long>(token) * kLatentSize
+                    + group * kMmaK);
+            stage_scale(
+                activation_scale_shared[slot], row,
+                scratch.latent_scale[
+                    static_cast<long long>(token) * kLatentGroups + group]);
+        }
+
         asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
         __syncthreads();
-        if (warpid() == 0) {
-            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-            load_mxnv_scale_async(activation_scale, activation_scale_shared);
-            load_mxnv_scale_async(first_scale, first_scale_shared);
-            load_mxnv_scale_async(second_scale, second_scale_shared);
-            tensor_store_wait();
-        }
-        __syncthreads();
         mark = clocks.lap(kClockRoutedGateUpStage, mark);
-        if (thread == 0) {
-            if (k_group == 0) {
-                mixed_mma<0, false>(
-                    first_accumulator, activation_tile, first_weight_tile,
-                    activation_scale, first_scale);
-                mixed_mma<0, false>(
-                    second_accumulator, activation_tile, second_weight_tile,
-                    activation_scale, second_scale);
-            } else {
-                mixed_mma<0, true>(
-                    first_accumulator, activation_tile, first_weight_tile,
-                    activation_scale, first_scale);
-                mixed_mma<0, true>(
-                    second_accumulator, activation_tile, second_weight_tile,
-                    activation_scale, second_scale);
+        // `tcgen05.cp`, `tcgen05.mma`, and `tcgen05.commit` are single-thread
+        // issues, but `tcgen05.wait::st` is `.sync.aligned`, so the whole warp
+        // has to reach it.
+        if (warpid() == 0) {
+            if (laneid() == 0) {
+                #pragma unroll
+                for (int slot = 0; slot < kGateUpRoundGroups; ++slot) {
+                    auto activation_scale = scale_slot(slot);
+                    auto first_scale = scale_slot(kGateUpRoundGroups + slot);
+                    auto second_scale =
+                        scale_slot(2 * kGateUpRoundGroups + slot);
+                    load_mxnv_scale_async(
+                        activation_scale, activation_scale_shared[slot]);
+                    load_mxnv_scale_async(
+                        first_scale, first_scale_shared[slot]);
+                    load_mxnv_scale_async(
+                        second_scale, second_scale_shared[slot]);
+                }
             }
-            detail::tcgen05::commit<1>(gate_up_done);
+            tensor_store_wait();
+            if (laneid() == 0) {
+                #pragma unroll
+                for (int slot = 0; slot < kGateUpRoundGroups; ++slot) {
+                    const bool accumulate = round != 0 || slot != 0;
+                    mixed_mma<0>(
+                        first_accumulator, activation_tile[slot],
+                        first_weight_tile[slot], scale_slot(slot),
+                        scale_slot(kGateUpRoundGroups + slot), accumulate);
+                    mixed_mma<0>(
+                        second_accumulator, activation_tile[slot],
+                        second_weight_tile[slot], scale_slot(slot),
+                        scale_slot(2 * kGateUpRoundGroups + slot), accumulate);
+                }
+                detail::tcgen05::commit<1>(gate_up_done);
+            }
         }
         wait(gate_up_done, compute_phase);
         __syncthreads();
@@ -669,7 +838,7 @@ static __device__ void routed_gate_up_unit(
     store_accumulator(second_accumulator, second_result_shared);
     quantize_situ_tile(
         first_result_shared, second_result_shared, scratch, assignment_begin,
-        batch_rows, output_base);
+        rows, output_base);
     __syncthreads();
 }
 
@@ -688,71 +857,129 @@ static __device__ void routed_down_unit(
     const PhaseClocks clocks
 ) {
     using namespace kittens;
-    tma_swizzle_allocator allocator(shared_raw);
-    mixed_operand_tile (&activation_tile) =
-        allocator.allocate<mixed_operand_tile>();
-    mixed_operand_tile (&weight_tile) =
-        allocator.allocate<mixed_operand_tile>();
-    mixed_scale_tile (&activation_scale_shared) =
-        allocator.allocate<mixed_scale_tile>();
-    mixed_scale_tile (&weight_scale_shared) =
-        allocator.allocate<mixed_scale_tile>();
+    tma_swizzle_allocator staging(shared_raw);
+    mixed_operand_tile (&activation_tile)[kDownRoundGroups] =
+        staging.allocate<mixed_operand_tile, kDownRoundGroups>();
+    mixed_operand_tile (&weight_tile)[kDownRoundGroups] =
+        staging.allocate<mixed_operand_tile, kDownRoundGroups>();
+    mixed_scale_tile (&activation_scale_shared)[kDownRoundGroups] =
+        staging.allocate<mixed_scale_tile, kDownRoundGroups>();
+    mixed_scale_tile (&weight_scale_shared)[kDownRoundGroups] =
+        staging.allocate<mixed_scale_tile, kDownRoundGroups>();
+
+    tma_swizzle_allocator results(shared_raw);
     mixed_result_tile (&result_shared) =
-        allocator.allocate<mixed_result_tile>();
+        results.allocate<mixed_result_tile>();
 
     __shared__ semaphore down_done;
     const int thread = static_cast<int>(threadIdx.x);
     if (thread == 0) init_semaphore(down_done, 0, 1);
-    __syncthreads();
 
     mixed_accumulator_tile accumulator =
         tensor_pool.allocate<mixed_accumulator_tile>(0);
-    auto activation_scale = tensor_pool.allocate<full_tt_fp8e8m0<16>>(256);
-    auto weight_scale = tensor_pool.allocate<full_tt_fp8e8m0<16>>(260);
+    const auto scale_slot = [&](const int buffer) {
+        return tensor_pool.allocate<full_tt_fp8e8m0<16>>(
+            kRoutedScaleColumnBase + buffer * kRoutedScaleColumns);
+    };
+
+    #pragma unroll
+    for (int slot = 0; slot < kDownRoundGroups; ++slot) {
+        clear_operand_tile(activation_tile[slot]);
+        clear_operand_tile(weight_tile[slot]);
+        clear_scale_tile(activation_scale_shared[slot]);
+    }
+    __syncthreads();
+
+    const int rows = min(batch_rows, kMmaM);
+
+    // A W2 row is only 192 packed bytes, so a round is every K group the SiTU
+    // width has and one thread carries half a row's groups.
+    constexpr int kDownGroupsPerThread = kDownRoundGroups / 2;
+    const int weight_row = thread % kMmaN;
+    const int weight_half = thread / kMmaN;
+    const int weight_group_base = weight_half * kDownGroupsPerThread;
+    const long long weight_index =
+        static_cast<long long>(expert) * kExpertW2PackedRows
+        + output_tile * kMmaN + weight_row;
+    const std::uint8_t *const weight_row_bytes =
+        expert_w2_packed + weight_index * kExpertW2PackedColumns;
+    const std::uint8_t *const weight_row_scales =
+        expert_w2_scale + weight_index * kExpertW2ScaleColumns;
 
     const int output_base = output_tile * kMmaN;
-    int compute_phase = 0;
     unsigned long long mark = clocks.now();
-    for (int k_group = 0; k_group < kSituGroups; ++k_group) {
-        load_quantized_activation_tile(
-            activation_tile, activation_scale_shared, scratch,
-            assignment_begin, batch_rows, k_group, true);
-        load_mxfp4_weight_tile(
-            weight_tile, weight_scale_shared, expert_w2_packed,
-            expert_w2_scale, expert, kExpertW2PackedRows,
-            kExpertW2PackedColumns, kExpertW2ScaleColumns, output_base,
-            k_group);
-        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-        __syncthreads();
-        if (warpid() == 0) {
-            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-            load_mxnv_scale_async(activation_scale, activation_scale_shared);
-            load_mxnv_scale_async(weight_scale, weight_scale_shared);
-            tensor_store_wait();
+
+    uint4 payload[kDownGroupsPerThread];
+    #pragma unroll
+    for (int slot = 0; slot < kDownGroupsPerThread; ++slot) {
+        payload[slot] = *reinterpret_cast<const uint4 *>(
+            weight_row_bytes + (weight_group_base + slot) * (kMmaK / 2));
+    }
+    std::uint8_t weight_scale_bytes[kDownGroupsPerThread];
+    #pragma unroll
+    for (int slot = 0; slot < kDownGroupsPerThread; ++slot) {
+        weight_scale_bytes[slot] =
+            weight_row_scales[weight_group_base + slot];
+    }
+    #pragma unroll
+    for (int slot = 0; slot < kDownGroupsPerThread; ++slot) {
+        const int group = weight_group_base + slot;
+        stage_weight_row(weight_tile[group], weight_row, payload[slot]);
+        stage_scale(
+            weight_scale_shared[group], weight_row, weight_scale_bytes[slot]);
+    }
+
+    for (int index = thread; index < rows * kDownRoundGroups;
+         index += kDecodeCtaThreads) {
+        const int row = index / kDownRoundGroups;
+        const int group = index % kDownRoundGroups;
+        const int assignment = assignment_begin + row;
+        stage_activation_row(
+            activation_tile[group], row,
+            scratch.situ_mxfp8
+                + static_cast<long long>(assignment)
+                      * kRoutedIntermediateSizePerRank
+                + group * kMmaK);
+        stage_scale(
+            activation_scale_shared[group], row,
+            scratch.situ_scale[
+                static_cast<long long>(assignment) * kSituGroups + group]);
+    }
+
+    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+    __syncthreads();
+    mark = clocks.lap(kClockRoutedDownStage, mark);
+    if (warpid() == 0) {
+        if (laneid() == 0) {
+            #pragma unroll
+            for (int slot = 0; slot < kDownRoundGroups; ++slot) {
+                auto activation_scale = scale_slot(slot);
+                auto weight_scale = scale_slot(kDownRoundGroups + slot);
+                load_mxnv_scale_async(
+                    activation_scale, activation_scale_shared[slot]);
+                load_mxnv_scale_async(
+                    weight_scale, weight_scale_shared[slot]);
+            }
         }
-        __syncthreads();
-        mark = clocks.lap(kClockRoutedDownStage, mark);
-        if (thread == 0) {
-            if (k_group == 0) {
-                mixed_mma<0, false>(
-                    accumulator, activation_tile, weight_tile,
-                    activation_scale, weight_scale);
-            } else {
-                mixed_mma<0, true>(
-                    accumulator, activation_tile, weight_tile,
-                    activation_scale, weight_scale);
+        tensor_store_wait();
+        if (laneid() == 0) {
+            #pragma unroll
+            for (int slot = 0; slot < kDownRoundGroups; ++slot) {
+                mixed_mma<0>(
+                    accumulator, activation_tile[slot], weight_tile[slot],
+                    scale_slot(slot), scale_slot(kDownRoundGroups + slot),
+                    slot != 0);
             }
             detail::tcgen05::commit<1>(down_done);
         }
-        wait(down_done, compute_phase);
-        __syncthreads();
-        mark = clocks.lap(kClockRoutedDownMma, mark);
-        compute_phase ^= 1;
     }
+    wait(down_done, 0);
+    __syncthreads();
+    clocks.lap(kClockRoutedDownMma, mark);
 
     store_accumulator(accumulator, result_shared);
     accumulate_down_tile(
-        result_shared, scratch, assignment_begin, batch_rows, output_base,
+        result_shared, scratch, assignment_begin, rows, output_base,
         active_tokens);
     __syncthreads();
 }

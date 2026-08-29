@@ -88,7 +88,10 @@ static_assert(kBenchmarkGridCtas[2] < kBenchmarkGridCtas[3]);
 
 /// The widest shared-memory footprint any stage this kernel runs asks for.
 inline constexpr int kWidestStageSharedBytes =
-    expert_mxfp4::kGateUpUnitSharedBytes;
+    expert_mxfp4::kGateUpUnitSharedBytes
+            > expert_mxfp4::kDownUnitSharedBytes
+        ? expert_mxfp4::kGateUpUnitSharedBytes
+        : expert_mxfp4::kDownUnitSharedBytes;
 
 // Each CTA holds all 512 tensor-memory columns, so the grid is only correct if
 // every launched CTA lands alone on an SM. Requesting more than half of an
