@@ -378,11 +378,16 @@ def _phase_profile(
     runtime: Any,
     device: Any,
 ) -> dict[str, Any]:
-    """Accumulated clock64 cycles per kernel region for one replayed shape.
+    """Clock64 cycles per kernel region, for the last launch over the pool.
 
     Collected outside the timed section and outside the captured graphs: the
     accumulators cost atomics that the measured launches must not pay, and a
     graph would have recorded whichever launch it captured anyway.
+
+    A profiled launch clears the band before it starts timing, so the counters
+    read back afterwards belong to the last pool entry alone. The earlier
+    entries are there to warm the path, and `replays` counts them rather than
+    describing what the cycles cover.
     """
     import torch
 
@@ -393,6 +398,7 @@ def _phase_profile(
         cycles = runtime.phase_clock_cycles(workspace)
     return {
         "replays": len(pool),
+        "cycles_cover": "the last replay",
         "cycles": cycles,
         **summarize_phase_cycles(cycles),
     }
