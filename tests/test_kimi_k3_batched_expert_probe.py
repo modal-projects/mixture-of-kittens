@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -154,6 +156,120 @@ def test_grouped_pipeline_benchmark_is_exactly_m16_and_m128() -> None:
     assert "def bench_kimi_k3_grouped_pipeline(" in modal_source
     assert "def grouped_pipeline(" in modal_source
     assert '"benchmarks.kimi_k3_grouped_pipeline"' in modal_source
+
+
+def test_grouped_pipeline_checks_errors_only_after_capture_and_replay_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    benchmark = importlib.import_module(
+        "benchmarks.kimi_k3_grouped_pipeline"
+    )
+    events: list[str] = []
+    capture_active = False
+
+    class FakeGraph:
+        def replay(self) -> None:
+            events.append("replay")
+
+    class FakeCapture:
+        def __enter__(self) -> None:
+            nonlocal capture_active
+            capture_active = True
+            events.append("capture-enter")
+
+        def __exit__(self, *args: object) -> None:
+            nonlocal capture_active
+            capture_active = False
+            events.append("capture-exit")
+
+    @contextlib.contextmanager
+    def benchmark_variant(**_: object):
+        events.append("variant-enter")
+        yield
+        events.append("variant-exit")
+
+    def decode_step(*_: object) -> None:
+        raise AssertionError("wrapped decode_step must not run in capture")
+
+    def decode_device_step(*_: object) -> None:
+        events.append("device-capture" if capture_active else "device-eager")
+
+    def check_decode_error(workspace: object) -> None:
+        assert events[-1] == "sync"
+        events.append("check")
+        workspace.error_flag.item()
+
+    def error_item() -> int:
+        assert capture_active is False
+        events.append("item")
+        return 0
+
+    def synchronize(_: object) -> None:
+        events.append("sync")
+
+    runtime = SimpleNamespace(
+        benchmark_decode_variant=benchmark_variant,
+        check_decode_error=check_decode_error,
+        decode_device_step=decode_device_step,
+        decode_step=decode_step,
+    )
+    workspace = SimpleNamespace(
+        error_flag=SimpleNamespace(item=error_item),
+    )
+    pool = [
+        SimpleNamespace(weights=object(), hidden=object()),
+    ]
+    monkeypatch.setattr(benchmark.torch.cuda, "CUDAGraph", FakeGraph)
+    monkeypatch.setattr(
+        benchmark.torch.cuda,
+        "graph",
+        lambda _: FakeCapture(),
+    )
+    monkeypatch.setattr(benchmark.torch.cuda, "synchronize", synchronize)
+
+    graphs = benchmark._capture_pool(
+        runtime,
+        workspace,
+        pool,
+        benchmark.CANDIDATE,
+        object(),
+    )
+
+    assert events == [
+        "variant-enter",
+        "device-eager",
+        "sync",
+        "check",
+        "item",
+        "capture-enter",
+        "device-capture",
+        "capture-exit",
+        "sync",
+        "check",
+        "item",
+        "variant-exit",
+    ]
+
+    events.clear()
+
+    def replay_samples(replay: object, **kwargs: object) -> list[float]:
+        replay(0)
+        kwargs["synchronize"]()
+        return [0.25]
+
+    monkeypatch.setattr(benchmark, "replay_samples", replay_samples)
+
+    samples = benchmark._measure(
+        graphs,
+        runtime_module=runtime,
+        workspace=workspace,
+        warmup_count=1,
+        sample_count=1,
+        device=object(),
+    )
+
+    assert samples == [0.25]
+    assert events == ["replay", "sync", "check", "item"]
 
 
 def test_grouped_pipeline_gate_requires_numerics_and_a_measured_gain() -> None:
