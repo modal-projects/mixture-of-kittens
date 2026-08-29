@@ -13,6 +13,7 @@
 
 #include "expert_mxfp4_mma.cuh"
 
+#include <cstddef>
 #include <cstdint>
 
 namespace kimi_k3_decode {
@@ -29,6 +30,50 @@ static_assert(kGateUpTiles == 3);
 static_assert(kDownTiles == 28);
 static_assert(kLatentGroups == 112);
 static_assert(kSituGroups == 12);
+
+// A TMA tile gathers one packed K32 group from 128 strided weight rows into a
+// compact shared buffer. Threads then expand each row into the two 16-byte
+// atoms the mixed MMA consumes. Keeping the compact tile non-swizzled makes
+// its 16-byte rows naturally aligned and lets the copy engine own the global
+// row stride without imposing that stride on the MMA tile.
+using packed_weight_tile =
+    kittens::st_uint8<kMmaN, kMmaK / 2, false>;
+using packed_weight_layout =
+    kittens::gl<kittens::uint8, kNumExperts, 1, -1, -1,
+                packed_weight_tile>;
+
+struct RoutedLayouts {
+    packed_weight_layout w1;
+    packed_weight_layout w3;
+    packed_weight_layout w2;
+};
+
+static __host__ inline packed_weight_layout packed_weight_layout_for(
+    const std::uint8_t *pointer,
+    const int rows,
+    const int columns
+) {
+    return packed_weight_layout{
+        const_cast<kittens::uint8 *>(
+            reinterpret_cast<const kittens::uint8 *>(pointer)),
+        nullptr, nullptr, static_cast<std::size_t>(rows),
+        static_cast<std::size_t>(columns)};
+}
+
+static __host__ inline RoutedLayouts routed_layouts(
+    const std::uint8_t *w1,
+    const std::uint8_t *w3,
+    const std::uint8_t *w2
+) {
+    return RoutedLayouts{
+        packed_weight_layout_for(
+            w1, kExpertW1W3PackedRows, kExpertW1W3PackedColumns),
+        packed_weight_layout_for(
+            w3, kExpertW1W3PackedRows, kExpertW1W3PackedColumns),
+        packed_weight_layout_for(
+            w2, kExpertW2PackedRows, kExpertW2PackedColumns),
+    };
+}
 
 __device__ __forceinline__ float decode_route_weight(
     const Scratch &scratch,
@@ -166,6 +211,54 @@ __device__ __forceinline__ void stage_weight_row(
 ) {
     *atom_of(tile, row, 0) = make_uint4(payload.x, payload.y, 0u, 0u);
     *atom_of(tile, row, 1) = make_uint4(payload.z, payload.w, 0u, 0u);
+}
+
+/// Gather one round of packed gate/up rows with TMA.
+template<int TILES>
+__device__ __forceinline__ void issue_packed_weight_round(
+    packed_weight_tile (&first)[TILES],
+    packed_weight_tile (&second)[TILES],
+    const packed_weight_layout &first_layout,
+    const packed_weight_layout &second_layout,
+    const int expert,
+    const int output_tile,
+    const int group_base,
+    kittens::semaphore &arrived
+) {
+    if (threadIdx.x != 0) return;
+    kittens::tma::expect_bytes(
+        arrived, 2 * TILES * static_cast<int>(sizeof(packed_weight_tile)));
+    #pragma unroll
+    for (int slot = 0; slot < TILES; ++slot) {
+        const kittens::coord<packed_weight_tile> tile{
+            expert, 0, output_tile, group_base + slot};
+        kittens::tma::load_async(
+            first[slot], first_layout, tile, arrived);
+        kittens::tma::load_async(
+            second[slot], second_layout, tile, arrived);
+    }
+}
+
+/// Gather one round of packed down-projection rows with TMA.
+template<int TILES>
+__device__ __forceinline__ void issue_packed_weight_round(
+    packed_weight_tile (&weight)[TILES],
+    const packed_weight_layout &layout,
+    const int expert,
+    const int output_tile,
+    const int group_base,
+    kittens::semaphore &arrived
+) {
+    if (threadIdx.x != 0) return;
+    kittens::tma::expect_bytes(
+        arrived, TILES * static_cast<int>(sizeof(packed_weight_tile)));
+    #pragma unroll
+    for (int slot = 0; slot < TILES; ++slot) {
+        const kittens::coord<packed_weight_tile> tile{
+            expert, 0, output_tile, group_base + slot};
+        kittens::tma::load_async(
+            weight[slot], layout, tile, arrived);
+    }
 }
 
 __device__ __forceinline__ void store_accumulator(
@@ -371,6 +464,7 @@ static_assert(kRoutedScaleColumnBase
               <= kittens::tensor_allocator<1, 1>::cols);
 
 static_assert(sizeof(mixed_operand_tile) == 4096);
+static_assert(sizeof(packed_weight_tile) == 2048);
 static_assert(sizeof(mixed_scale_tile) == 512);
 static_assert(sizeof(mixed_result_tile) == 65536);
 
@@ -402,9 +496,12 @@ __host__ __device__ constexpr int staging_bytes(
 }
 
 inline constexpr int kGateUpStagingBytes =
-    staging_bytes(3, kGateUpRoundGroups, 3, kGateUpScaleTiles);
+    staging_bytes(3, kGateUpRoundGroups, 3, kGateUpScaleTiles)
+    + 2 * kGateUpRoundGroups
+        * static_cast<int>(sizeof(packed_weight_tile));
 inline constexpr int kDownStagingBytes =
-    staging_bytes(2, kDownRoundGroups, 2, kDownScaleTiles);
+    staging_bytes(2, kDownRoundGroups, 2, kDownScaleTiles)
+    + kDownRoundGroups * static_cast<int>(sizeof(packed_weight_tile));
 
 /// Shared bytes one gate/up unit holds, which is the widest of any K3 stage.
 ///
@@ -422,10 +519,10 @@ inline constexpr int kDownUnitSharedBytes =
         ? kDownStagingBytes
         : static_cast<int>(sizeof(mixed_result_tile));
 
-static_assert(kGateUpStagingBytes == 101376);
-static_assert(kDownStagingBytes == 102400);
-static_assert(kGateUpUnitSharedBytes == 131072);
-static_assert(kDownUnitSharedBytes == 102400);
+static_assert(kGateUpStagingBytes == 134144);
+static_assert(kDownStagingBytes == 126976);
+static_assert(kGateUpUnitSharedBytes == 134144);
+static_assert(kDownUnitSharedBytes == 126976);
 
 }  // namespace expert_mxfp4
 }  // namespace kimi_k3_decode

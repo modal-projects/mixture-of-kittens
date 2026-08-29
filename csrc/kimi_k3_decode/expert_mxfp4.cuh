@@ -43,9 +43,8 @@ namespace expert_mxfp4 {
 static __device__ void routed_gate_up_unit(
     int *__restrict__ shared_raw,
     kittens::tensor_allocator<1, 1> &tensor_pool,
-    const std::uint8_t *__restrict__ expert_w1_packed,
+    const RoutedLayouts &layouts,
     const std::uint8_t *__restrict__ expert_w1_scale,
-    const std::uint8_t *__restrict__ expert_w3_packed,
     const std::uint8_t *__restrict__ expert_w3_scale,
     const Scratch &scratch,
     const int expert,
@@ -62,6 +61,10 @@ static __device__ void routed_gate_up_unit(
         staging.allocate<mixed_operand_tile, kGateUpRoundGroups>();
     mixed_operand_tile (&second_weight_tile)[kGateUpRoundGroups] =
         staging.allocate<mixed_operand_tile, kGateUpRoundGroups>();
+    packed_weight_tile (&first_weight_packed)[kGateUpRoundGroups] =
+        staging.allocate<packed_weight_tile, kGateUpRoundGroups>();
+    packed_weight_tile (&second_weight_packed)[kGateUpRoundGroups] =
+        staging.allocate<packed_weight_tile, kGateUpRoundGroups>();
     mixed_scale_tile (&activation_scale_shared)[kGateUpScaleTiles] =
         staging.allocate<mixed_scale_tile, kGateUpScaleTiles>();
     mixed_scale_tile (&first_scale_shared)[kGateUpScaleTiles] =
@@ -78,8 +81,12 @@ static __device__ void routed_gate_up_unit(
         results.allocate<mixed_result_tile>();
 
     __shared__ semaphore gate_up_done;
+    __shared__ semaphore weight_arrived;
     const int thread = static_cast<int>(threadIdx.x);
-    if (thread == 0) init_semaphore(gate_up_done, 0, 1);
+    if (thread == 0) {
+        init_semaphore(gate_up_done, 0, 1);
+        init_semaphore(weight_arrived, 0, 1);
+    }
 
     mixed_accumulator_tile first_accumulator =
         tensor_pool.allocate<mixed_accumulator_tile>(0);
@@ -113,8 +120,6 @@ static __device__ void routed_gate_up_unit(
     // unit, which is what makes a round's reads of that row contiguous.
     const int weight_half = thread / kMmaN;
     const int weight_row = thread % kMmaN;
-    const std::uint8_t *const weight_packed =
-        weight_half == 0 ? expert_w1_packed : expert_w3_packed;
     const std::uint8_t *const weight_scales =
         weight_half == 0 ? expert_w1_scale : expert_w3_scale;
     mixed_operand_tile *const weight_tile =
@@ -125,51 +130,48 @@ static __device__ void routed_gate_up_unit(
     const long long weight_index =
         static_cast<long long>(expert) * kExpertW1W3PackedRows
         + output_base + weight_row;
-    const std::uint8_t *const weight_row_bytes =
-        weight_packed + weight_index * kExpertW1W3PackedColumns;
     const std::uint8_t *const weight_row_scales =
         weight_scales + weight_index * kExpertW1W3ScaleColumns;
 
-    // A round's global reads are all issued before any of them is consumed,
-    // and a round issues the *next* round's reads before it contracts, so a
-    // weight row's HBM latency is paid underneath a contraction rather than
-    // in front of one. The reads land in registers, which is what lets them
-    // outlive the barrier that publishes the round they belong to.
+    // TMA gathers a round's packed rows into one compact shared buffer. Once
+    // those rows have been expanded into the mixed-MMA tiles, the CTA barrier
+    // makes the compact bytes dead and the same buffer can receive the next
+    // round while the tensor core consumes the expanded current one.
     //
-    // One buffer serves both roles. A round stages its own bytes into shared
-    // memory first, which is the last read of them, and only then reloads the
-    // same registers with the next round's bytes -- so the prefetch keeps its
-    // distance without a second buffer to hold it or a copy to move it across.
-    // The final round simply does not reload, and nothing reads what it did
-    // not write.
-    uint4 payload[kGateUpRoundGroups];
+    // Scales remain a small register prefetch. Their row pitches are already
+    // compact, while the packed payload is the measured strided-load burden
+    // this candidate is isolating.
     std::uint32_t scale_words[kGateUpScaleTiles];
-    const auto read_weight_round = [&](
+    const auto read_scale_round = [&](
         const int group_base,
-        uint4 (&into)[kGateUpRoundGroups],
         std::uint32_t (&scales)[kGateUpScaleTiles]
     ) {
-        #pragma unroll
-        for (int slot = 0; slot < kGateUpRoundGroups; ++slot) {
-            into[slot] = *reinterpret_cast<const uint4 *>(
-                weight_row_bytes + (group_base + slot) * (kMmaK / 2));
-        }
         #pragma unroll
         for (int quad = 0; quad < kGateUpScaleTiles; ++quad) {
             scales[quad] = *reinterpret_cast<const std::uint32_t *>(
                 weight_row_scales + group_base + quad * kScaleGroupsPerTile);
         }
     };
-    read_weight_round(0, payload, scale_words);
+    read_scale_round(0, scale_words);
+    issue_packed_weight_round(
+        first_weight_packed, second_weight_packed,
+        layouts.w1, layouts.w3, expert, output_tile, 0, weight_arrived);
 
     int compute_phase = 0;
     unsigned long long mark = clocks.now();
     for (int round = 0; round < kGateUpRounds; ++round) {
         const int group_base = round * kGateUpRoundGroups;
+        wait(weight_arrived, round % 2);
 
         #pragma unroll
         for (int slot = 0; slot < kGateUpRoundGroups; ++slot) {
-            stage_weight_row(weight_tile[slot], weight_row, payload[slot]);
+            const packed_weight_tile &source =
+                weight_half == 0
+                    ? first_weight_packed[slot]
+                    : second_weight_packed[slot];
+            stage_weight_row(
+                weight_tile[slot], weight_row,
+                *reinterpret_cast<const uint4 *>(&source[{weight_row, 0}]));
         }
         #pragma unroll
         for (int quad = 0; quad < kGateUpScaleTiles; ++quad) {
@@ -205,17 +207,15 @@ static __device__ void routed_gate_up_unit(
                     + group_base + quad * kScaleGroupsPerTile));
         }
 
-        // Both staging loops above have consumed `payload` and `scale_words`,
-        // so the round's own bytes are dead and the registers can be reloaded
-        // in place with the next round's. The last round has no next round and
-        // leaves them alone; nothing below reads them again.
-        if (round + 1 < kGateUpRounds) {
-            read_weight_round(
-                group_base + kGateUpRoundGroups, payload, scale_words);
-        }
-
         asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
         __syncthreads();
+        if (round + 1 < kGateUpRounds) {
+            read_scale_round(group_base + kGateUpRoundGroups, scale_words);
+            issue_packed_weight_round(
+                first_weight_packed, second_weight_packed,
+                layouts.w1, layouts.w3, expert, output_tile,
+                group_base + kGateUpRoundGroups, weight_arrived);
+        }
         mark = clocks.lap(kClockRoutedGateUpStage, mark);
         // `tcgen05.cp`, `tcgen05.mma`, and `tcgen05.commit` are single-thread
         // issues, but `tcgen05.wait::st` is `.sync.aligned`, so the whole warp
@@ -275,7 +275,7 @@ static __device__ void routed_gate_up_unit(
 static __device__ void routed_down_unit(
     int *__restrict__ shared_raw,
     kittens::tensor_allocator<1, 1> &tensor_pool,
-    const std::uint8_t *__restrict__ expert_w2_packed,
+    const RoutedLayouts &layouts,
     const std::uint8_t *__restrict__ expert_w2_scale,
     const Scratch &scratch,
     const int expert,
@@ -291,6 +291,8 @@ static __device__ void routed_down_unit(
         staging.allocate<mixed_operand_tile, kDownRoundGroups>();
     mixed_operand_tile (&weight_tile)[kDownRoundGroups] =
         staging.allocate<mixed_operand_tile, kDownRoundGroups>();
+    packed_weight_tile (&weight_packed)[kDownRoundGroups] =
+        staging.allocate<packed_weight_tile, kDownRoundGroups>();
     mixed_scale_tile (&activation_scale_shared)[kDownScaleTiles] =
         staging.allocate<mixed_scale_tile, kDownScaleTiles>();
     mixed_scale_tile (&weight_scale_shared)[kDownScaleTiles] =
@@ -301,8 +303,12 @@ static __device__ void routed_down_unit(
         results.allocate<mixed_result_tile>();
 
     __shared__ semaphore down_done;
+    __shared__ semaphore weight_arrived;
     const int thread = static_cast<int>(threadIdx.x);
-    if (thread == 0) init_semaphore(down_done, 0, 1);
+    if (thread == 0) {
+        init_semaphore(down_done, 0, 1);
+        init_semaphore(weight_arrived, 0, 1);
+    }
 
     mixed_accumulator_tile accumulator =
         tensor_pool.allocate<mixed_accumulator_tile>(0);
@@ -329,25 +335,19 @@ static __device__ void routed_down_unit(
     const int weight_row = thread % kMmaN;
     const int weight_half = thread / kMmaN;
     const int weight_group_base = weight_half * kDownGroupsPerThread;
-    const long long weight_index =
-        static_cast<long long>(expert) * kExpertW2PackedRows
-        + output_tile * kMmaN + weight_row;
-    const std::uint8_t *const weight_row_bytes =
-        expert_w2_packed + weight_index * kExpertW2PackedColumns;
 
     const int output_base = output_tile * kMmaN;
     unsigned long long mark = clocks.now();
 
-    uint4 payload[kDownGroupsPerThread];
-    #pragma unroll
-    for (int slot = 0; slot < kDownGroupsPerThread; ++slot) {
-        payload[slot] = *reinterpret_cast<const uint4 *>(
-            weight_row_bytes + (weight_group_base + slot) * (kMmaK / 2));
-    }
+    issue_packed_weight_round(
+        weight_packed, layouts.w2, expert, output_tile, 0, weight_arrived);
+    wait(weight_arrived, 0);
     #pragma unroll
     for (int slot = 0; slot < kDownGroupsPerThread; ++slot) {
         stage_weight_row(
-            weight_tile[weight_group_base + slot], weight_row, payload[slot]);
+            weight_tile[weight_group_base + slot], weight_row,
+            *reinterpret_cast<const uint4 *>(
+                &weight_packed[weight_group_base + slot][{weight_row, 0}]));
     }
 
     // Six groups is a thread's share of a W2 row but only one and a half scale
@@ -441,6 +441,7 @@ void kimi_k3_routed_experts_kernel(
     const std::uint8_t *__restrict__ expert_w3_scale,
     const std::uint8_t *__restrict__ expert_w2_packed,
     const std::uint8_t *__restrict__ expert_w2_scale,
+    const __grid_constant__ RoutedLayouts layouts,
     __nv_bfloat16 *__restrict__ routed_output,
     std::uint8_t *__restrict__ scratch_bytes,
     const int active_tokens,
@@ -498,17 +499,17 @@ void kimi_k3_routed_experts_kernel(
             for (int output_tile = 0; output_tile < kGateUpTiles;
                  ++output_tile) {
                 routed_gate_up_unit(
-                    shared_raw, tensor_pool, expert_w1_packed, expert_w1_scale,
-                    expert_w3_packed, expert_w3_scale, scratch, expert,
-                    assignment_begin, batch_rows, output_tile,
+                    shared_raw, tensor_pool, layouts, expert_w1_scale,
+                    expert_w3_scale, scratch, expert, assignment_begin,
+                    batch_rows, output_tile,
                     PhaseClocks{nullptr});
             }
 
             for (int output_tile = 0; output_tile < kDownTiles;
                  ++output_tile) {
                 routed_down_unit(
-                    shared_raw, tensor_pool, expert_w2_packed, expert_w2_scale,
-                    scratch, expert, assignment_begin, batch_rows, output_tile,
+                    shared_raw, tensor_pool, layouts, expert_w2_scale, scratch,
+                    expert, assignment_begin, batch_rows, output_tile,
                     active_tokens, PhaseClocks{nullptr});
             }
         }
@@ -541,6 +542,10 @@ static __host__ void launch_routed_experts(
     const at::Tensor &scratch,
     const int active_tokens
 ) {
+    const RoutedLayouts layouts = routed_layouts(
+        reinterpret_cast<const std::uint8_t *>(expert_w1_packed.data_ptr()),
+        reinterpret_cast<const std::uint8_t *>(expert_w3_packed.data_ptr()),
+        reinterpret_cast<const std::uint8_t *>(expert_w2_packed.data_ptr()));
     C10_CUDA_CHECK(cudaFuncSetAttribute(
         kimi_k3_routed_experts_kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -561,6 +566,7 @@ static __host__ void launch_routed_experts(
                 expert_w2_packed.data_ptr()),
             reinterpret_cast<const std::uint8_t *>(
                 expert_w2_scale.data_ptr()),
+            layouts,
             reinterpret_cast<__nv_bfloat16 *>(routed_output.data_ptr()),
             reinterpret_cast<std::uint8_t *>(scratch.data_ptr()),
             active_tokens,

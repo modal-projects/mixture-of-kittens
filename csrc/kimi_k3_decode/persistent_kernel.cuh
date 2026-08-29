@@ -286,11 +286,10 @@ inline void set_benchmark_grid_ctas_for_testing(const std::int64_t grid_ctas) {
 // ---------------------------------------------------------------------------
 // Tensor-path descriptors.
 //
-// Every tcgen05 stage this kernel runs reads through one of two tile shapes, so
-// the eleven TMA descriptors it needs collapse to two global-layout types. They
-// travel in one `__grid_constant__` struct that only the tensor instantiation
-// carries: building a descriptor costs a driver call per launch, and the core
-// instantiation would never dereference one.
+// The routed stages gather their three packed expert matrices with TMA on both
+// capacity paths. The tensor path carries those descriptors alongside the
+// eleven BF16 descriptors its tcgen05 stages already use; the core path carries
+// only the routed descriptors.
 // ---------------------------------------------------------------------------
 
 using tile_layout = skinny_gemm::hidden_layout;
@@ -307,6 +306,7 @@ static_assert(std::is_same_v<square_layout,
                              shared_experts::tensor_output_layout>);
 
 struct TensorLayouts {
+    expert_mxfp4::RoutedLayouts routed;
     tile_layout hidden;          // [active, 7168]
     tile_layout latent_down;     // [3584, 7168]
     square_layout latent;        // [active, 3584]
@@ -320,13 +320,8 @@ struct TensorLayouts {
     tile_layout latent_up;       // [896, 3584]
 };
 
-/// What the core instantiation carries in place of the descriptors.
-///
-/// It holds one dead byte rather than nothing, because a `__grid_constant__`
-/// parameter names a const reference to an object in the kernel's parameter
-/// space and an empty type gives that object no bytes to name.
 struct NoTensorLayouts {
-    char unused;
+    expert_mxfp4::RoutedLayouts routed;
 };
 
 template<bool TENSOR_PATH>
@@ -568,10 +563,11 @@ void kimi_k3_decode_persistent_kernel(
             const int expert =
                 scratch.unit_expert[routed / expert_mxfp4::kGateUpTiles];
             const int begin = scratch.expert_offsets[expert];
+            const int batch_rows =
+                scratch.expert_offsets[expert + 1] - begin;
             expert_mxfp4::routed_gate_up_unit(
-                shared_raw, tensor_pool, expert_w1_packed, expert_w1_scale,
-                expert_w3_packed, expert_w3_scale, scratch, expert, begin,
-                scratch.expert_offsets[expert + 1] - begin,
+                shared_raw, tensor_pool, layouts.routed, expert_w1_scale,
+                expert_w3_scale, scratch, expert, begin, batch_rows,
                 routed % expert_mxfp4::kGateUpTiles, clocks);
             __syncthreads();
             mark = clocks.lap(kClockRoutedGateUp, mark);
@@ -628,10 +624,11 @@ void kimi_k3_decode_persistent_kernel(
             const int expert =
                 scratch.unit_expert[routed / expert_mxfp4::kDownTiles];
             const int begin = scratch.expert_offsets[expert];
+            const int batch_rows =
+                scratch.expert_offsets[expert + 1] - begin;
             expert_mxfp4::routed_down_unit(
-                shared_raw, tensor_pool, expert_w2_packed, expert_w2_scale,
-                scratch, expert, begin,
-                scratch.expert_offsets[expert + 1] - begin,
+                shared_raw, tensor_pool, layouts.routed, expert_w2_scale,
+                scratch, expert, begin, batch_rows,
                 routed % expert_mxfp4::kDownTiles, active_tokens, clocks);
             __syncthreads();
             mark = clocks.lap(kClockRoutedDown, mark);
@@ -898,7 +895,19 @@ static __host__ void launch_persistent(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-/// Build the eleven TMA descriptors the tcgen05 stages read through.
+static __host__ expert_mxfp4::RoutedLayouts routed_layouts(
+    const LaunchArguments &arguments
+) {
+    return expert_mxfp4::routed_layouts(
+        reinterpret_cast<const std::uint8_t *>(
+            arguments.expert_w1_packed.data_ptr()),
+        reinterpret_cast<const std::uint8_t *>(
+            arguments.expert_w3_packed.data_ptr()),
+        reinterpret_cast<const std::uint8_t *>(
+            arguments.expert_w2_packed.data_ptr()));
+}
+
+/// Build the routed and BF16 TMA descriptors the tensor path reads through.
 static __host__ TensorLayouts tensor_layouts(
     const LaunchArguments &arguments
 ) {
@@ -927,6 +936,7 @@ static __host__ TensorLayouts tensor_layouts(
     constexpr int shared_intermediate = shared_experts::kIntermediate;
 
     return TensorLayouts{
+        routed_layouts(arguments),
         tile(arguments.hidden_states.data_ptr(), active, kHiddenSize),
         tile(arguments.routed_expert_down_proj.data_ptr(), kLatentSize,
              kHiddenSize),
@@ -954,7 +964,8 @@ static __host__ TensorLayouts tensor_layouts(
 /// Run one whole TP8 Kimi K3 decode step in a single launch.
 static __host__ void launch_decode(const LaunchArguments &arguments) {
     if (capacity_bucket(arguments.active_tokens) <= kMaxCoreCapacity) {
-        launch_persistent<false>(arguments, NoTensorLayouts{});
+        launch_persistent<false>(
+            arguments, NoTensorLayouts{routed_layouts(arguments)});
         return;
     }
     launch_persistent<true>(arguments, tensor_layouts(arguments));
