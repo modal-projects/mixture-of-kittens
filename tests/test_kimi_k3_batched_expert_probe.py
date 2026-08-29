@@ -15,6 +15,7 @@ def test_temporary_agent_instrumentation_has_been_removed() -> None:
         root / "benchmarks" / "kimi_k3_decode_runtime.py",
         root / "benchmarks" / "compare_kimi_k3_frameworks.py",
         root / "modal_app.py",
+        root / "tests" / "kimi_k3_decode_support.py",
         root / "tests" / "test_kimi_k3_decode.py",
     )
 
