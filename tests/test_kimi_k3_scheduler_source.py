@@ -84,3 +84,59 @@ def test_batched_expert_probe_is_a_transposed_m128x8x32_microprototype() -> None
     assert "batched_down_unit(" in probe
     assert "batched_gate_up_unit(" not in production
     assert "batched_down_unit(" not in persistent
+
+
+def test_grouped_pipeline_reuses_activation_across_expert_output_tiles() -> None:
+    """Group output tiles, not unrelated expert rows, behind m128x8 math."""
+    grouped = _source("expert_mxfp4_grouped.cuh")
+
+    assert "kGroupedGateUpWidth = 3" in grouped
+    assert "kGroupedDownWidth = 4" in grouped
+    assert "kGroupedGateUpUnits == 1" in grouped
+    assert "kGroupedDownUnits == 7" in grouped
+    assert "kGroupedM = 128" in grouped
+    assert "kGroupedN = 8" in grouped
+    assert "kGroupedPhysicalN = 16" in grouped
+    assert "(5u << 7)" in grouped
+    assert "(0u << 10)" in grouped
+    assert "kMmaK = 32" not in grouped
+
+    gate_up = _function_body(grouped, "void grouped_gate_up_unit(")
+    down = _function_body(grouped, "void grouped_down_unit(")
+    for body in (gate_up, down):
+        assert "assignment_offset += kGroupedN" in body
+        assert "stage_grouped_activation(" in body
+        assert "weight_tile[2]" in body
+        assert "next_buffer = (round + 1) & 1" in body
+        assert body.index("stage_grouped_activation(") < body.index(
+            "for (int tile = 0; tile < tile_count; ++tile)"
+        )
+
+    assert "grouped_batch_mixed_mma(" in gate_up
+    assert "grouped_batch_mixed_mma(" in down
+    assert "quantize_grouped_situ(" in gate_up
+    assert "accumulate_grouped_down(" in down
+
+
+def test_grouped_pipeline_is_a_guarded_separate_persistent_instantiation() -> None:
+    """The benchmark switch must not alter the default production launch."""
+    persistent = _source("persistent_kernel.cuh")
+    kernel = _function_body(
+        persistent,
+        "void kimi_k3_decode_persistent_kernel(",
+    )
+
+    assert "MOK_KIMI_K3_ENABLE_GROUPED_PIPELINE" in persistent
+    assert "set_benchmark_grouped_pipeline_for_testing(" in persistent
+    assert "benchmark_grouped_pipeline_enabled()" in persistent
+    assert "template<bool TENSOR_PATH, bool GROUPED_PIPELINE>" in persistent
+    assert kernel.count("if constexpr (GROUPED_PIPELINE)") == 2
+    assert "grouped_gate_up_unit(" in kernel
+    assert "grouped_down_unit(" in kernel
+    assert "launch_persistent<TENSOR_PATH, false>" in persistent
+    assert "launch_persistent<TENSOR_PATH, true>" in persistent
+    assert (
+        "benchmark_grouped_pipeline_enabled()"
+        " ? launch_grouped_decode(arguments)"
+        " : launch_production_decode(arguments)"
+    ) in persistent.replace("\n", "").replace("    ", "")
