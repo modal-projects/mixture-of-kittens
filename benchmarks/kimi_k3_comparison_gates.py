@@ -61,6 +61,25 @@ def _row_label(row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+# Every distance comparison has to report all three, on every row.
+COMPARISON_METRICS = ("relative_l1", "cosine_similarity", "max_abs")
+
+# The comparisons whose finiteness finding is a gate input rather than a
+# derived statistic. The two stage comparisons are exposed by only one of the
+# native layers' internals and carry distances alone.
+FINITENESS_COMPARISONS = (
+    "custom_vs_reference",
+    "custom_vs_native",
+    "native_vs_reference",
+)
+
+ROUTER_FIELDS = (
+    "expert_ids_match",
+    "expert_id_mismatch_count",
+    "router_weight_max_abs",
+)
+
+
 def _within_gate_tolerances(stats: Mapping[str, Any]) -> bool:
     """Whether one comparison would clear the gated tolerances.
 
@@ -68,7 +87,7 @@ def _within_gate_tolerances(stats: Mapping[str, Any]) -> bool:
     gets counted and reported without failing anything.
     """
     return (
-        bool(stats.get("finite", True))
+        bool(stats["finite"])
         and float(stats["relative_l1"]) <= NUMERICAL_TOLERANCES["relative_l1"]
         and float(stats["cosine_similarity"])
         >= NUMERICAL_TOLERANCES["cosine_similarity"]
@@ -76,8 +95,98 @@ def _within_gate_tolerances(stats: Mapping[str, Any]) -> bool:
     )
 
 
+def _row_key(row: Mapping[str, Any]) -> tuple[str, int, int]:
+    for field in ("mode", "tokens", "pool_index"):
+        if row.get(field) is None:
+            raise ValueError(f"parity row {dict(row)!r} has no {field}")
+    return (str(row["mode"]), int(row["tokens"]), int(row["pool_index"]))
+
+
+def _check_row_is_complete(row: Mapping[str, Any]) -> None:
+    """Refuse a row that left any gate input out.
+
+    A missing metric read as a default is a gate that passes because nothing
+    measured it, which is the failure mode these gates exist to prevent.
+    """
+    label = _row_label(row)
+    for comparison in (GATED_COMPARISON, *DIAGNOSTIC_COMPARISONS):
+        if comparison not in row:
+            raise ValueError(
+                f"parity row {label} has no {comparison} comparison"
+            )
+        stats = row[comparison]
+        for metric in COMPARISON_METRICS:
+            if stats.get(metric) is None:
+                raise ValueError(
+                    f"parity row {label} {comparison} has no {metric}"
+                )
+    for comparison in FINITENESS_COMPARISONS:
+        if row[comparison].get("finite") is None:
+            raise ValueError(
+                f"parity row {label} {comparison} has no finite finding"
+            )
+    if "router" not in row:
+        raise ValueError(f"parity row {label} has no router comparison")
+    for field in ROUTER_FIELDS:
+        if row["router"].get(field) is None:
+            raise ValueError(f"parity row {label} router has no {field}")
+
+
+def _check_coverage(
+    rows: Sequence[Mapping[str, Any]],
+    expected_rows: Iterable[tuple[str, int, int]] | None,
+) -> dict[str, Any]:
+    """Refuse a set of rows that is not exactly the set the run promised.
+
+    Two archives measure the same shapes against different native layers, so a
+    row is unique by framework as well as by shape, while the shapes a run has
+    to cover are the same for each. Duplicates are judged on the first and
+    coverage on the second.
+    """
+    seen: set[tuple[Any, str, int, int]] = set()
+    for row in rows:
+        key = (row.get("framework"), *_row_key(row))
+        if key in seen:
+            raise ValueError(f"duplicate parity row for {key}")
+        seen.add(key)
+    shapes = {key[1:] for key in seen}
+    if expected_rows is None:
+        return {
+            "expected_row_count": None,
+            "measured_row_count": len(seen),
+            "measured_shape_count": len(shapes),
+        }
+    expected = set(expected_rows)
+    missing = sorted(expected - shapes)
+    if missing:
+        raise ValueError(f"missing parity rows for {missing}")
+    unexpected = sorted(shapes - expected)
+    if unexpected:
+        raise ValueError(f"unexpected parity rows for {unexpected}")
+    return {
+        "expected_row_count": len(expected),
+        "measured_row_count": len(seen),
+        "measured_shape_count": len(shapes),
+    }
+
+
+def expected_parity_rows(
+    shape_groups: Mapping[str, Sequence[int]],
+    pool_size: int,
+) -> list[tuple[str, int, int]]:
+    """Every ``(mode, tokens, pool entry)`` a run of this sweep must measure."""
+    return [
+        (mode, int(tokens), pool_index)
+        for mode, shapes in shape_groups.items()
+        for tokens in shapes
+        for pool_index in range(pool_size)
+    ]
+
+
 def evaluate_numerical_gates(
     rows: Sequence[Mapping[str, Any]],
+    *,
+    expected_rows: Iterable[tuple[str, int, int]] | None = None,
 ) -> dict[str, Any]:
     """Enforce the official-reference tolerances on every parity row.
 
@@ -88,22 +197,27 @@ def evaluate_numerical_gates(
     tolerance because a routing decision is discrete -- a different expert is a
     different computation, not a rounding difference -- so unlike the output
     comparisons they are required of the native selection as well.
+
+    Everything the gates read has to be there. An absent row set, an absent
+    metric, a duplicated shape, or a shape the sweep promised and never
+    measured are all raised rather than scored, because each of them is a way
+    for a run that measured less than it claimed to report a pass.
     """
+    if not rows:
+        raise ValueError("no parity rows to gate")
+    coverage = _check_coverage(rows, expected_rows)
+
     evaluated: list[dict[str, Any]] = []
     violations: list[dict[str, Any]] = []
     for row in rows:
-        if GATED_COMPARISON not in row:
-            raise ValueError(
-                f"parity row {_row_label(row)} has no {GATED_COMPARISON} "
-                "comparison to gate"
-            )
+        _check_row_is_complete(row)
         gated = row[GATED_COMPARISON]
         router = row["router"]
         checks = {
             "finite": {
-                "value": bool(gated.get("finite", True)),
+                "value": bool(gated["finite"]),
                 "limit": True,
-                "passed": bool(gated.get("finite", True)),
+                "passed": bool(gated["finite"]),
             },
             "relative_l1": {
                 "value": float(gated["relative_l1"]),
@@ -124,10 +238,10 @@ def evaluate_numerical_gates(
                 <= NUMERICAL_TOLERANCES["max_abs"],
             },
             "router_expert_ids_exact": {
-                "value": int(router.get("expert_id_mismatch_count", 0)),
+                "value": int(router["expert_id_mismatch_count"]),
                 "limit": 0,
                 "passed": bool(router["expert_ids_match"])
-                and int(router.get("expert_id_mismatch_count", 0)) == 0,
+                and int(router["expert_id_mismatch_count"]) == 0,
             },
             "router_weight_max_abs": {
                 "value": float(router["router_weight_max_abs"]),
@@ -151,9 +265,8 @@ def evaluate_numerical_gates(
 
     diagnostics: dict[str, Any] = {}
     for comparison in (GATED_COMPARISON, *DIAGNOSTIC_COMPARISONS):
-        present = [row[comparison] for row in rows if comparison in row]
-        if not present:
-            continue
+        present = [row[comparison] for row in rows]
+        finiteness_known = comparison in FINITENESS_COMPARISONS
         diagnostics[comparison] = {
             "row_count": len(present),
             "max_relative_l1": max(
@@ -163,9 +276,13 @@ def evaluate_numerical_gates(
                 float(stats["cosine_similarity"]) for stats in present
             ),
             "max_abs": max(float(stats["max_abs"]) for stats in present),
-            "rows_outside_gate_tolerances": sum(
-                0 if _within_gate_tolerances(stats) else 1
-                for stats in present
+            "rows_outside_gate_tolerances": (
+                sum(
+                    0 if _within_gate_tolerances(stats) else 1
+                    for stats in present
+                )
+                if finiteness_known
+                else None
             ),
             "gated": comparison == GATED_COMPARISON,
         }
@@ -177,6 +294,7 @@ def evaluate_numerical_gates(
         "tolerances": dict(NUMERICAL_TOLERANCES),
         "router_weight_max_abs": ROUTER_WEIGHT_MAX_ABS,
         "row_count": len(evaluated),
+        "coverage": coverage,
         "rows": evaluated,
         "violations": violations,
         "diagnostics": diagnostics,
@@ -440,10 +558,20 @@ def combine_archives(
     Everything is written before the verdict is returned, so a caller that
     turns a failing verdict into a failing exit status still leaves a complete
     set of artifacts behind.
+
+    An archive has to carry the parity rows its own manifest says it measured.
+    A performance sweep that fell short is recorded as incomplete and fails the
+    verdict, but a numerical archive that fell short is refused outright: an
+    absent row is an unmeasured shape, and averaging over the shapes that did
+    report is how an incomplete run gets read as a clean one.
     """
+    if not directories:
+        raise ValueError("combining needs at least one archive")
+
     latency_groups = []
     parity_rows: list[Mapping[str, Any]] = []
     manifests = {}
+    expected_rows: list[tuple[str, int, int]] = []
     for directory in directories:
         directory = Path(directory)
         manifest = json.loads((directory / "manifest.json").read_text())
@@ -457,8 +585,32 @@ def combine_archives(
                 rows.append({**row, "image": manifest["framework"]})
         latency_groups.append(rows)
         parity_path = directory / "parity.json"
-        if parity_path.is_file():
-            parity_rows.extend(json.loads(parity_path.read_text())["rows"])
+        if not parity_path.is_file():
+            raise ValueError(
+                f"{directory} has no parity.json to gate numerically"
+            )
+        archived = [
+            {"framework": manifest["framework"], **row}
+            for row in json.loads(parity_path.read_text())["rows"]
+        ]
+        parity_rows.extend(archived)
+        shape_groups = manifest.get("shape_groups")
+        pool_size = manifest.get("graph_pool_size")
+        if shape_groups is None or pool_size is None:
+            continue
+        promised = set(expected_parity_rows(shape_groups, int(pool_size)))
+        measured = {_row_key(row) for row in archived}
+        if promised - measured:
+            raise ValueError(
+                f"{directory} is missing parity rows its manifest promised: "
+                f"{sorted(promised - measured)}"
+            )
+        if measured - promised:
+            raise ValueError(
+                f"{directory} archived parity rows its manifest does not "
+                f"cover: {sorted(measured - promised)}"
+            )
+        expected_rows.extend(sorted(promised))
 
     combined = merge_latency_rows(latency_groups)
     try:
@@ -469,7 +621,9 @@ def combine_archives(
             "passed": False,
             "reason": str(error),
         }
-    numerical = evaluate_numerical_gates(parity_rows)
+    numerical = evaluate_numerical_gates(
+        parity_rows, expected_rows=sorted(set(expected_rows)) or None
+    )
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -510,6 +664,7 @@ __all__ = [
     "GATED_COMPARISON",
     "combine_archives",
     "evaluate_numerical_gates",
+    "expected_parity_rows",
     "evaluate_performance_gates",
     "merge_latency_rows",
     "parity_summary",

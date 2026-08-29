@@ -481,15 +481,6 @@ def test_pinned_image_reference_rejects_an_unknown_framework() -> None:
         compare.pinned_image_reference("tensorrt")
 
 
-def test_effective_image_reference_defaults_to_the_pin(monkeypatch) -> None:
-    compare = _compare()
-    monkeypatch.delenv("MOK_COMPARISON_IMAGE_REF", raising=False)
-
-    assert compare.effective_image_reference("vllm") == (
-        compare.pinned_image_reference("vllm")
-    )
-
-
 def test_effective_image_reference_rejects_a_build_off_the_pin(monkeypatch) -> None:
     """The image the container actually booted has to be the pinned digest."""
     compare = _compare()
@@ -702,8 +693,11 @@ def test_dry_run_manifest_records_the_effective_cli_overrides(
     assert manifest["graph_pool_size"] == 2
     assert manifest["shape_groups"] == {"block16": [16, 32]}
     assert manifest["routing"]["pool_entries"] == 2
-    assert manifest["image_reference"] == _compare().pinned_image_reference(
-        "sglang"
+    # A dry run builds no image, so it has no observed reference to record and
+    # records the pin it would have been held to instead.
+    assert manifest["image_reference"] is None
+    assert manifest["image_reference_expected"] == (
+        _compare().pinned_image_reference("sglang")
     )
 
 
@@ -720,35 +714,6 @@ class _FakeEvent:
     def elapsed_time(self, other: _FakeEvent) -> float:
         assert self.stamp is not None and other.stamp is not None
         return other.stamp - self.stamp
-
-
-def test_replay_samples_discards_a_primed_event_pair() -> None:
-    """The first event pair's one-time cost must not land in a sample.
-
-    Creating and recording the very first ``torch.cuda.Event`` of a process
-    pays a driver initialization that shows up entirely in sample zero, which
-    is then the p99 of a thousand-sample series. One pair is recorded and
-    thrown away before the persisted ones.
-    """
-    from benchmarks.kimi_k3_timing import replay_samples
-
-    clock = [0.0]
-    replays: list[int] = []
-
-    def replay(iteration: int) -> None:
-        replays.append(iteration)
-        clock[0] += 50.0 if len(replays) == 3 else 1.0
-
-    samples = replay_samples(
-        replay,
-        warmup_count=2,
-        sample_count=4,
-        event_factory=lambda: _FakeEvent(clock),
-        synchronize=lambda: None,
-    )
-
-    assert samples == [1.0, 1.0, 1.0, 1.0]
-    assert replays == [0, 1, 2, 3, 4, 5, 6]
 
 
 def test_replay_samples_rejects_a_non_positive_count() -> None:
@@ -912,3 +877,214 @@ def test_modal_exposes_the_two_framework_comparison_entrypoints() -> None:
     # completeness check while the Modal function still rejects it.
     assert "comparison_artifact_files" in source
     assert "COMPARISON_ARTIFACT_FILES" not in source
+
+
+# --------------------------------------------------------------------------
+# One immutable router for every captured graph
+# --------------------------------------------------------------------------
+
+
+# --------------------------------------------------------------------------
+# Fail-closed numerical gates
+# --------------------------------------------------------------------------
+
+
+def test_numerical_gates_reject_an_empty_row_set() -> None:
+    """No rows is not a pass; it is a run that measured nothing."""
+    compare = _compare()
+
+    with pytest.raises(ValueError, match="no parity rows"):
+        compare.evaluate_numerical_gates([])
+
+
+def test_numerical_gates_require_an_explicit_finiteness_finding() -> None:
+    compare = _compare()
+    row = _parity_row()
+    del row["custom_vs_reference"]["finite"]
+
+    with pytest.raises(ValueError, match="finite"):
+        compare.evaluate_numerical_gates([row])
+
+
+def test_numerical_gates_require_every_metric_on_every_comparison() -> None:
+    compare = _compare()
+    row = _parity_row()
+    del row["native_vs_reference"]["cosine_similarity"]
+
+    with pytest.raises(ValueError, match="cosine_similarity"):
+        compare.evaluate_numerical_gates([row])
+
+
+def test_numerical_gates_require_every_comparison_to_be_present() -> None:
+    compare = _compare()
+    row = _parity_row()
+    del row["custom_vs_native"]
+
+    with pytest.raises(ValueError, match="custom_vs_native"):
+        compare.evaluate_numerical_gates([row])
+
+
+def test_numerical_gates_reject_a_duplicated_shape_and_pool_row() -> None:
+    compare = _compare()
+
+    with pytest.raises(ValueError, match="duplicate"):
+        compare.evaluate_numerical_gates([_parity_row(), _parity_row()])
+
+
+def test_numerical_gates_reject_a_row_the_expected_coverage_omits() -> None:
+    compare = _compare()
+
+    with pytest.raises(ValueError, match="unexpected"):
+        compare.evaluate_numerical_gates(
+            [_parity_row(), _parity_row(tokens=48)],
+            expected_rows=[("block16", 16, 0)],
+        )
+
+
+def test_numerical_gates_reject_a_shape_the_run_never_measured() -> None:
+    compare = _compare()
+
+    with pytest.raises(ValueError, match="missing"):
+        compare.evaluate_numerical_gates(
+            [_parity_row()],
+            expected_rows=[("block16", 16, 0), ("block16", 16, 1)],
+        )
+
+
+def test_numerical_gates_accept_the_exact_expected_coverage() -> None:
+    compare = _compare()
+
+    gates = compare.evaluate_numerical_gates(
+        [_parity_row(), _parity_row(pool_index=1)],
+        expected_rows=[("block16", 16, 0), ("block16", 16, 1)],
+    )
+
+    assert gates["passed"] is True
+    assert gates["row_count"] == 2
+    assert gates["coverage"]["expected_row_count"] == 2
+
+
+# --------------------------------------------------------------------------
+# Fail-closed archive combination
+# --------------------------------------------------------------------------
+
+
+def test_combine_archives_requires_parity_from_every_archive(
+    tmp_path: Path,
+) -> None:
+    compare = _compare()
+    directories = [
+        _write_archive(
+            tmp_path / "vllm",
+            "vllm",
+            medians={"mok": 1.0, "vllm": 1.4},
+            p99s={"mok": 1.1, "vllm": 1.5},
+            parity=[_parity_row()],
+        ),
+        _write_archive(
+            tmp_path / "sglang",
+            "sglang",
+            medians={"mok": 1.0, "sglang": 1.2},
+            p99s={"mok": 1.1, "sglang": 1.3},
+            parity=[_parity_row(pool_index=1)],
+        ),
+    ]
+    (tmp_path / "sglang" / "parity.json").unlink()
+
+    with pytest.raises(ValueError, match="parity.json"):
+        compare.combine_archives(directories, tmp_path / "combined")
+
+
+def test_combine_archives_requires_the_manifest_coverage_it_claims(
+    tmp_path: Path,
+) -> None:
+    """An archive that dropped a shape cannot be combined as if it had not."""
+    compare = _compare()
+    directory = _write_archive(
+        tmp_path / "vllm",
+        "vllm",
+        medians={"mok": 1.0, "vllm": 1.4},
+        p99s={"mok": 1.1, "vllm": 1.5},
+        parity=[_parity_row()],
+    )
+    manifest = json.loads((directory / "manifest.json").read_text())
+    manifest["shape_groups"] = {"block16": [16, 32]}
+    manifest["graph_pool_size"] = 1
+    (directory / "manifest.json").write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="missing"):
+        compare.combine_archives([directory], tmp_path / "combined")
+
+
+# --------------------------------------------------------------------------
+# Observed provenance
+# --------------------------------------------------------------------------
+
+
+def test_effective_image_reference_requires_the_builder_to_report_one(
+    monkeypatch,
+) -> None:
+    """An expected pin is not evidence of what the container booted.
+
+    Recording the manifest's digest when the builder said nothing would put a
+    value in the archive that no observation supports, which is the one thing
+    an image pin exists to prevent.
+    """
+    compare = _compare()
+    monkeypatch.delenv("MOK_COMPARISON_IMAGE_REF", raising=False)
+
+    with pytest.raises(ValueError, match="MOK_COMPARISON_IMAGE_REF"):
+        compare.effective_image_reference("vllm")
+
+
+def test_effective_image_reference_is_optional_only_for_a_dry_run(
+    monkeypatch,
+) -> None:
+    compare = _compare()
+    monkeypatch.delenv("MOK_COMPARISON_IMAGE_REF", raising=False)
+
+    assert compare.effective_image_reference("vllm", dry_run=True) is None
+
+
+def test_effective_image_reference_returns_the_reported_pin(
+    monkeypatch,
+) -> None:
+    compare = _compare()
+    pinned = compare.pinned_image_reference("vllm")
+    monkeypatch.setenv("MOK_COMPARISON_IMAGE_REF", pinned)
+
+    assert compare.effective_image_reference("vllm") == pinned
+
+
+# --------------------------------------------------------------------------
+# Steady-state samples
+# --------------------------------------------------------------------------
+
+
+def test_replay_samples_discards_a_settling_replay_after_priming() -> None:
+    """Priming the events is not the same as reaching a steady state.
+
+    The primed pair costs the driver's first-record initialization, so the
+    replay it brackets is itself not a steady-state one. One more replay and
+    event pair are run and discarded before the persisted series begins, and
+    the series is exactly ``sample_count`` long.
+    """
+    from benchmarks.kimi_k3_timing import replay_samples
+
+    clock = [0.0]
+    replays: list[int] = []
+
+    def replay(iteration: int) -> None:
+        replays.append(iteration)
+        clock[0] += {1: 50.0, 2: 7.0}.get(len(replays) - 2, 1.0)
+
+    samples = replay_samples(
+        replay,
+        warmup_count=2,
+        sample_count=4,
+        event_factory=lambda: _FakeEvent(clock),
+        synchronize=lambda: None,
+    )
+
+    assert samples == [1.0, 1.0, 1.0, 1.0]
+    assert replays == [0, 1, 2, 3, 4, 5, 6, 7]

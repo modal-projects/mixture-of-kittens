@@ -188,18 +188,27 @@ def effective_image_reference(
     framework: str,
     *,
     environment: Mapping[str, str] | None = None,
-) -> str:
-    """Return the reference this container's image was derived from.
+    dry_run: bool = False,
+) -> str | None:
+    """Return the reference this container's image was actually derived from.
 
-    The builder records what it actually used; this refuses anything that is
-    not the pin, so an archive can never claim a digest it was not produced
-    from.
+    The builder reports what it used and this refuses anything that is not the
+    pin, so an archive can never claim a digest it was not produced from. It
+    also refuses to answer when the builder said nothing: recording the pin
+    then would put a digest in the archive that no observation supports, which
+    is the one thing pinning an image exists to prevent. A dry run builds no
+    image and has nothing to observe, so it records no reference at all.
     """
     pinned = pinned_image_reference(framework)
     env = os.environ if environment is None else environment
     reported = env.get(IMAGE_REFERENCE_ENV)
     if reported is None:
-        return pinned
+        if dry_run:
+            return None
+        raise ValueError(
+            f"{IMAGE_REFERENCE_ENV} is unset, so there is no observed image "
+            f"reference for {framework}; the expected pin is {pinned!r}"
+        )
     if reported != pinned:
         raise ValueError(
             f"{framework} image reference {reported!r} does not match the "
@@ -332,7 +341,10 @@ def build_comparison_manifest(
         "platform": platform.platform(),
         "gpu": pins["gpu"],
         "tp_size": TP_SIZE,
-        "image_reference": effective_image_reference(framework),
+        "image_reference": effective_image_reference(
+            framework, dry_run=dry_run
+        ),
+        "image_reference_expected": pinned_image_reference(framework),
         "warmup_count": warmup_count,
         "sample_count": sample_count,
         "graph_pool_size": pool_size,

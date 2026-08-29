@@ -80,17 +80,21 @@ def replay_samples(
     event_factory: Callable[[], TimingEvent],
     synchronize: Callable[[], None],
 ) -> list[float]:
-    """Time ``sample_count`` replays, after warming both the kernel and the events.
+    """Time ``sample_count`` replays, after warming the kernel and the instrument.
 
-    The warmups are the kernel's; the primed pair is the timing instrument's.
+    The warmups are the kernel's. The two discarded pairs are the instrument's.
     A process's first ``cuda.Event`` record pays a one-time driver
     initialization, and every sample here is enqueued back to back before a
-    single synchronization, so that cost lands entirely in sample zero -- which
-    a thousand-sample p99 then reports as a tail. One pair is recorded and its
-    reading thrown away first, so the persisted series measures only replays.
+    single synchronization, so that cost lands entirely in whichever replay it
+    brackets. The first pair pays it. The replay that pair brackets is
+    therefore not a steady-state one either, so a second pair runs and is
+    discarded as well, and only then does the persisted series begin.
 
-    The iteration index continues across the warmups, the primed replay, and
-    the measured ones, so a caller that rotates a graph pool by index keeps
+    The series is exactly ``sample_count`` long: the discarded replays are
+    extra work, not samples taken out of the count.
+
+    The iteration index continues across the warmups, both discarded replays,
+    and the measured ones, so a caller that rotates a graph pool by index keeps
     rotating it.
     """
     if warmup_count < 1 or sample_count < 1:
@@ -99,19 +103,22 @@ def replay_samples(
         replay(iteration)
     synchronize()
 
-    primed_start = event_factory()
-    primed_end = event_factory()
-    primed_start.record()
-    replay(warmup_count)
-    primed_end.record()
-    synchronize()
-    primed_start.elapsed_time(primed_end)
+    settled = warmup_count
+    for _ in range(2):
+        start = event_factory()
+        end = event_factory()
+        start.record()
+        replay(settled)
+        end.record()
+        synchronize()
+        start.elapsed_time(end)
+        settled += 1
 
     starts = [event_factory() for _ in range(sample_count)]
     ends = [event_factory() for _ in range(sample_count)]
     for offset, (start, end) in enumerate(zip(starts, ends, strict=True)):
         start.record()
-        replay(warmup_count + 1 + offset)
+        replay(settled + offset)
         end.record()
     synchronize()
     return [
