@@ -378,7 +378,6 @@ void kimi_k3_decode_persistent_kernel(
     const int block = static_cast<int>(blockIdx.x);
     const int thread = static_cast<int>(threadIdx.x);
     const int grid_ctas = static_cast<int>(gridDim.x);
-    unsigned long long mark = clocks.now();
 
     // The managed allocator barriers the whole CTA and a CTA may allocate
     // tensor memory only once, so the pool is provisioned here, before any
@@ -388,6 +387,30 @@ void kimi_k3_decode_persistent_kernel(
     // Latched before the first barrier, which is the only point at which no
     // CTA of this launch can have advanced the counter yet.
     GridPhase grid = latch_grid_phase(scratch, &latch_slot);
+
+    // -----------------------------------------------------------------------
+    // Phase -1, profiled launches only: zero the accumulators, grid-wide.
+    //
+    // A profiled replay has to report its own cycles rather than every replay
+    // the graph ever made, so block 0 clears the band. That clearing has to be
+    // separated from the first timed region by a barrier: a CTA that reached
+    // the end of phase 0 before the zeroing landed would have its cycles
+    // erased by it, and the region would under-report by however many CTAs
+    // won that race. `profile_phases` is a launch-wide argument, so either
+    // every CTA takes this barrier or none does, and their barrier targets
+    // stay in step either way.
+    //
+    // A measured launch is never profiled: the condition is one predicate on a
+    // null pointer the caller already handed in, and nothing inside runs.
+    // -----------------------------------------------------------------------
+    if (clocks.enabled()) {
+        if (block == 0 && thread < kPhaseClockCount) {
+            clocks.counters[thread] = 0ull;
+        }
+        grid_barrier(scratch, error_flag, grid, grid_ctas);
+    }
+
+    unsigned long long mark = clocks.now();
 
     // -----------------------------------------------------------------------
     // Phase 0: clear this launch's queues and the routed accumulator.
@@ -402,11 +425,6 @@ void kimi_k3_decode_persistent_kernel(
             reinterpret_cast<unsigned int *>(
                 &scratch.phase[cleared_counter(thread)]),
             0u);
-    }
-    // The accumulators are cleared alongside the queues so a profiled replay
-    // reports its own cycles rather than every replay the graph ever made.
-    if (clocks.enabled() && block == 0 && thread < kPhaseClockCount) {
-        clocks.counters[thread] = 0ull;
     }
     const int routed_values = active_tokens * kLatentSize;
     for (int index = block * kDecodeCtaThreads + thread;

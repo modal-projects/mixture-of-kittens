@@ -21,6 +21,10 @@ Every test here needs all eight ranks, so this file must be launched through
 
 from __future__ import annotations
 
+import contextlib
+import os
+from collections.abc import Iterator
+
 import pytest
 import torch
 
@@ -813,3 +817,104 @@ def test_the_step_runs_on_the_current_stream(
     torch.cuda.current_stream(device).wait_stream(side)
     torch.cuda.synchronize(device)
     assert_decode_close(captured, expected)
+
+
+@contextlib.contextmanager
+def _phase_profiling() -> Iterator[None]:
+    """Turn the clock64 accumulators on, the way the benchmark process does."""
+    previous = os.environ.get("MOK_KIMI_K3_ENABLE_GRID_TUNING")
+    os.environ["MOK_KIMI_K3_ENABLE_GRID_TUNING"] = "1"
+    _C._kimi_k3_decode_set_phase_profile(True)
+    try:
+        yield
+    finally:
+        _C._kimi_k3_decode_set_phase_profile(False)
+        if previous is None:
+            os.environ.pop("MOK_KIMI_K3_ENABLE_GRID_TUNING", None)
+        else:
+            os.environ["MOK_KIMI_K3_ENABLE_GRID_TUNING"] = previous
+
+
+def _phase_clock_band(workspace: KimiK3DecodeWorkspace) -> torch.Tensor:
+    begin, names = _C._kimi_k3_decode_phase_clock_metadata()
+    return workspace.scratch[begin * 4 : (begin + 2 * len(names)) * 4]
+
+
+def _phase_clocks(workspace: KimiK3DecodeWorkspace) -> dict[str, int]:
+    _, names = _C._kimi_k3_decode_phase_clock_metadata()
+    counters = _phase_clock_band(workspace).cpu().view(torch.int64).tolist()
+    return dict(zip(names, counters, strict=True))
+
+
+def test_a_profiled_launch_reports_its_own_cycles_and_costs_one_barrier(
+    workspace: KimiK3DecodeWorkspace,
+    weights: KimiK3DecodeWeights,
+    tp8_context: tuple[int, int, torch.device],
+) -> None:
+    """Block 0 zeroes the band, so the grid has to wait for it before timing.
+
+    Without a barrier between the clearing and the first timed region, a CTA
+    that finished phase 0 early would have its cycles erased by a store that
+    landed after them, and the profile would under-report by however many CTAs
+    won that race -- exactly the launches a profile is read to explain. The
+    barrier is what makes each profiled launch report only itself, so the check
+    is that two identical launches accumulate the same order of cycles rather
+    than the second one carrying the first, and that the extra rendezvous shows
+    up as one more generation than an unprofiled launch spends.
+    """
+    _, _, device = tp8_context
+    tokens = BLOCK16_TOKENS
+    hidden = hidden_states(device, tokens)
+    expected = decode_reference(hidden, weights)
+
+    _decode(workspace, weights, hidden)
+    _synchronize_ranks(workspace)
+
+    # An unprofiled launch takes neither the clearing nor its barrier, and
+    # writes no counter, so the band it is handed back is the one it was given.
+    _phase_clock_band(workspace).zero_()
+    _phase(workspace.scratch)[GRID_GENERATION].zero_()
+    _synchronize_ranks(workspace)
+    _decode(workspace, weights, hidden)
+    torch.cuda.synchronize(device)
+    assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 7
+    assert set(_phase_clocks(workspace).values()) == {0}
+
+    with _phase_profiling():
+        assert _C._kimi_k3_decode_phase_profile()
+        _phase(workspace.scratch)[GRID_GENERATION].zero_()
+        _synchronize_ranks(workspace)
+        first_result = _decode(workspace, weights, hidden).clone()
+        torch.cuda.synchronize(device)
+        first = _phase_clocks(workspace)
+        assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 8
+
+        _synchronize_ranks(workspace)
+        second_result = _decode(workspace, weights, hidden).clone()
+        torch.cuda.synchronize(device)
+        second = _phase_clocks(workspace)
+
+    assert_decode_close(first_result, expected)
+    assert_decode_close(second_result, expected)
+    assert int(workspace.error_flag.item()) == 0
+
+    # Every region the launch runs is timed by every CTA that ran it, so a
+    # cleared band that raced the first region would leave a counter short of
+    # the CTAs that reached it. Both launches do the same work, so the second
+    # reading is a repeat of the first rather than a running total.
+    assert set(first) == set(_C._kimi_k3_decode_phase_clock_metadata()[1])
+    assert min(first.values()) > 0, first
+    for name, cycles in second.items():
+        assert cycles > 0, name
+        assert cycles < 2 * first[name], (name, first[name], cycles)
+        assert cycles > first[name] // 2, (name, first[name], cycles)
+
+    # Profiling is off again, so the band stops moving and the launch is back
+    # to the seven generations a measured replay spends.
+    assert not _C._kimi_k3_decode_phase_profile()
+    _phase(workspace.scratch)[GRID_GENERATION].zero_()
+    _synchronize_ranks(workspace)
+    _decode(workspace, weights, hidden)
+    torch.cuda.synchronize(device)
+    assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 7
+    assert _phase_clocks(workspace) == second

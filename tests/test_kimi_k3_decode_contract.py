@@ -435,6 +435,42 @@ def test_the_gate_up_rounds_never_read_a_prefetch_they_did_not_make() -> None:
 
 
 # ---------------------------------------------------------------------------
+# The profiling band.
+# ---------------------------------------------------------------------------
+
+
+def test_clearing_the_phase_clocks_is_fenced_off_from_the_first_timed_region(
+) -> None:
+    """One CTA zeroes the band, so the rest may not be timing while it does.
+
+    Only block 0 clears the counters, and a CTA that finished a region before
+    that store landed would have its cycles zeroed with it, so the profile
+    would silently under-report by however many CTAs won the race. The clearing
+    is therefore separated from the first ``clocks.now()`` by a grid barrier,
+    and this pins that order in the source: the clear, then the barrier, then
+    the first mark.
+    """
+    text = _source("persistent_kernel.cuh")
+    body = _function_body(text, "void kimi_k3_decode_persistent_kernel(")
+
+    clear = body.index("clocks.counters[thread] = 0ull;")
+    barrier = body.index("grid_barrier(", clear)
+    mark = body.index("clocks.now()", clear)
+    assert clear < barrier < mark
+
+    # The clear and its barrier are one launch-wide predicate, so every CTA
+    # agrees on whether the extra barrier happens and their targets stay in
+    # step. An unprofiled launch takes neither.
+    guard = re.search(
+        r"if \(clocks\.enabled\(\)\) \{(?P<block>(?:[^{}]|\{[^{}]*\})*)\}",
+        body,
+    )
+    assert guard is not None
+    assert "clocks.counters[thread] = 0ull;" in guard.group("block")
+    assert "grid_barrier(" in guard.group("block")
+
+
+# ---------------------------------------------------------------------------
 # Rejections.
 # ---------------------------------------------------------------------------
 
