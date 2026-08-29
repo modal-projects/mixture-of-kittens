@@ -136,3 +136,60 @@ def test_modal_exposes_a_focused_single_b300_probe() -> None:
     assert '"benchmarks.kimi_k3_batched_expert_probe"' in source
     assert '"compute-sanitizer"' in source
     assert 'gpu="B300"' in source
+
+
+def test_grouped_pipeline_benchmark_is_exactly_m16_and_m128() -> None:
+    benchmark = importlib.import_module(
+        "benchmarks.kimi_k3_grouped_pipeline"
+    )
+    modal_source = (
+        Path(__file__).parents[1] / "modal_app.py"
+    ).read_text(encoding="utf-8")
+
+    assert benchmark.TOKENS == (16, 128)
+    assert benchmark.BASELINE.name == "baseline_148"
+    assert benchmark.CANDIDATE.name == "grouped_128"
+    assert benchmark.CANDIDATE.grouped_pipeline is True
+    assert benchmark.CANDIDATE.grid_ctas == 128
+    assert "def bench_kimi_k3_grouped_pipeline(" in modal_source
+    assert "def grouped_pipeline(" in modal_source
+    assert '"benchmarks.kimi_k3_grouped_pipeline"' in modal_source
+
+
+def test_grouped_pipeline_gate_requires_numerics_and_a_measured_gain() -> None:
+    benchmark = importlib.import_module(
+        "benchmarks.kimi_k3_grouped_pipeline"
+    )
+    numerical = [
+        {
+            "candidate_vs_reference": {
+                "finite": True,
+                "relative_l1": 0.01,
+                "cosine_similarity": 0.9999,
+                "max_abs": 0.5,
+            }
+        }
+    ]
+
+    accepted = benchmark.evaluate_candidate(
+        baseline_repeat_medians=[1.0, 1.01, 0.99],
+        candidate_repeat_medians=[0.8, 0.81, 0.79],
+        numerical_rows=numerical,
+    )
+    wrong = benchmark.evaluate_candidate(
+        baseline_repeat_medians=[1.0, 1.01, 0.99],
+        candidate_repeat_medians=[0.8, 0.81, 0.79],
+        numerical_rows=[
+            {
+                "candidate_vs_reference": {
+                    **numerical[0]["candidate_vs_reference"],
+                    "finite": False,
+                }
+            }
+        ],
+    )
+
+    assert accepted["passed"] is True
+    assert accepted["measurably_faster"] is True
+    assert wrong["numerically_correct"] is False
+    assert wrong["passed"] is False

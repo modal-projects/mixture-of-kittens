@@ -57,8 +57,10 @@ PRIVATE_ROUTED_STACK_CEILING = 48
 
 # Itanium mangling spells the two ``bool TENSOR_PATH`` instantiations out, so
 # the core and tcgen05 builds of the same template can be told apart by name.
-CORE_MANGLING = "ILb0E"
-TENSOR_MANGLING = "ILb1E"
+PRODUCTION_CORE_MANGLING = "ILb0ELb0EE"
+PRODUCTION_TENSOR_MANGLING = "ILb1ELb0EE"
+GROUPED_CORE_MANGLING = "ILb0ELb1EE"
+GROUPED_TENSOR_MANGLING = "ILb1ELb1EE"
 
 # Blackwell SASS, from the SM103 build. ``UTCQMMA`` is the native mixed
 # MXFP4-by-MXFP8 tcgen05 contraction, ``UTCHMMA`` its BF16 sibling, ``LDGMC``
@@ -144,10 +146,29 @@ def persistent_symbols(extension_path: Path) -> dict[str, str]:
     """The two persistent instantiations, keyed by which capacity path they are."""
     usage = _resource_usage(extension_path)
     found = [name for name in usage if PERSISTENT_SYMBOL in name]
-    assert len(found) == 2, found
+    assert len(found) == 4, found
     symbols = {
-        "core": next(name for name in found if CORE_MANGLING in name),
-        "tensor": next(name for name in found if TENSOR_MANGLING in name),
+        "core": next(
+            name for name in found if PRODUCTION_CORE_MANGLING in name
+        ),
+        "tensor": next(
+            name for name in found if PRODUCTION_TENSOR_MANGLING in name
+        ),
+    }
+    assert symbols["core"] != symbols["tensor"]
+    return symbols
+
+
+@pytest.fixture(scope="module")
+def grouped_persistent_symbols(extension_path: Path) -> dict[str, str]:
+    """The two benchmark-only grouped instantiations."""
+    usage = _resource_usage(extension_path)
+    found = [name for name in usage if PERSISTENT_SYMBOL in name]
+    symbols = {
+        "core": next(name for name in found if GROUPED_CORE_MANGLING in name),
+        "tensor": next(
+            name for name in found if GROUPED_TENSOR_MANGLING in name
+        ),
     }
     assert symbols["core"] != symbols["tensor"]
     return symbols
@@ -190,6 +211,28 @@ def test_the_private_routed_expert_kernel_stays_under_its_measured_spill(
     found = [name for name in usage if ROUTED_EXPERTS_SYMBOL in name]
     assert len(found) == 1, found
     assert usage[found[0]]["STACK"] <= PRIVATE_ROUTED_STACK_CEILING, usage[found[0]]
+
+
+@pytest.mark.parametrize("path_name", ["core", "tensor"])
+def test_grouped_candidate_stays_resident_and_spill_free(
+    extension_path: Path,
+    grouped_persistent_symbols: dict[str, str],
+    path_name: str,
+) -> None:
+    """The extra live accumulators must fit before timing is meaningful."""
+    usage = _resource_usage(extension_path)[
+        grouped_persistent_symbols[path_name]
+    ]
+    assert usage["STACK"] == 0, usage
+    assert usage["LOCAL"] == 0, usage
+    dynamic_shared, resident = _C._kimi_k3_decode_grouped_pipeline_resource(
+        path_name == "tensor"
+    )
+    properties = torch.cuda.get_device_properties(0)
+    assert dynamic_shared + usage["SHARED"] <= (
+        properties.shared_memory_per_block_optin
+    ), usage
+    assert resident == 1
 
 
 @pytest.mark.parametrize("path_name", ["core", "tensor"])

@@ -67,6 +67,39 @@ def phase_profiling() -> Iterator[None]:
             os.environ["MOK_KIMI_K3_ENABLE_GRID_TUNING"] = previous_guard
 
 
+@contextlib.contextmanager
+def benchmark_decode_variant(
+    *,
+    grouped_pipeline: bool,
+    grid_ctas: int,
+) -> Iterator[None]:
+    """Select one guarded persistent-kernel variant for capture or replay."""
+    from mok import _C
+
+    guards = {
+        "MOK_KIMI_K3_ENABLE_GRID_TUNING":
+            os.environ.get("MOK_KIMI_K3_ENABLE_GRID_TUNING"),
+        "MOK_KIMI_K3_ENABLE_GROUPED_PIPELINE":
+            os.environ.get("MOK_KIMI_K3_ENABLE_GROUPED_PIPELINE"),
+    }
+    os.environ["MOK_KIMI_K3_ENABLE_GRID_TUNING"] = "1"
+    os.environ["MOK_KIMI_K3_ENABLE_GROUPED_PIPELINE"] = "1"
+    _C._kimi_k3_decode_set_benchmark_grid(grid_ctas)
+    _C._kimi_k3_decode_set_grouped_pipeline(grouped_pipeline)
+    try:
+        yield
+    finally:
+        _C._kimi_k3_decode_set_grouped_pipeline(False)
+        _C._kimi_k3_decode_set_benchmark_grid(
+            _C._kimi_k3_decode_grid_shape()[0]
+        )
+        for name, previous in guards.items():
+            if previous is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = previous
+
+
 def phase_clock_cycles(
     workspace: KimiK3DecodeWorkspace,
 ) -> dict[str, int]:
@@ -336,6 +369,7 @@ __all__ = [
     "CONFIG",
     "assert_decode_close",
     "assert_identical_across_ranks",
+    "benchmark_decode_variant",
     "decode_reference",
     "decode_step",
     "profiled_kernel_names",
