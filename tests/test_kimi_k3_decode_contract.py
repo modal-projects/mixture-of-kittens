@@ -408,8 +408,9 @@ def test_routed_tma_writes_the_mma_layout_and_double_buffers_it() -> None:
     transfer with the current contraction, while keeping both routed units
     inside the persistent shared-memory budget.
     """
-    expert = _source("expert_mxfp4.cuh")
-    body = _function_body(expert, "void routed_gate_up_unit(")
+    body = _function_body(
+        _source("expert_mxfp4.cuh"), "void routed_gate_up_unit("
+    )
     loop = body[body.index("for (int round = 0; round < kGateUpRounds; ++round)"):]
     staging = _source("expert_mxfp4_staging.cuh")
 
@@ -418,9 +419,14 @@ def test_routed_tma_writes_the_mma_layout_and_double_buffers_it() -> None:
     assert "kDirectWeightGroups = 4" in staging
     assert "kWeightPipelineStages = 2" in staging
     assert "using direct_weight_stage =" in staging
-    assert "template<int WEIGHT_STAGES>" in expert
-    assert "direct_weight_stage (&first_weight_stage)[WEIGHT_STAGES]" in body
-    assert "direct_weight_stage (&second_weight_stage)[WEIGHT_STAGES]" in body
+    assert (
+        "direct_weight_stage (&first_weight_stage)[kWeightPipelineStages]"
+        in body
+    )
+    assert (
+        "direct_weight_stage (&second_weight_stage)[kWeightPipelineStages]"
+        in body
+    )
     assert "packed_weight_tile" not in staging
     assert "stage_weight_row(" not in body
     assert (
@@ -429,25 +435,22 @@ def test_routed_tma_writes_the_mma_layout_and_double_buffers_it() -> None:
         in body
     )
 
-    # Round zero is primed before the loop. Tensor shapes issue into the
-    # alternate stage before MMA; core shapes reuse one stage only after MMA.
-    assert body.count("issue_direct_weight_round(") == 3
-    assert "if constexpr (WEIGHT_STAGES == kWeightPipelineStages)" in loop
-    assert "(round + 1) % WEIGHT_STAGES" in loop
-    assert "if constexpr (WEIGHT_STAGES == 1)" in loop
-    assert "round + 1, 0, weight_arrived" in loop
+    # Round zero is primed before the loop. The only later direct issue is
+    # guarded and targets the alternate stage.
+    assert body.count("issue_direct_weight_round(") == 2
+    guarded = re.findall(
+        r"if \(round \+ 1 < kGateUpRounds\) \{(?P<block>(?:[^{}]|\{[^{}]*\})*)\}",
+        loop,
+    )
+    assert len(guarded) == 1, loop
+    assert "issue_direct_weight_round(" in guarded[0]
+    assert "(round + 1) % kWeightPipelineStages" in guarded[0]
 
     persistent = _source("persistent_kernel.cuh")
     kernel = _function_body(
         persistent, "void kimi_k3_decode_persistent_kernel("
     )
     assert "layouts.routed" in kernel
-    assert (
-        "TENSOR_PATH ? expert_mxfp4::kWeightPipelineStages : 1"
-        in kernel
-    )
-    assert "routed_gate_up_unit<routed_weight_stages>" in kernel
-    assert "routed_down_unit<routed_weight_stages>" in kernel
     assert "kimi_k3_decode_persistent_kernel<TENSOR_PATH" in persistent
 
 

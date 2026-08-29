@@ -378,8 +378,6 @@ void kimi_k3_decode_persistent_kernel(
     // tensor memory only once, so the pool is provisioned here, before any
     // divergence, and handed to every stage this block later runs.
     kittens::tensor_allocator<1, 1> tensor_pool{};
-    constexpr int routed_weight_stages =
-        TENSOR_PATH ? expert_mxfp4::kWeightPipelineStages : 1;
 
     // Latched before the first barrier, which is the only point at which no
     // CTA of this launch can have advanced the counter yet.
@@ -567,7 +565,7 @@ void kimi_k3_decode_persistent_kernel(
             const int begin = scratch.expert_offsets[expert];
             const int batch_rows =
                 scratch.expert_offsets[expert + 1] - begin;
-            expert_mxfp4::routed_gate_up_unit<routed_weight_stages>(
+            expert_mxfp4::routed_gate_up_unit(
                 shared_raw, tensor_pool, layouts.routed, expert_w1_scale,
                 expert_w3_scale, scratch, expert, begin, batch_rows,
                 routed % expert_mxfp4::kGateUpTiles, clocks);
@@ -628,7 +626,7 @@ void kimi_k3_decode_persistent_kernel(
             const int begin = scratch.expert_offsets[expert];
             const int batch_rows =
                 scratch.expert_offsets[expert + 1] - begin;
-            expert_mxfp4::routed_down_unit<routed_weight_stages>(
+            expert_mxfp4::routed_down_unit(
                 shared_raw, tensor_pool, layouts.routed, expert_w2_scale,
                 scratch, expert, begin, batch_rows,
                 routed % expert_mxfp4::kDownTiles, active_tokens, clocks);

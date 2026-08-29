@@ -40,7 +40,6 @@ namespace expert_mxfp4 {
 /// `tensor_pool` is owned by the caller because a CTA may allocate tensor
 /// memory only once: the persistent kernel provisions one pool at entry and
 /// hands it to every unit, and the private kernel provisions one of its own.
-template<int WEIGHT_STAGES>
 static __device__ void routed_gate_up_unit(
     int *__restrict__ shared_raw,
     kittens::tensor_allocator<1, 1> &tensor_pool,
@@ -58,10 +57,10 @@ static __device__ void routed_gate_up_unit(
     tma_swizzle_allocator staging(shared_raw);
     mixed_operand_tile (&activation_tile)[kGateUpRoundGroups] =
         staging.allocate<mixed_operand_tile, kGateUpRoundGroups>();
-    direct_weight_stage (&first_weight_stage)[WEIGHT_STAGES] =
-        staging.allocate<direct_weight_stage, WEIGHT_STAGES>();
-    direct_weight_stage (&second_weight_stage)[WEIGHT_STAGES] =
-        staging.allocate<direct_weight_stage, WEIGHT_STAGES>();
+    direct_weight_stage (&first_weight_stage)[kWeightPipelineStages] =
+        staging.allocate<direct_weight_stage, kWeightPipelineStages>();
+    direct_weight_stage (&second_weight_stage)[kWeightPipelineStages] =
+        staging.allocate<direct_weight_stage, kWeightPipelineStages>();
     mixed_scale_tile (&activation_scale_shared)[kGateUpScaleTiles] =
         staging.allocate<mixed_scale_tile, kGateUpScaleTiles>();
     mixed_scale_tile (&first_scale_shared)[kGateUpScaleTiles] =
@@ -154,7 +153,7 @@ static __device__ void routed_gate_up_unit(
     #pragma unroll 1
     for (int round = 0; round < kGateUpRounds; ++round) {
         const int group_base = round * kGateUpRoundGroups;
-        const int stage = round % WEIGHT_STAGES;
+        const int stage = round % kWeightPipelineStages;
         wait(weight_arrived, round % 2);
 
         #pragma unroll
@@ -190,18 +189,16 @@ static __device__ void routed_gate_up_unit(
                     + static_cast<long long>(token) * kLatentGroups
                     + group_base + quad * kScaleGroupsPerTile));
         }
+
         asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
         __syncthreads();
-        if constexpr (WEIGHT_STAGES == kWeightPipelineStages) {
-            if (round + 1 < kGateUpRounds) {
-                read_scale_round(
-                    group_base + kGateUpRoundGroups, scale_words);
-                issue_direct_weight_round(
-                    first_weight_stage, second_weight_stage,
-                    layouts.w1, layouts.w3, expert, output_tile,
-                    round + 1, (round + 1) % WEIGHT_STAGES,
-                    weight_arrived);
-            }
+        if (round + 1 < kGateUpRounds) {
+            read_scale_round(group_base + kGateUpRoundGroups, scale_words);
+            issue_direct_weight_round(
+                first_weight_stage, second_weight_stage,
+                layouts.w1, layouts.w3, expert, output_tile,
+                round + 1, (round + 1) % kWeightPipelineStages,
+                weight_arrived);
         }
         mark = clocks.lap(kClockRoutedGateUpStage, mark);
         // `tcgen05.cp`, `tcgen05.mma`, and `tcgen05.commit` are single-thread
@@ -232,14 +229,12 @@ static __device__ void routed_gate_up_unit(
                     const bool accumulate = round != 0 || slot != 0;
                     mixed_mma_direct(
                         first_accumulator, activation_tile[slot],
-                        first_weight_stage[stage], slot,
-                        scale_slot(quad),
+                        first_weight_stage[stage], slot, scale_slot(quad),
                         scale_slot(kGateUpScaleTiles + quad),
                         scale_factor_id, accumulate);
                     mixed_mma_direct(
                         second_accumulator, activation_tile[slot],
-                        second_weight_stage[stage], slot,
-                        scale_slot(quad),
+                        second_weight_stage[stage], slot, scale_slot(quad),
                         scale_slot(2 * kGateUpScaleTiles + quad),
                         scale_factor_id, accumulate);
                 }
@@ -250,16 +245,6 @@ static __device__ void routed_gate_up_unit(
         __syncthreads();
         mark = clocks.lap(kClockRoutedGateUpMma, mark);
         compute_phase ^= 1;
-        if constexpr (WEIGHT_STAGES == 1) {
-            if (round + 1 < kGateUpRounds) {
-                read_scale_round(
-                    group_base + kGateUpRoundGroups, scale_words);
-                issue_direct_weight_round(
-                    first_weight_stage, second_weight_stage,
-                    layouts.w1, layouts.w3, expert, output_tile,
-                    round + 1, 0, weight_arrived);
-            }
-        }
     }
 
     store_accumulator(first_accumulator, first_result_shared);
@@ -271,7 +256,6 @@ static __device__ void routed_gate_up_unit(
 }
 
 /// Contract one expert batch's down tile and weight it into the accumulator.
-template<int WEIGHT_STAGES>
 static __device__ void routed_down_unit(
     int *__restrict__ shared_raw,
     kittens::tensor_allocator<1, 1> &tensor_pool,
@@ -289,8 +273,8 @@ static __device__ void routed_down_unit(
     tma_swizzle_allocator staging(shared_raw);
     mixed_operand_tile (&activation_tile)[kDownRoundGroups] =
         staging.allocate<mixed_operand_tile, kDownRoundGroups>();
-    direct_weight_stage (&weight_stage)[WEIGHT_STAGES] =
-        staging.allocate<direct_weight_stage, WEIGHT_STAGES>();
+    direct_weight_stage (&weight_stage)[kWeightPipelineStages] =
+        staging.allocate<direct_weight_stage, kWeightPipelineStages>();
     mixed_scale_tile (&activation_scale_shared)[kDownScaleTiles] =
         staging.allocate<mixed_scale_tile, kDownScaleTiles>();
     mixed_scale_tile (&weight_scale_shared)[kDownScaleTiles] =
@@ -338,7 +322,7 @@ static __device__ void routed_down_unit(
     #pragma unroll 1
     for (int round = 0; round < kDownRounds; ++round) {
         const int group_base = round * kDownRoundGroups;
-        const int stage = round % WEIGHT_STAGES;
+        const int stage = round % kWeightPipelineStages;
         if (round != 0) {
             wait(weight_arrived, round % 2);
         }
@@ -353,6 +337,7 @@ static __device__ void routed_down_unit(
                     + scale_index * kExpertW2ScaleColumns
                     + group_base));
         }
+
         for (int index = thread; index < rows * kDownRoundGroups;
              index += kDecodeCtaThreads) {
             const int row = index / kDownRoundGroups;
@@ -374,14 +359,13 @@ static __device__ void routed_down_unit(
                     + static_cast<long long>(assignment) * kSituGroups
                     + group_base));
         }
+
         asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
         __syncthreads();
-        if constexpr (WEIGHT_STAGES == kWeightPipelineStages) {
-            if (round + 1 < kDownRounds) {
-                issue_direct_weight_round(
-                    weight_stage, layouts.w2, expert, output_tile, round + 1,
-                    (round + 1) % WEIGHT_STAGES, weight_arrived);
-            }
+        if (round + 1 < kDownRounds) {
+            issue_direct_weight_round(
+                weight_stage, layouts.w2, expert, output_tile, round + 1,
+                (round + 1) % kWeightPipelineStages, weight_arrived);
         }
         mark = clocks.lap(kClockRoutedDownStage, mark);
         if (warpid() == 0) {
@@ -410,13 +394,6 @@ static __device__ void routed_down_unit(
         __syncthreads();
         mark = clocks.lap(kClockRoutedDownMma, mark);
         compute_phase ^= 1;
-        if constexpr (WEIGHT_STAGES == 1) {
-            if (round + 1 < kDownRounds) {
-                issue_direct_weight_round(
-                    weight_stage, layouts.w2, expert, output_tile, round + 1,
-                    0, weight_arrived);
-            }
-        }
     }
 
     store_accumulator(accumulator, result_shared);
@@ -492,7 +469,7 @@ void kimi_k3_routed_experts_kernel(
 
             for (int output_tile = 0; output_tile < kGateUpTiles;
                  ++output_tile) {
-                routed_gate_up_unit<kWeightPipelineStages>(
+                routed_gate_up_unit(
                     shared_raw, tensor_pool, layouts, expert_w1_scale,
                     expert_w3_scale, scratch, expert, assignment_begin,
                     batch_rows, output_tile,
@@ -501,7 +478,7 @@ void kimi_k3_routed_experts_kernel(
 
             for (int output_tile = 0; output_tile < kDownTiles;
                  ++output_tile) {
-                routed_down_unit<kWeightPipelineStages>(
+                routed_down_unit(
                     shared_raw, tensor_pool, layouts, expert_w2_scale, scratch,
                     expert, assignment_begin, batch_rows, output_tile,
                     active_tokens, PhaseClocks{nullptr});
