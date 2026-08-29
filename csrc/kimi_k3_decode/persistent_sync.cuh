@@ -24,6 +24,13 @@ namespace persistent {
 /// count co-resides, and the kernel reads that count from `gridDim.x`.
 inline constexpr int kPersistentCtas = 148;
 
+/// Adjacent logical units one routed-phase queue claim reserves.
+///
+/// Four cuts the two CTA barriers and one contended global atomic around those
+/// phases by 4x while keeping their scheduler quantum far below one expert's
+/// 28 down-projection tiles.
+inline constexpr int kRoutedClaimBatch = 4;
+
 /// Dynamic shared memory every CTA requests, in bytes.
 ///
 /// It has to cover the widest stage the kernel runs, which is one routed
@@ -180,13 +187,10 @@ static __device__ void grid_barrier(
 /// Claim this CTA's next unit of one phase's queue, or -1 once it is drained.
 ///
 /// Thread 0 takes the ticket and broadcasts it, so the whole CTA runs one unit
-/// at a time and the stage device functions keep their CTA-wide barriers. A
-/// counter is cleared at kernel entry and then rises to `units` plus exactly
-/// one refused ticket per CTA, because a CTA leaves the loop on its first
-/// refusal. `persistent_kernel.cuh` static-asserts the resulting bound: the
-/// longest queue is the tensor path's 25 150 down units. The largest accepted
-/// runtime grid is the 148-CTA production default, so its maximum overshoot
-/// stops at 25 298 -- nowhere near an unsigned wrap.
+/// at a time and the stage device functions keep their CTA-wide barriers. This
+/// single-unit form serves the short route/latent queue. The routed phases use
+/// `claim_unit_batch` below; both counters are cleared at kernel entry and a
+/// CTA leaves either loop on its first refused claim.
 static __device__ int claim_unit(
     const Scratch &scratch,
     const int queue_index,
@@ -203,6 +207,37 @@ static __device__ int claim_unit(
     }
     __syncthreads();
     return *slot;
+}
+
+/// Claim up to `BATCH` adjacent units with one atomic and one CTA rendezvous.
+///
+/// The returned half-open range is clipped at `units`; a CTA leaves after its
+/// first refused range just as it does for `claim_unit`.
+template<int BATCH>
+static __device__ int claim_unit_batch(
+    const Scratch &scratch,
+    const int queue_index,
+    const int units,
+    int *const begin_slot,
+    int *const end_slot
+) {
+    static_assert(BATCH > 0);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned int ticket = atomicAdd(
+            reinterpret_cast<unsigned int *>(&scratch.phase[queue_index]),
+            static_cast<unsigned int>(BATCH));
+        if (ticket < static_cast<unsigned int>(units)) {
+            const int begin = static_cast<int>(ticket);
+            *begin_slot = begin;
+            *end_slot = begin + BATCH < units ? begin + BATCH : units;
+        } else {
+            *begin_slot = -1;
+            *end_slot = -1;
+        }
+    }
+    __syncthreads();
+    return *begin_slot;
 }
 
 /// Spin until an in-phase arrival counter reaches `target`, then acquire.

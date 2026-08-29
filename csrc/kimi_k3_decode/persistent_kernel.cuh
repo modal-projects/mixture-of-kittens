@@ -163,24 +163,28 @@ inline constexpr int longest_queue_units() {
     return longest;
 }
 
-/// The longest queue, and the highest ticket a worker can take from one.
+/// The longest queue, and the highest routed counter value it can reach.
 ///
 /// Both bounds matter. The length is what a unit index is decoded against, and
 /// the ticket is what the counter has to hold without wrapping, because nothing
-/// resets it inside a launch. A CTA leaves a queue on its first refusal, so the
-/// overshoot past the last unit is exactly one refused ticket per CTA.
+/// resets it inside a launch. Routed claims round the logical length up to their
+/// batch width, then every CTA can add one refused batch.
 inline constexpr int kLongestQueueUnits = longest_queue_units();
+inline constexpr int kLongestQueueRounded =
+    (kLongestQueueUnits + kRoutedClaimBatch - 1)
+        / kRoutedClaimBatch * kRoutedClaimBatch;
 inline constexpr int kLongestQueueTicket =
-    kLongestQueueUnits + kMaximumBenchmarkCtas;
+    kLongestQueueRounded + kRoutedClaimBatch * kMaximumBenchmarkCtas;
 
 static_assert(kLongestQueueUnits == 25150,
               "the widest phase is 6 activation + 56 shared-down + 896 * 28 "
               "routed down units");
 static_assert(kLongestQueueTicket
-                  == kLongestQueueUnits + kPersistentCtas,
+                  == kLongestQueueRounded
+                       + kRoutedClaimBatch * kPersistentCtas,
               "the ticket bound must cover the largest production grid");
-static_assert(kLongestQueueTicket == 25298,
-              "the widest phase plus one refused ticket for each of 148 CTAs");
+static_assert(kLongestQueueTicket == 25744,
+              "the rounded widest phase plus one refused batch per CTA");
 static_assert(static_cast<unsigned int>(kLongestQueueTicket)
                   < 0xffffffffu / 2u,
               "a queue counter must not approach the unsigned wrap");
@@ -372,6 +376,7 @@ void kimi_k3_decode_persistent_kernel(
     std::uint8_t *const shared = reinterpret_cast<std::uint8_t *>(shared_raw);
     __shared__ std::uint32_t latch_slot;
     __shared__ int claim_slot;
+    __shared__ int claim_end_slot;
 
     const Scratch scratch = scratch_view(scratch_bytes);
     const PhaseClocks clocks = phase_clocks(scratch, profile_phases != 0);
@@ -541,40 +546,47 @@ void kimi_k3_decode_persistent_kernel(
             : shared_experts::kCoreGateCtas;
         const int units =
             shared_units + expert_units * expert_mxfp4::kGateUpTiles;
-        int unit;
-        while ((unit = claim_unit(
-                    scratch, kGateUpQueue, units, &claim_slot)) >= 0) {
-            if (unit < shared_units) {
-                if constexpr (TENSOR_PATH) {
-                    const bool gate = unit < shared_experts::kTensorGateCtas;
-                    shared_experts::project_tensor(
-                        shared_raw, tensor_pool, layouts.hidden,
-                        gate ? layouts.shared_gate : layouts.shared_up,
-                        gate ? layouts.gate : layouts.up,
-                        gate ? unit : unit - shared_experts::kTensorGateCtas,
-                        shared_experts::kTensorGateKIterations);
-                } else {
-                    // The core producer writes the activated intermediate too,
-                    // so the core path has no separate activation unit.
-                    shared_experts::gate_up_core<kMaxCoreCapacity>(
-                        shared, hidden_states, shared_gate_proj, shared_up_proj,
-                        scratch, unit, active_tokens);
+        int batch_begin;
+        while ((batch_begin = claim_unit_batch<kRoutedClaimBatch>(
+                    scratch, kGateUpQueue, units, &claim_slot,
+                    &claim_end_slot)) >= 0) {
+            for (int unit = batch_begin; unit < claim_end_slot; ++unit) {
+                if (unit < shared_units) {
+                    if constexpr (TENSOR_PATH) {
+                        const bool gate =
+                            unit < shared_experts::kTensorGateCtas;
+                        shared_experts::project_tensor(
+                            shared_raw, tensor_pool, layouts.hidden,
+                            gate ? layouts.shared_gate : layouts.shared_up,
+                            gate ? layouts.gate : layouts.up,
+                            gate
+                                ? unit
+                                : unit - shared_experts::kTensorGateCtas,
+                            shared_experts::kTensorGateKIterations);
+                    } else {
+                        // The core producer writes the activated intermediate
+                        // too, so the core path has no separate activation unit.
+                        shared_experts::gate_up_core<kMaxCoreCapacity>(
+                            shared, hidden_states, shared_gate_proj,
+                            shared_up_proj, scratch, unit, active_tokens);
+                    }
+                    __syncthreads();
+                    mark = clocks.lap(kClockSharedExperts, mark);
+                    continue;
                 }
+                const int routed = unit - shared_units;
+                const int expert =
+                    scratch.unit_expert[
+                        routed / expert_mxfp4::kGateUpTiles];
+                const int begin = scratch.expert_offsets[expert];
+                expert_mxfp4::routed_gate_up_unit(
+                    shared_raw, tensor_pool, expert_w1_packed, expert_w1_scale,
+                    expert_w3_packed, expert_w3_scale, scratch, expert, begin,
+                    scratch.expert_offsets[expert + 1] - begin,
+                    routed % expert_mxfp4::kGateUpTiles, clocks);
                 __syncthreads();
-                mark = clocks.lap(kClockSharedExperts, mark);
-                continue;
+                mark = clocks.lap(kClockRoutedGateUp, mark);
             }
-            const int routed = unit - shared_units;
-            const int expert =
-                scratch.unit_expert[routed / expert_mxfp4::kGateUpTiles];
-            const int begin = scratch.expert_offsets[expert];
-            expert_mxfp4::routed_gate_up_unit(
-                shared_raw, tensor_pool, expert_w1_packed, expert_w1_scale,
-                expert_w3_packed, expert_w3_scale, scratch, expert, begin,
-                scratch.expert_offsets[expert + 1] - begin,
-                routed % expert_mxfp4::kGateUpTiles, clocks);
-            __syncthreads();
-            mark = clocks.lap(kClockRoutedGateUp, mark);
         }
     }
     grid_barrier(scratch, error_flag, grid, grid_ctas);
@@ -599,42 +611,47 @@ void kimi_k3_decode_persistent_kernel(
         constexpr int shared_units = activation_units + shared_down_units;
         const int units =
             shared_units + expert_units * expert_mxfp4::kDownTiles;
-        int unit;
-        while ((unit = claim_unit(
-                    scratch, kDownQueue, units, &claim_slot)) >= 0) {
-            if (unit < shared_units) {
-                if (unit < activation_units) {
-                    shared_experts::activate_shared_tile(
-                        scratch, unit, active_tokens);
-                    publish_count(scratch, kActivationArrivals);
-                } else if constexpr (TENSOR_PATH) {
-                    wait_for_count(
-                        scratch, error_flag, kActivationArrivals,
-                        activation_units, kErrorPersistentActivation);
-                    shared_experts::down_tensor(
-                        shared_raw, tensor_pool, layouts.activated,
-                        layouts.shared_down, collective_buffer,
-                        unit - activation_units, active_tokens, active_tokens);
-                } else {
-                    shared_experts::down_core<kMaxCoreCapacity>(
-                        shared, scratch, shared_down_proj, collective_buffer,
-                        unit - activation_units, active_tokens, active_tokens);
+        int batch_begin;
+        while ((batch_begin = claim_unit_batch<kRoutedClaimBatch>(
+                    scratch, kDownQueue, units, &claim_slot,
+                    &claim_end_slot)) >= 0) {
+            for (int unit = batch_begin; unit < claim_end_slot; ++unit) {
+                if (unit < shared_units) {
+                    if (unit < activation_units) {
+                        shared_experts::activate_shared_tile(
+                            scratch, unit, active_tokens);
+                        publish_count(scratch, kActivationArrivals);
+                    } else if constexpr (TENSOR_PATH) {
+                        wait_for_count(
+                            scratch, error_flag, kActivationArrivals,
+                            activation_units, kErrorPersistentActivation);
+                        shared_experts::down_tensor(
+                            shared_raw, tensor_pool, layouts.activated,
+                            layouts.shared_down, collective_buffer,
+                            unit - activation_units, active_tokens,
+                            active_tokens);
+                    } else {
+                        shared_experts::down_core<kMaxCoreCapacity>(
+                            shared, scratch, shared_down_proj,
+                            collective_buffer, unit - activation_units,
+                            active_tokens, active_tokens);
+                    }
+                    __syncthreads();
+                    mark = clocks.lap(kClockSharedExperts, mark);
+                    continue;
                 }
+                const int routed = unit - shared_units;
+                const int expert =
+                    scratch.unit_expert[routed / expert_mxfp4::kDownTiles];
+                const int begin = scratch.expert_offsets[expert];
+                expert_mxfp4::routed_down_unit(
+                    shared_raw, tensor_pool, expert_w2_packed, expert_w2_scale,
+                    scratch, expert, begin,
+                    scratch.expert_offsets[expert + 1] - begin,
+                    routed % expert_mxfp4::kDownTiles, active_tokens, clocks);
                 __syncthreads();
-                mark = clocks.lap(kClockSharedExperts, mark);
-                continue;
+                mark = clocks.lap(kClockRoutedDown, mark);
             }
-            const int routed = unit - shared_units;
-            const int expert =
-                scratch.unit_expert[routed / expert_mxfp4::kDownTiles];
-            const int begin = scratch.expert_offsets[expert];
-            expert_mxfp4::routed_down_unit(
-                shared_raw, tensor_pool, expert_w2_packed, expert_w2_scale,
-                scratch, expert, begin,
-                scratch.expert_offsets[expert + 1] - begin,
-                routed % expert_mxfp4::kDownTiles, active_tokens, clocks);
-            __syncthreads();
-            mark = clocks.lap(kClockRoutedDown, mark);
         }
     }
     grid_barrier(scratch, error_flag, grid, grid_ctas);
