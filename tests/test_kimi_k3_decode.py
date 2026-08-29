@@ -857,13 +857,14 @@ def test_a_profiled_launch_reports_its_own_cycles_and_costs_one_barrier(
     that finished phase 0 early would have its cycles erased by a store that
     landed after them, and the profile would under-report by however many CTAs
     won that race -- exactly the launches a profile is read to explain. The
-    barrier is what makes each profiled launch report only itself, so the check
-    is that two identical launches accumulate the same order of cycles rather
-    than the second one carrying the first, and that the extra rendezvous shows
-    up as one more generation than an unprofiled launch spends.
+    barrier is what makes each profiled launch report only itself. The band is
+    poisoned with a sentinel far above any real cycle count before the second
+    profiled launch, so a counter that survives it is a counter the launch
+    never cleared, and the extra rendezvous shows up directly as one more grid
+    generation than an unprofiled launch spends.
     """
     _, _, device = tp8_context
-    tokens = BLOCK16_TOKENS
+    tokens = TENSOR_TOKENS
     hidden = hidden_states(device, tokens)
     expected = decode_reference(hidden, weights)
 
@@ -889,6 +890,12 @@ def test_a_profiled_launch_reports_its_own_cycles_and_costs_one_barrier(
         first = _phase_clocks(workspace)
         assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 8
 
+        # Every byte of the band set to one is 0x0101010101010101 in each
+        # counter, 7.2e16 cycles: eight orders of magnitude above anything a
+        # decode step spends, and it survives being added to. A counter that
+        # comes back small is one this launch cleared.
+        poison_floor = 1 << 40
+        _phase_clock_band(workspace).fill_(1)
         _synchronize_ranks(workspace)
         second_result = _decode(workspace, weights, hidden).clone()
         torch.cuda.synchronize(device)
@@ -898,16 +905,13 @@ def test_a_profiled_launch_reports_its_own_cycles_and_costs_one_barrier(
     assert_decode_close(second_result, expected)
     assert int(workspace.error_flag.item()) == 0
 
-    # Every region the launch runs is timed by every CTA that ran it, so a
-    # cleared band that raced the first region would leave a counter short of
-    # the CTAs that reached it. Both launches do the same work, so the second
-    # reading is a repeat of the first rather than a running total.
+    # Every region of the step is timed, by every CTA that ran it, and the
+    # poison is gone from all of them: the launch reported itself rather than
+    # itself plus whatever the band already held.
     assert set(first) == set(_C._kimi_k3_decode_phase_clock_metadata()[1])
     assert min(first.values()) > 0, first
     for name, cycles in second.items():
-        assert cycles > 0, name
-        assert cycles < 2 * first[name], (name, first[name], cycles)
-        assert cycles > first[name] // 2, (name, first[name], cycles)
+        assert 0 < cycles < poison_floor, (name, cycles)
 
     # Profiling is off again, so the band stops moving and the launch is back
     # to the seven generations a measured replay spends.
