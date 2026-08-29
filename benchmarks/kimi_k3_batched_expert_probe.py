@@ -50,6 +50,7 @@ def _debug_log(
     data: dict[str, object],
 ) -> None:
     # region agent log
+    Path("/opt/cursor/logs").mkdir(parents=True, exist_ok=True)
     with open("/opt/cursor/logs/debug.log", "a", encoding="utf-8") as stream:
         stream.write(
             json.dumps(
