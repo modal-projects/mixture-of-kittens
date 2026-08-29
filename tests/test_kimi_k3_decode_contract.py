@@ -400,46 +400,49 @@ def _function_body(text: str, signature: str) -> str:
     raise AssertionError(f"{signature} is never closed")
 
 
-def test_the_gate_up_rounds_never_read_a_prefetch_they_did_not_make() -> None:
-    """The last round has no next round, so its prefetch never happened.
+def test_gate_up_tma_prefetch_reuses_one_compact_buffer_safely() -> None:
+    """Packed weights use the copy engine without adding a second launch.
 
-    A second buffer to prefetch into is what creates the hazard: on the round
-    that skips the prefetch it holds an indeterminate value, and copying it
-    forward reads that value, which is undefined however dead the copy proves
-    to be. One buffer removes the hazard rather than guarding it -- the round
-    stages its own bytes first, then reloads the same registers -- so the
-    contract is that no second buffer exists and the reload is the only write
-    the loop makes to the one that does.
+    One compact shared buffer is enough: after the CTA expands the current
+    round into the MMA tiles, a barrier makes the compact bytes dead and TMA
+    can overwrite that same buffer with the next round while the tensor core
+    consumes the expanded tiles. Requiring one buffer keeps the routed stage
+    inside the persistent shared-memory budget and guarding the only in-loop
+    issue keeps the last round from reading beyond the weight row.
     """
     body = _function_body(
         _source("expert_mxfp4.cuh"), "void routed_gate_up_unit("
     )
     loop = body[body.index("for (int round = 0; round < kGateUpRounds; ++round)"):]
+    staging = _source("expert_mxfp4_staging.cuh")
 
-    declarations = [
-        line
-        for line in body.splitlines()
-        if re.match(r"\s*(uint4|std::uint32_t) \w+\[kGateUp\w+\];", line)
-    ]
-    assert len(declarations) == 2, declarations
-    assert "uint4 payload[kGateUpRoundGroups];" in declarations[0]
-    assert "std::uint32_t scale_words[kGateUpScaleTiles];" in declarations[1]
+    assert "using packed_weight_tile =" in staging
+    assert "using packed_weight_layout =" in staging
+    assert "tma::load_async(" in staging
+    assert "packed_weight_tile (&first_weight_packed)" in body
+    assert "packed_weight_tile (&second_weight_packed)" in body
+    assert body.count("packed_weight_tile (&") == 2
+    assert "uint4 payload" not in body
+    assert "std::uint32_t scale_words[kGateUpScaleTiles];" in body
 
-    # The prefetch is the loop's only reload, it targets the one buffer, and
-    # it is the only thing the last-round test guards.
+    # Round zero is primed before the loop. The only later TMA issue is guarded
+    # and targets the same two compact arrays rather than a second buffer.
+    assert body.count("issue_packed_weight_round(") == 2
     guarded = re.findall(
         r"if \(round \+ 1 < kGateUpRounds\) \{(?P<block>(?:[^{}]|\{[^{}]*\})*)\}",
         loop,
     )
     assert len(guarded) == 1, loop
-    assert "read_weight_round(" in guarded[0]
-    assert "payload, scale_words);" in guarded[0]
-    assert len(re.findall(r"read_weight_round\(", loop)) == 1
+    assert "issue_packed_weight_round(" in guarded[0]
+    assert "first_weight_packed, second_weight_packed" in guarded[0]
+    assert not re.search(r"\bnext_(?:weight_packed|scale_words)\b", body), body
 
-    # No copy forward, because there is nothing to copy from.
-    assert not re.search(r"\bnext_(?:payload|scale_words)\b", body), body
-    assert "payload[slot] =" not in loop
-    assert "scale_words[quad] =" not in loop
+    persistent = _source("persistent_kernel.cuh")
+    kernel = _function_body(
+        persistent, "void kimi_k3_decode_persistent_kernel("
+    )
+    assert "layouts.routed" in kernel
+    assert "kimi_k3_decode_persistent_kernel<TENSOR_PATH" in persistent
 
 
 # ---------------------------------------------------------------------------
