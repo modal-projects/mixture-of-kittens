@@ -58,6 +58,12 @@ def test_gate_up_stage_is_partitioned_without_replacing_parent_clocks() -> None:
     assert "add_gate_up_subphase(kGateUpQueueClaim" in persistent
     assert "clocks.lap(kClockRoutedGateUpStage" in expert
     assert "clocks.lap(kClockRoutedGateUpMma" in expert
+    gate_up = expert.split("void routed_gate_up_unit(", 1)[1].split(
+        "\n/// Contract one expert batch's down tile", 1
+    )[0]
+    assert gate_up.index(
+        "add_gate_up_subphase(kGateUpWeightGlobalLoad"
+    ) < gate_up.index("store_accumulator(first_accumulator")
     assert persistent.count("routed_gate_up_unit(") == 1
 
 
