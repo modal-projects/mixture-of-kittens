@@ -7,7 +7,6 @@ import importlib
 import json
 import math
 import os
-import time
 from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
@@ -33,25 +32,6 @@ INTERMEDIATE = 384
 TOPK = 16
 SCRATCH_BYTES = 6_276_096
 EXPERT_WEIGHT_BYTES = 2_193_408
-DEBUG_LOG_PATH = Path("/opt/cursor/logs/debug.log")
-
-
-def _debug_log(
-    hypothesis_id: str,
-    location: str,
-    message: str,
-    data: dict[str, object],
-) -> None:
-    payload = {
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": time.time_ns() // 1_000_000,
-    }
-    DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with DEBUG_LOG_PATH.open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
 def same_expert_batching_coverage(
@@ -128,6 +108,31 @@ def evaluate_row(
         "measurably_faster": measurably_faster,
         "numerically_correct": numerically_correct,
         "passed": measurably_faster and numerically_correct,
+    }
+
+
+def integration_decision(*, layout_validated: bool) -> dict[str, object]:
+    """Keep the layout isolated until it enables a compound kernel change."""
+    return {
+        "layout_validated": layout_validated,
+        "standalone_integration_candidate": False,
+        "preserve_single_launch": True,
+        "next_design": "persistent_multi_unit_staged_pipeline",
+        "first_full_kernel_shapes": [16, 128],
+        "reason": (
+            "the isolated layout changes data and accumulator handling but "
+            "does not remove the dominant full-kernel staging, MMA, epilogue, "
+            "or grid-wait phases"
+            if layout_validated
+            else "the isolated layout did not pass its measurement gate"
+        ),
+        "compound_change": [
+            "use the smaller m128x8 accumulator slices to keep multiple "
+            "independent routed units live in tensor memory",
+            "double-buffer weight and scale staging across those units",
+            "overlap staging with MMA and delayed epilogue readout",
+            "keep each MMA expert-pure while claiming work persistently",
+        ],
     }
 
 
@@ -308,7 +313,8 @@ def _manifest(
         "warmup_count": warmup_count,
         "sample_count": sample_count,
         "repeats": repeats,
-        "integration_status": "isolated_not_integrated",
+        "integration_status": "isolated_evidence_retained",
+        "next_design": "persistent_multi_unit_staged_pipeline",
         "measurement_gate": (
             "candidate median gain must exceed the larger repeat-median "
             "dispersion and pass numerical tolerances at every row count"
@@ -408,34 +414,12 @@ def run(
     if extension.kimi_k3_decode_workspace_bytes() != SCRATCH_BYTES:
         raise RuntimeError("probe scratch contract is stale")
 
-    # region agent log
-    _debug_log(
-        "A",
-        "benchmarks/kimi_k3_batched_expert_probe.py:run",
-        "probe entry",
-        {
-            "rows": list(PROBE_ROWS),
-            "warmup_count": warmup_count,
-            "sample_count": sample_count,
-            "repeats": repeats,
-        },
-    )
-    # endregion
-
     route_coverage = {
         str(tokens): same_expert_batching_coverage(
             route_assignments(tokens, 0)
         )
         for tokens in (16, 32, 128)
     }
-    # region agent log
-    _debug_log(
-        "C",
-        "benchmarks/kimi_k3_batched_expert_probe.py:route_coverage",
-        "same-expert batching coverage",
-        route_coverage,
-    )
-    # endregion
 
     l2_bytes = _l2_bytes(device)
     pool_size = l2_bytes // EXPERT_WEIGHT_BYTES + 1
@@ -470,14 +454,6 @@ def run(
             scratch,
             rows,
         )
-        # region agent log
-        _debug_log(
-            "D",
-            "benchmarks/kimi_k3_batched_expert_probe.py:numerical",
-            "candidate numerical comparison",
-            {"rows": rows, **numerical},
-        )
-        # endregion
 
         baseline_graphs = _capture_pool(
             extension, latents, weights, baseline_output, scratch, rows,
@@ -515,36 +491,10 @@ def run(
             summarize_rank_max([samples])
             for samples in samples_by_variant["baseline"]
         ]
-        # region agent log
-        _debug_log(
-            "A",
-            "benchmarks/kimi_k3_batched_expert_probe.py:baseline_timing",
-            "baseline timing complete",
-            {
-                "rows": rows,
-                "repeat_medians_ms": [
-                    summary["median_ms"] for summary in baseline_summaries
-                ],
-            },
-        )
-        # endregion
         candidate_summaries = [
             summarize_rank_max([samples])
             for samples in samples_by_variant["candidate"]
         ]
-        # region agent log
-        _debug_log(
-            "B",
-            "benchmarks/kimi_k3_batched_expert_probe.py:candidate_timing",
-            "candidate timing complete",
-            {
-                "rows": rows,
-                "repeat_medians_ms": [
-                    summary["median_ms"] for summary in candidate_summaries
-                ],
-            },
-        )
-        # endregion
         verdict = evaluate_row(
             baseline_repeat_medians=[
                 float(summary["median_ms"])
@@ -556,14 +506,6 @@ def run(
             ],
             numerical=numerical,
         )
-        # region agent log
-        _debug_log(
-            "A,B,D",
-            "benchmarks/kimi_k3_batched_expert_probe.py:row_verdict",
-            "row gate evaluated",
-            {"rows": rows, **verdict},
-        )
-        # endregion
         rows_output.append(
             {
                 "rows": rows,
@@ -578,28 +520,11 @@ def run(
         candidate_graphs.clear()
 
     passed = all(bool(row["passed"]) for row in rows_output)
-    row_one = next(row for row in rows_output if row["rows"] == 1)
-    if bool(row_one["passed"]):
-        decision = {
-            "same_expert_integration_candidate": True,
-            "reason": (
-                "m128x8 handles the one-row M16 distribution by padding only "
-                "the seven unused token columns"
-            ),
-            "alternative": None,
-        }
-    else:
-        decision = {
-            "same_expert_integration_candidate": False,
-            "reason": (
-                "the isolated one-row path did not clear the measurement gate"
-            ),
-            "alternative": (
-                "software-batch independent expert units in one CTA pipeline; "
-                "keep one weight descriptor and accumulator per expert and "
-                "never place different experts in one MMA"
-            ),
-        }
+    decision = integration_decision(layout_validated=passed)
+    decision["isolated_improvement_fraction"] = {
+        "minimum": min(float(row["improvement_fraction"]) for row in rows_output),
+        "maximum": max(float(row["improvement_fraction"]) for row in rows_output),
+    }
     result = {
         "passed": passed,
         "rows": rows_output,
@@ -613,14 +538,6 @@ def run(
         },
         "decision": decision,
     }
-    # region agent log
-    _debug_log(
-        "A,B,C,D",
-        "benchmarks/kimi_k3_batched_expert_probe.py:exit",
-        "probe exit",
-        {"passed": passed, "decision": decision},
-    )
-    # endregion
 
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_json(
@@ -634,8 +551,6 @@ def run(
     )
     _write_json(output_dir / "results.json", result)
     _write_json(output_dir / "raw_samples.json", raw_output)
-    if DEBUG_LOG_PATH.exists():
-        (output_dir / "debug.log").write_bytes(DEBUG_LOG_PATH.read_bytes())
     return result
 
 

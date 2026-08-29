@@ -21,7 +21,6 @@ import importlib
 import json
 import os
 import sys
-import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -161,31 +160,6 @@ PHASE_CLOCK_NAMES = (
     "tail",
 )
 PHASE_CLOCK_BREAKDOWN_SUFFIXES = ("_stage", "_mma", "_residual")
-_AGENT_DEBUG_LOG = "/opt/cursor/logs/debug.log"
-
-
-def _agent_debug_log(
-    hypothesis_id: str,
-    location: str,
-    message: str,
-    data: Mapping[str, Any],
-) -> None:
-    try:
-        with open(_AGENT_DEBUG_LOG, "a", encoding="utf-8") as handle:
-            handle.write(
-                json.dumps(
-                    {
-                        "hypothesisId": hypothesis_id,
-                        "location": location,
-                        "message": message,
-                        "data": dict(data),
-                        "timestamp": time.time_ns() // 1_000_000,
-                    }
-                )
-                + "\n"
-            )
-    except OSError:
-        pass
 
 
 def derive_phase_cycles(cycles: Mapping[str, int]) -> dict[str, int]:
@@ -434,42 +408,11 @@ def _phase_profile(
     """
     import torch
 
-    tokens = int(pool[0].hidden.shape[0])
-    batch = 1 if tokens <= 16 else 4
-    # region agent log
-    _agent_debug_log(
-        "A",
-        "benchmarks/compare_kimi_k3_frameworks.py:_phase_profile",
-        "phase profile entry",
-        {"tokens": tokens, "pool_size": len(pool), "routed_claim_batch": batch},
-    )
-    # endregion
     with runtime.phase_profiling():
         for entry in pool:
             runtime.decode_step(workspace, entry.weights, entry.hidden)
-        # region agent log
-        _agent_debug_log(
-            "C",
-            "benchmarks/compare_kimi_k3_frameworks.py:_phase_profile",
-            "profile replays queued",
-            {"tokens": tokens, "replays": len(pool)},
-        )
-        # endregion
         torch.cuda.synchronize(device)
         cycles = derive_phase_cycles(runtime.phase_clock_cycles(workspace))
-    # region agent log
-    _agent_debug_log(
-        "B",
-        "benchmarks/compare_kimi_k3_frameworks.py:_phase_profile",
-        "phase profile exit",
-        {
-            "tokens": tokens,
-            "grid_barrier": cycles["grid_barrier"],
-            "routed_gate_up": cycles["routed_gate_up"],
-            "routed_down": cycles["routed_down"],
-        },
-    )
-    # endregion
     return {
         "replays": len(pool),
         "cycles_cover": "the last replay",
