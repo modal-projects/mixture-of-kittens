@@ -127,11 +127,16 @@ def integration_decision(*, layout_validated: bool) -> dict[str, object]:
             else "the isolated layout did not pass its measurement gate"
         ),
         "compound_change": [
-            "use the smaller m128x8 accumulator slices to keep multiple "
-            "independent routed units live in tensor memory",
-            "double-buffer weight and scale staging across those units",
-            "overlap staging with MMA and delayed epilogue readout",
-            "keep each MMA expert-pure while claiming work persistently",
+            "claim expert-pure output-tile groups instead of one output tile "
+            "per persistent queue unit",
+            "use the smaller m128x8 slices to keep each group's accumulators "
+            "live in tensor memory",
+            "stage an expert activation once per K chunk and reuse it across "
+            "the group's output-tile MMAs",
+            "double-buffer weight and scale staging while the current buffer "
+            "feeds MMA and delayed epilogue readout",
+            "tune group width at M16 and M128 so reuse does not become grid "
+            "tail imbalance",
         ],
     }
 
