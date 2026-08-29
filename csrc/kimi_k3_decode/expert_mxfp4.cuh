@@ -329,6 +329,42 @@ __device__ __forceinline__ float decode_route_weight(
 // whole atoms, so an atom is contiguous and aligned however the tile is
 // placed, and a whole atom is one store. The measured decode profile put
 // 76.5% of all cycles in the byte-at-a-time staging these replace.
+//
+// The staging that remains is the largest region of the decode step, 29.4% of
+// it at M16, and the serving-backend comparison measured two attempts to cut
+// it. Both lost, and the reasons are worth keeping here, because both are the
+// obvious thing to try.
+//
+// The first attempt addressed the instruction path: converting every staging
+// store to `st.shared` so it compiles to `STS` instead of a generic `ST.E`,
+// and hoisting the cross-proxy fence out of `mixed_mma` so a gate/up round
+// pays one `MEMBAR.ALL.CTA` rather than sixteen. It does what it says --
+// `ST.E` 62 to 0, `MEMBAR` 155 to 127, `LDG` 230 to 294 as the freed prefetch
+// reaches the scheduler -- and it changed the median by less than the run to
+// run spread on all sixteen measured shapes, worst case 0.84% slower at M8
+// where the freed scheduling spilled sixteen bytes. The region is not bound by
+// the instructions it issues.
+//
+// The second attempt addressed the access pattern. A thread owning a whole
+// weight row reads that row contiguously, but rows are 192 bytes apart in W2
+// and 1,792 in W1/W3, so a warp's thirty-two lanes put one `LDG.128` across
+// thirty-two sectors. Dealing the round out by flat vector index instead --
+// consecutive lanes on consecutive vectors -- brings a down unit's load inside
+// 512 contiguous bytes, four sectors. It is 14% slower at M16 and 18% at M128,
+// because the destination moves with the source: consecutive vectors belong to
+// consecutive K groups, which are different 4 KB operand tiles, and 4,096 is a
+// whole number of 128-byte bank periods, so the warp's thirty-two shared
+// stores collide on the same banks. The packed layout makes the two ends
+// exclusive. A row-major deal buys conflict-free shared stores with
+// thirty-two-sector reads; a vector-major deal buys four-sector reads with a
+// twelve-way store conflict; and no thread-to-element map has both, because
+// the global row stride and the shared tile stride disagree.
+//
+// Having both is what a copy engine is for, and it is what the native layer
+// uses: vLLM's expert BMM is `..._tma_ldgstsSf_rgTma_...`, a TMA read of the
+// global tile writing the swizzled shared destination directly. That is the
+// change this staging needs, and it is a different kernel structure, not a
+// different index.
 // ---------------------------------------------------------------------------
 
 /// One shared tile row's two sixteen-byte atoms.
