@@ -3,28 +3,36 @@
 from __future__ import annotations
 
 import importlib
-import json
 from pathlib import Path
 
 import pytest
 
 
-def test_debug_log_creates_missing_parent(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_temporary_agent_instrumentation_has_been_removed() -> None:
+    root = Path(__file__).parents[1]
+    sources = (
+        root / "benchmarks" / "kimi_k3_batched_expert_probe.py",
+        root / "benchmarks" / "compare_kimi_k3_frameworks.py",
+    )
+
+    for source in sources:
+        text = source.read_text(encoding="utf-8")
+        assert "/opt/cursor/logs/debug.log" not in text
+        assert "agent log" not in text
+        assert "hypothesisId" not in text
+
+
+def test_probe_retains_layout_as_evidence_for_a_compound_pipeline() -> None:
     probe = importlib.import_module(
         "benchmarks.kimi_k3_batched_expert_probe"
     )
-    debug_log_path = tmp_path / "missing" / "debug.log"
-    monkeypatch.setattr(probe, "DEBUG_LOG_PATH", debug_log_path)
 
-    probe._debug_log("A", "test:debug_log", "probe entry", {"rows": [1]})
+    decision = probe.integration_decision(layout_validated=True)
 
-    payload = json.loads(debug_log_path.read_text(encoding="utf-8"))
-    assert payload["hypothesisId"] == "A"
-    assert payload["message"] == "probe entry"
-    assert payload["data"] == {"rows": [1]}
+    assert decision["layout_validated"] is True
+    assert decision["standalone_integration_candidate"] is False
+    assert decision["next_design"] == "persistent_multi_unit_staged_pipeline"
+    assert decision["preserve_single_launch"] is True
 
 
 def test_probe_rows_are_exactly_the_native_token_columns() -> None:
