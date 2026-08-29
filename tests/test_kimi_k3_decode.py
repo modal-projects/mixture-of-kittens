@@ -22,7 +22,9 @@ Every test here needs all eight ranks, so this file must be launched through
 from __future__ import annotations
 
 import contextlib
+import json
 import os
+import time
 from collections.abc import Iterator
 
 import pytest
@@ -591,6 +593,24 @@ def test_the_grid_claims_only_occupied_experts(
         + TENSOR_SHARED_DOWN_UNITS
         + distinct * GROUPED_DOWN_UNITS
     )
+    # region agent log
+    with open("/opt/cursor/logs/debug.log", "a", encoding="utf-8") as debug_file:
+        debug_file.write(json.dumps({
+            "hypothesisId": "Q",
+            "location": "tests/test_kimi_k3_decode.py:queue_accounting",
+            "message": "grouped queue counters after decode",
+            "data": {
+                "rank": tp8_context[0],
+                "mode": mode,
+                "distinct": distinct,
+                "gate_up_units": gate_up_units,
+                "gate_up_counter": int(counters[GATE_UP_QUEUE].item()),
+                "down_units": down_units,
+                "down_counter": int(counters[DOWN_QUEUE].item()),
+            },
+            "timestamp": time.time_ns() // 1_000_000,
+        }) + "\n")
+    # endregion
     # Batched routed queues stop one width-four claim past their last unit for
     # every CTA that was refused; the route/latent queue still claims singly.
     for counter, units, claim_width in (
@@ -709,14 +729,51 @@ def test_rotating_rank_skew_leaves_the_step_bit_identical(
     baseline = _decode(workspace, weights, hidden).clone()
     torch.cuda.synchronize(device)
     assert_decode_close(baseline, expected)
+    # region agent log
+    with open("/opt/cursor/logs/debug.log", "a", encoding="utf-8") as debug_file:
+        debug_file.write(json.dumps({
+            "hypothesisId": "D2,D4",
+            "location": "tests/test_kimi_k3_decode.py:skew_baseline",
+            "message": "rank-skew baseline completed",
+            "data": {
+                "rank": rank,
+                "gate_up_counter": int(_phase(workspace.scratch)[GATE_UP_QUEUE].item()),
+                "down_counter": int(_phase(workspace.scratch)[DOWN_QUEUE].item()),
+            },
+            "timestamp": time.time_ns() // 1_000_000,
+        }) + "\n")
+    # endregion
 
     for step in range(KIMI_K3_TP_SIZE):
         _synchronize_ranks(workspace)
         _rotating_skew(rank, step)
         actual = _decode(workspace, weights, hidden)
         torch.cuda.synchronize(device)
-        assert torch.equal(actual, baseline), step
+        difference = (actual.float() - baseline.float()).abs()
+        # region agent log
+        with open("/opt/cursor/logs/debug.log", "a", encoding="utf-8") as debug_file:
+            debug_file.write(json.dumps({
+                "hypothesisId": "D1,D2,D3,D4",
+                "location": "tests/test_kimi_k3_decode.py:skew_comparison",
+                "message": "rank-skew replay compared with baseline",
+                "data": {
+                    "rank": rank,
+                    "step": step,
+                    "equal": bool(torch.equal(actual, baseline)),
+                    "different_values": int(torch.count_nonzero(difference).item()),
+                    "max_abs": float(difference.max().item()),
+                    "gate_up_counter": int(
+                        _phase(workspace.scratch)[GATE_UP_QUEUE].item()
+                    ),
+                    "down_counter": int(
+                        _phase(workspace.scratch)[DOWN_QUEUE].item()
+                    ),
+                },
+                "timestamp": time.time_ns() // 1_000_000,
+            }) + "\n")
+        # endregion
         assert_identical_across_ranks(actual)
+        assert torch.equal(actual, baseline), step
 
 
 def test_one_thousand_graph_replays_reproduce_the_eager_step(

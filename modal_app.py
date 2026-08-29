@@ -27,6 +27,7 @@ Environment overrides:
 """
 
 import io
+import json
 import os
 import subprocess
 import tarfile
@@ -318,15 +319,23 @@ def test_kimi_k3_decode() -> None:
         str(path)
         for path in Path("tests").glob("test_kimi_k3*.py")
     )
-    _run_kimi_k3_torchrun(
-        [
-            "-m",
-            "pytest",
-            "-q",
-            *test_files,
-        ],
-        timeout=14_100,
-    )
+    try:
+        _run_kimi_k3_torchrun(
+            [
+                "-m",
+                "pytest",
+                "-q",
+                *test_files,
+            ],
+            timeout=14_100,
+        )
+    finally:
+        # region agent log
+        debug_log = Path("/opt/cursor/logs/debug.log")
+        if debug_log.is_file():
+            print("AGENT_DEBUG_LOG")
+            print(debug_log.read_text(encoding="utf-8"), end="")
+        # endregion
 
 
 @app.function(image=B300_IMAGE, gpu="B300:8", timeout=86_400)
@@ -589,6 +598,10 @@ def grouped_pipeline(
     repeats: int = 5,
 ) -> None:
     """Run and unpack the exact M16/M128 grouped-pipeline comparison."""
+    # region agent log
+    with open("/opt/cursor/logs/debug.log", "a", encoding="utf-8") as debug_file:
+        debug_file.write(json.dumps({"hypothesisId": "A,E", "location": "modal_app.py:grouped_pipeline:entry", "message": "grouped reproduction started", "data": {"git_sha": git_sha, "output_dir": output_dir, "warmup_count": warmup_count, "sample_count": sample_count, "repeats": repeats}, "timestamp": __import__("time").time_ns() // 1_000_000}) + "\n")
+    # endregion
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
     archive = bench_kimi_k3_grouped_pipeline.remote(
@@ -597,9 +610,26 @@ def grouped_pipeline(
         sample_count=sample_count,
         repeats=repeats,
     )
+    # region agent log
+    with open("/opt/cursor/logs/debug.log", "a", encoding="utf-8") as debug_file:
+        debug_file.write(json.dumps({"hypothesisId": "A,B,C,D,E", "location": "modal_app.py:grouped_pipeline:remote", "message": "remote build and benchmark returned", "data": {"archive_bytes": len(archive)}, "timestamp": __import__("time").time_ns() // 1_000_000}) + "\n")
+    # endregion
     (destination / "artifacts.tar").write_bytes(archive)
     with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
         bundle.extractall(destination, filter="data")
+    # region agent log
+    with open("/opt/cursor/logs/debug.log", "a", encoding="utf-8") as debug_file:
+        debug_file.write(json.dumps({"hypothesisId": "E", "location": "modal_app.py:grouped_pipeline:extract", "message": "grouped artifacts extracted", "data": {"artifacts": sorted(path.name for path in destination.iterdir())}, "timestamp": __import__("time").time_ns() // 1_000_000}) + "\n")
+    # endregion
+    results = json.loads((destination / "results.json").read_text(encoding="utf-8"))
+    # region agent log
+    with open("/opt/cursor/logs/debug.log", "a", encoding="utf-8") as debug_file:
+        debug_file.write(json.dumps({"hypothesisId": "A,B,C,D,E", "location": "modal_app.py:grouped_pipeline:results", "message": "grouped numerical performance and phase verdict", "data": {"passed": results["passed"], "rows": [{"tokens": row["tokens"], "passed": row["passed"], "numerically_correct": row["numerically_correct"], "improvement_fraction": row["improvement_fraction"]} for row in results["rows"]], "phase_categories": {tokens: {variant: profile["categories"] for variant, profile in variants.items()} for tokens, variants in results["phase_profiles"].items()}}, "timestamp": __import__("time").time_ns() // 1_000_000}) + "\n")
+    # endregion
+    # region agent log
+    with open("/opt/cursor/logs/debug.log", "a", encoding="utf-8") as debug_file:
+        debug_file.write(json.dumps({"hypothesisId": "A,B,C,D", "location": "modal_app.py:grouped_pipeline:phase_isolation", "message": "down-only phase isolation verdict", "data": {"variants": {tokens: sorted(variants) for tokens, variants in results["phase_profiles"].items()}, "phase_regions": {tokens: {variant: {name: profile["cycles"].get(name, 0) for name in ("routed_gate_up", "routed_gate_up_stage", "routed_gate_up_mma", "routed_down", "routed_down_stage", "routed_down_mma", "grid_barrier")} for variant, profile in variants.items()} for tokens, variants in results["phase_profiles"].items()}, "launch_names": results["launch_names"]}, "timestamp": __import__("time").time_ns() // 1_000_000}) + "\n")
+    # endregion
     print(
         "grouped pipeline artifacts: "
         f"{sorted(path.name for path in destination.iterdir())}"
