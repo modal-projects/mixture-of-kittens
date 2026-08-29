@@ -1,4 +1,4 @@
-"""Compare one/two-tile gate/up groups with the shipped persistent path."""
+"""Compare grouped and pipelined gate/up candidates with the shipped path."""
 
 from __future__ import annotations
 
@@ -39,12 +39,14 @@ REPEATS = 5
 class Variant:
     name: str
     group_size: int
+    pipeline_gate_up_down: bool
 
 
 VARIANTS = (
-    Variant("baseline", 0),
-    Variant("group_1", 1),
-    Variant("group_2", 2),
+    Variant("baseline", 0, False),
+    Variant("group_1", 1, False),
+    Variant("group_2", 2, False),
+    Variant("pipeline_gate_up_down", 0, True),
 )
 BASELINE = VARIANTS[0]
 CANDIDATES = VARIANTS[1:]
@@ -136,7 +138,9 @@ def _capture_pool(
     device: torch.device,
 ) -> list[torch.cuda.CUDAGraph]:
     graphs: list[torch.cuda.CUDAGraph] = []
-    with runtime_module.benchmark_gate_up_variant(variant.group_size):
+    with runtime_module.benchmark_persistent_variant(
+        variant.group_size, variant.pipeline_gate_up_down
+    ):
         for entry in pool:
             runtime_module.decode_device_step(
                 workspace, entry.weights, entry.hidden
@@ -192,7 +196,9 @@ def _phase_profile(
     variant: Variant,
     device: torch.device,
 ) -> dict[str, Any]:
-    with runtime_module.benchmark_gate_up_variant(variant.group_size):
+    with runtime_module.benchmark_persistent_variant(
+        variant.group_size, variant.pipeline_gate_up_down
+    ):
         with runtime_module.phase_profiling():
             for entry in pool:
                 runtime_module.decode_step(
@@ -222,6 +228,7 @@ def _phase_profile(
             "epilogue": epilogue,
             "queue": cycles.get("routed_queue", 0),
             "barrier": cycles.get("grid_barrier", 0),
+            "readiness_wait": cycles.get("readiness_wait", 0),
         },
         **summarize_phase_cycles(cycles),
     }
@@ -233,7 +240,9 @@ def _kernel_names(
     entry: Any,
     variant: Variant,
 ) -> list[str]:
-    with runtime_module.benchmark_gate_up_variant(variant.group_size):
+    with runtime_module.benchmark_persistent_variant(
+        variant.group_size, variant.pipeline_gate_up_down
+    ):
         return runtime_module.profiled_kernel_names(
             lambda: runtime_module.decode_step(
                 workspace, entry.weights, entry.hidden
@@ -299,7 +308,7 @@ def run(
     rank, device = _init_distributed()
     # region agent log
     _agent_log(
-        "A,B,C,D",
+        "E,F,G,H",
         "benchmarks/kimi_k3_gate_up_grouping.py:run:start",
         "gate/up benchmark started",
         {
@@ -343,8 +352,8 @@ def run(
         for pool_index, entry in enumerate(pool):
             outputs = {}
             for variant in VARIANTS:
-                with runtime_module.benchmark_gate_up_variant(
-                    variant.group_size
+                with runtime_module.benchmark_persistent_variant(
+                    variant.group_size, variant.pipeline_gate_up_down
                 ):
                     outputs[variant.name] = runtime_module.decode_step(
                         workspace, entry.weights, entry.hidden
@@ -367,6 +376,8 @@ def run(
                         "pool_index": pool_index,
                         "variant": candidate.name,
                         "group_size": candidate.group_size,
+                        "pipeline_gate_up_down":
+                            candidate.pipeline_gate_up_down,
                         "baseline_vs_reference": baseline_vs_reference,
                         "candidate_vs_reference": candidate_vs_reference,
                         "candidate_vs_baseline": _stats(
@@ -378,7 +389,7 @@ def run(
         _barrier(device)
         # region agent log
         _agent_log(
-            "D",
+            "H",
             "benchmarks/kimi_k3_gate_up_grouping.py:run:numerical",
             "gate/up numerical checks completed",
             {
@@ -455,7 +466,7 @@ def run(
         )
         # region agent log
         _agent_log(
-            "A,B,D",
+            "E,F,H",
             "benchmarks/kimi_k3_gate_up_grouping.py:run:latency",
             "gate/up repeat medians evaluated",
             {
@@ -483,7 +494,7 @@ def run(
         }
         # region agent log
         _agent_log(
-            "A,B,C,D",
+            "E,F,G,H",
             "benchmarks/kimi_k3_gate_up_grouping.py:run:phases",
             "gate/up phase categories collected",
             {
@@ -511,12 +522,12 @@ def run(
         variant.name: {
             "dynamic_shared_bytes": int(
                 extension._kimi_k3_decode_gate_up_group_resource(
-                    True, variant.group_size
+                    True, variant.group_size, variant.pipeline_gate_up_down
                 )[0]
             ),
             "resident_blocks_per_sm": int(
                 extension._kimi_k3_decode_gate_up_group_resource(
-                    True, variant.group_size
+                    True, variant.group_size, variant.pipeline_gate_up_down
                 )[1]
             ),
         }
@@ -539,7 +550,7 @@ def run(
     }
     # region agent log
     _agent_log(
-        "A,B,D",
+        "E,F,H",
         "benchmarks/kimi_k3_gate_up_grouping.py:run:exit",
         "gate/up benchmark completed",
         {"m16_winners": m16_winners, "resource": resource},

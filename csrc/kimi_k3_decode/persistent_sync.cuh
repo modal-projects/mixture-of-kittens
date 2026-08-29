@@ -253,27 +253,25 @@ static __device__ int claim_unit_batch(
     return *begin_slot;
 }
 
-/// Spin until an in-phase arrival counter reaches `target`, then acquire.
+/// Spin on one counter address until it reaches `target`, then acquire.
 ///
-/// Used once, for the only producer-consumer edge inside a phase: the tensor
-/// path's shared-down units read the activated intermediate that the same
-/// phase's activation units write. Tickets are handed out in increasing index
-/// order, so every activation unit is already claimed by a resident CTA that
-/// waits on nothing before any shared-down unit can be claimed.
-static __device__ void wait_for_count(
+/// `diagnostic_counter_index` names the transition family in the timeout
+/// record. It may differ from the address: the benchmark-only pipelined routed
+/// path stores one readiness count per expert outside the compact phase band.
+static __device__ void wait_for_count_at(
     const Scratch &scratch,
     int *__restrict__ const error_flag,
-    const int counter_index,
+    const int *__restrict__ const counter,
+    const int diagnostic_counter_index,
     const int target,
     const int error_code
 ) {
     if (threadIdx.x == 0) {
         const std::uint64_t started = clock64();
-        while (load_relaxed_gpu(&scratch.phase[counter_index])
-               < static_cast<std::uint32_t>(target)) {
+        while (load_relaxed_gpu(counter) < static_cast<std::uint32_t>(target)) {
             if (wait_timed_out(started, clock64())) {
                 record_timeout_and_trap(
-                    scratch, error_flag, counter_index, error_code);
+                    scratch, error_flag, diagnostic_counter_index, error_code);
             }
             __nanosleep(64);
         }
@@ -282,18 +280,37 @@ static __device__ void wait_for_count(
     __threadfence();
 }
 
-/// Release this unit's writes, then count it into an in-phase arrival counter.
-static __device__ void publish_count(
+/// Spin until an in-phase arrival counter reaches `target`, then acquire.
+static __device__ void wait_for_count(
     const Scratch &scratch,
-    const int counter_index
+    int *__restrict__ const error_flag,
+    const int counter_index,
+    const int target,
+    const int error_code
+) {
+    wait_for_count_at(
+        scratch, error_flag, &scratch.phase[counter_index], counter_index,
+        target, error_code);
+}
+
+/// Release this unit's writes, then increment one global readiness counter.
+static __device__ void publish_count_at(
+    int *__restrict__ const counter
 ) {
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) {
         atomicAdd(
-            reinterpret_cast<unsigned int *>(&scratch.phase[counter_index]),
-            1u);
+            reinterpret_cast<unsigned int *>(counter), 1u);
     }
+}
+
+/// Release this unit's writes, then count it into an in-phase arrival counter.
+static __device__ void publish_count(
+    const Scratch &scratch,
+    const int counter_index
+) {
+    publish_count_at(&scratch.phase[counter_index]);
 }
 
 }  // namespace persistent

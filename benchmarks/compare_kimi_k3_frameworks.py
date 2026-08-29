@@ -144,7 +144,7 @@ __all__ = [
 # The two `_stage`/`_mma` pairs measure the inside of the routed region above
 # them rather than a region of their own.
 PHASE_CLOCK_NAMES = (
-    "queue_clear",
+    "readiness_wait",
     "router_score",
     "latent_project",
     "routed_queue",

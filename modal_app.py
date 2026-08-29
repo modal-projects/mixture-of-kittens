@@ -495,7 +495,7 @@ def bench_kimi_k3_gate_up_grouping(
     sample_count: int = 1000,
     repeats: int = 5,
 ) -> bytes:
-    """Compare guarded gate/up widths one and two at M16/M32/M128."""
+    """Compare guarded gate/up grouping and pipelining at M16/M32/M128."""
     if len(git_sha) != 40:
         raise ValueError("git_sha must be the full 40-character commit SHA")
     with tempfile.TemporaryDirectory(
@@ -589,7 +589,7 @@ def gate_up_grouping(
     sample_count: int = 1000,
     repeats: int = 5,
 ) -> None:
-    """Run and unpack the focused M16/M32/M128 gate/up comparison."""
+    """Run and unpack the focused M16/M32/M128 gate/up scheduling comparison."""
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
     archive = bench_kimi_k3_gate_up_grouping.remote(

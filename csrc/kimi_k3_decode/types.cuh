@@ -203,7 +203,11 @@ inline constexpr int kActiveExpertUnits = 33;
 // A zero value means no persistent wait timed out. On timeout the waiting CTA
 // records the counter slot it gave up on before trapping.
 inline constexpr int kPersistentTimeoutPhase = 34;
+// Benchmark-only pipelining uses this arrival counter to publish completion of
+// every shared gate/up unit before shared-down consumers read their outputs.
+inline constexpr int kGateUpArrivals = 35;
 static_assert(kPersistentTimeoutPhase < NUM_PHASE_COUNTERS);
+static_assert(kGateUpArrivals < NUM_PHASE_COUNTERS);
 
 // ---------------------------------------------------------------------------
 // Benchmark-only phase clocks.
@@ -219,7 +223,7 @@ static_assert(kPersistentTimeoutPhase < NUM_PHASE_COUNTERS);
 
 /// One accumulated region, in the order the kernel runs them.
 enum PhaseClock : int {
-    kClockQueueClear = 0,
+    kClockReadinessWait = 0,
     kClockRouterScore,
     kClockLatentProject,
     kClockRoutedQueue,
@@ -243,12 +247,12 @@ inline constexpr int kPhaseClockBegin =
 static_assert(kPhaseClockBegin == 36);
 static_assert(kPhaseClockBegin % 2 == 0,
               "a 64-bit accumulator must start on an aligned slot pair");
-static_assert(kPhaseClockBegin > kPersistentTimeoutPhase,
+static_assert(kPhaseClockBegin > kGateUpArrivals,
               "the accumulators must not overlap a live counter");
 
 /// Every accumulated region's reported name, in `PhaseClock` order.
 inline constexpr const char *kPhaseClockNames[] = {
-    "queue_clear",
+    "readiness_wait",
     "router_score",
     "latent_project",
     "routed_queue",
@@ -288,6 +292,7 @@ inline constexpr int kErrorTailShardReduce = 5;
 inline constexpr int kErrorTailDrainExit = 6;
 inline constexpr int kErrorPersistentGridBarrier = 7;
 inline constexpr int kErrorPersistentActivation = 8;
+inline constexpr int kErrorPersistentGateUpDownReadiness = 9;
 
 /// One bounded wait, named by the code it reports and the slots it writes.
 struct TimeoutSite {
@@ -319,12 +324,15 @@ inline constexpr TimeoutSite kTimeoutSites[] = {
      kPersistentTimeoutPhase, kGridGeneration},
     {"persistent_shared_activation", kErrorPersistentActivation,
      kPersistentTimeoutPhase, kActivationArrivals},
+    {"persistent_gate_up_down_readiness",
+     kErrorPersistentGateUpDownReadiness,
+     kPersistentTimeoutPhase, kGateUpArrivals},
 };
 
 inline constexpr int kTimeoutSiteCount =
     static_cast<int>(sizeof(kTimeoutSites) / sizeof(kTimeoutSites[0]));
 
-static_assert(kTimeoutSiteCount == 8);
+static_assert(kTimeoutSiteCount == 9);
 static_assert(kTimeoutSites[kTimeoutSiteCount - 1].code == kTimeoutSiteCount,
               "the timeout codes must be a dense nonzero range");
 

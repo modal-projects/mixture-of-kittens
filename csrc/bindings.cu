@@ -95,10 +95,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &kimi_k3_decode::persistent::
             benchmark_gate_up_group_size_for_testing);
     m.def(
+        "_kimi_k3_decode_set_gate_up_down_pipeline",
+        &kimi_k3_decode::persistent::
+            set_benchmark_gate_up_down_pipeline_for_testing,
+        "", pybind11::arg("enabled"));
+    m.def(
+        "_kimi_k3_decode_gate_up_down_pipeline",
+        &kimi_k3_decode::persistent::
+            benchmark_gate_up_down_pipeline_for_testing);
+    m.def(
         "_kimi_k3_decode_gate_up_group_resource",
         &kimi_k3_decode::persistent::
             gate_up_group_resource_for_testing,
-        "", pybind11::arg("tensor_path"), pybind11::arg("group_size"));
+        "", pybind11::arg("tensor_path"), pybind11::arg("group_size"),
+        pybind11::arg("pipeline_gate_up_down"));
     m.def("_kimi_k3_decode_benchmark_grids", []() {
         const auto &grids =
             kimi_k3_decode::persistent::kBenchmarkGridCtas;

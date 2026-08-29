@@ -131,7 +131,10 @@ def test_gate_up_grouping_is_a_guarded_benchmark_only_instantiation() -> None:
     assert "MOK_KIMI_K3_ENABLE_GATE_UP_GROUPING" in persistent
     assert "set_benchmark_gate_up_group_size_for_testing(" in persistent
     assert "benchmark_gate_up_group_size()" in persistent
-    assert "template<bool TENSOR_PATH, int GATE_UP_GROUP_SIZE>" in persistent
+    assert (
+        "template<bool TENSOR_PATH, int GATE_UP_GROUP_SIZE, "
+        "bool PIPELINE_GATE_UP_DOWN>"
+    ) in persistent
     assert "GATE_UP_GROUP_SIZE == 0" in kernel
     assert "GATE_UP_GROUP_SIZE == 1" in kernel
     assert "GATE_UP_GROUP_SIZE == 2" in kernel
@@ -173,9 +176,9 @@ def test_gate_up_benchmark_measures_all_priority_shapes_and_widths() -> None:
     ).read_text(encoding="utf-8")
 
     assert "TOKENS = (16, 32, 128)" in benchmark
-    assert 'Variant("baseline", 0)' in benchmark
-    assert 'Variant("group_1", 1)' in benchmark
-    assert 'Variant("group_2", 2)' in benchmark
+    assert 'Variant("baseline", 0, False)' in benchmark
+    assert 'Variant("group_1", 1, False)' in benchmark
+    assert 'Variant("group_2", 2, False)' in benchmark
     assert '"staging":' in benchmark
     assert '"mma":' in benchmark
     assert '"epilogue":' in benchmark

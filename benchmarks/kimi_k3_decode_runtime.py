@@ -79,25 +79,49 @@ def phase_profiling() -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def benchmark_gate_up_variant(group_size: int) -> Iterator[None]:
-    """Select one guarded gate/up kernel instantiation for capture or replay."""
-    previous_guard = os.environ.get(
+def benchmark_persistent_variant(
+    group_size: int,
+    pipeline_gate_up_down: bool,
+) -> Iterator[None]:
+    """Select one guarded persistent-kernel instantiation for benchmarking."""
+    previous_group_guard = os.environ.get(
         "MOK_KIMI_K3_ENABLE_GATE_UP_GROUPING"
     )
+    previous_pipeline_guard = os.environ.get(
+        "MOK_KIMI_K3_ENABLE_GATE_UP_DOWN_PIPELINE"
+    )
     os.environ["MOK_KIMI_K3_ENABLE_GATE_UP_GROUPING"] = "1"
+    os.environ["MOK_KIMI_K3_ENABLE_GATE_UP_DOWN_PIPELINE"] = "1"
     _C._kimi_k3_decode_set_gate_up_group_size(group_size)
+    _C._kimi_k3_decode_set_gate_up_down_pipeline(pipeline_gate_up_down)
     try:
         yield
     finally:
+        _C._kimi_k3_decode_set_gate_up_down_pipeline(False)
         _C._kimi_k3_decode_set_gate_up_group_size(0)
-        if previous_guard is None:
+        if previous_group_guard is None:
             os.environ.pop(
                 "MOK_KIMI_K3_ENABLE_GATE_UP_GROUPING", None
             )
         else:
             os.environ[
                 "MOK_KIMI_K3_ENABLE_GATE_UP_GROUPING"
-            ] = previous_guard
+            ] = previous_group_guard
+        if previous_pipeline_guard is None:
+            os.environ.pop(
+                "MOK_KIMI_K3_ENABLE_GATE_UP_DOWN_PIPELINE", None
+            )
+        else:
+            os.environ[
+                "MOK_KIMI_K3_ENABLE_GATE_UP_DOWN_PIPELINE"
+            ] = previous_pipeline_guard
+
+
+@contextlib.contextmanager
+def benchmark_gate_up_variant(group_size: int) -> Iterator[None]:
+    """Select one guarded gate/up grouping with phase pipelining disabled."""
+    with benchmark_persistent_variant(group_size, False):
+        yield
 
 
 def phase_clock_cycles(
@@ -368,6 +392,7 @@ __all__ = [
     "assert_decode_close",
     "assert_identical_across_ranks",
     "benchmark_gate_up_variant",
+    "benchmark_persistent_variant",
     "check_decode_error",
     "decode_reference",
     "decode_device_step",
