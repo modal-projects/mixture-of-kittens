@@ -149,9 +149,9 @@ def test_gate_up_grouping_is_a_guarded_benchmark_only_instantiation() -> None:
     assert "quantize_grouped_situ(" in grouped
     launch = _function_body(persistent, "void launch_decode(")
     assert "benchmark_gate_up_group_size()" in launch
-    assert "launch_selected_decode<0>(" in launch
-    assert "launch_selected_decode<1>(" in launch
-    assert "launch_selected_decode<2>(" in launch
+    assert "launch_selected_decode<0, false>(" in launch
+    assert "launch_selected_decode<1, false>(" in launch
+    assert "launch_selected_decode<2, false>(" in launch
 
 
 def test_gate_up_candidates_cap_live_accumulators_and_reuse_activation() -> None:
