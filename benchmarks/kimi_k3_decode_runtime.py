@@ -78,22 +78,6 @@ def phase_profiling() -> Iterator[None]:
             os.environ["MOK_KIMI_K3_ENABLE_GRID_TUNING"] = previous_guard
 
 
-@contextlib.contextmanager
-def gate_up_activation_atom_staging() -> Iterator[None]:
-    """Enable the split-atom gate/up staging candidate for one benchmark."""
-    previous_guard = os.environ.get("MOK_KIMI_K3_ENABLE_GRID_TUNING")
-    os.environ["MOK_KIMI_K3_ENABLE_GRID_TUNING"] = "1"
-    _C._kimi_k3_decode_set_gate_up_activation_atom_staging(True)
-    try:
-        yield
-    finally:
-        _C._kimi_k3_decode_set_gate_up_activation_atom_staging(False)
-        if previous_guard is None:
-            os.environ.pop("MOK_KIMI_K3_ENABLE_GRID_TUNING", None)
-        else:
-            os.environ["MOK_KIMI_K3_ENABLE_GRID_TUNING"] = previous_guard
-
-
 def phase_clock_cycles(
     workspace: KimiK3DecodeWorkspace,
 ) -> dict[str, int]:
@@ -109,29 +93,6 @@ def phase_clock_cycles(
     words = workspace.scratch[begin * 4 : (begin + 2 * len(names)) * 4].cpu()
     counters = words.view(torch.int64).tolist()
     return dict(zip(names, counters, strict=True))
-
-
-def gate_up_subphase_tensor(
-    workspace: KimiK3DecodeWorkspace,
-) -> torch.Tensor:
-    """Return this launch's per-CTA routed gate/up subphase counters."""
-    begin, ctas, names = _C._kimi_k3_decode_gate_up_subphase_metadata()
-    byte_count = ctas * len(names) * 8
-    return workspace.scratch[begin : begin + byte_count].view(torch.int64).view(
-        ctas, len(names)
-    )
-
-
-def gate_up_subphase_cycles(
-    workspace: KimiK3DecodeWorkspace,
-) -> list[dict[str, int]]:
-    """Copy and name every CTA row from a dedicated profiled launch."""
-    _, _, names = _C._kimi_k3_decode_gate_up_subphase_metadata()
-    rows = gate_up_subphase_tensor(workspace).cpu().tolist()
-    return [
-        dict(zip(names, (int(value) for value in row), strict=True))
-        for row in rows
-    ]
 
 
 def _e8m0_scale_bytes(absolute_max: torch.Tensor) -> torch.Tensor:
@@ -388,10 +349,6 @@ __all__ = [
     "decode_reference",
     "decode_device_step",
     "decode_step",
-    "gate_up_subphase_cycles",
-    "gate_up_subphase_tensor",
-    "phase_clock_cycles",
-    "phase_profiling",
     "profiled_kernel_names",
     "recorded_allocator_events",
 ]

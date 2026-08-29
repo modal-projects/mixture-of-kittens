@@ -106,11 +106,6 @@ static_assert(kPersistentSharedBytes <= kittens::MAX_SHARED_MEMORY - 1024,
               "the persistent grid must leave room for static shared memory");
 static_assert(kPersistentSharedBytes >= kWidestStageSharedBytes,
               "the persistent grid must fit its widest stage");
-static_assert(kGateUpSubphaseTraceCtas == kPersistentCtas);
-static_assert(
-    expert_mxfp4::kGateUpUnitSharedBytes + kGateUpSubphaseSharedBytes
-        <= kPersistentSharedBytes,
-    "profiled gate/up units need private subphase counters after staging");
 static_assert(
     kPersistentSharedBytes
         >= expert_mxfp4::grouped_pipeline::kGroupedDownPersistentSharedBytes,
@@ -276,58 +271,12 @@ inline bool benchmark_phase_profile_for_testing() {
     return benchmark_phase_profile_enabled();
 }
 
-/// Whether a dedicated benchmark splits MXFP8 activation rows by atom.
-///
-/// Production keeps the validated row-owned staging path. The candidate is
-/// available only behind the same explicit process guard as phase profiling,
-/// and defaults off even in a guarded process until the private binding opts
-/// in.
-static __host__ std::atomic<int> &
-benchmark_gate_up_activation_atom_staging_storage() {
-    static std::atomic<int> candidate{0};
-    return candidate;
-}
-
-inline bool benchmark_gate_up_activation_atom_staging_enabled() {
-    if (!benchmark_grid_tuning_enabled()) return false;
-    return benchmark_gate_up_activation_atom_staging_storage().load(
-               std::memory_order_relaxed)
-        != 0;
-}
-
-inline void set_benchmark_gate_up_activation_atom_staging_for_testing(
-    const bool enabled
-) {
-    TORCH_CHECK(
-        benchmark_grid_tuning_enabled(),
-        "MoK: Kimi K3 activation atom staging is benchmark-only; set "
-        "MOK_KIMI_K3_ENABLE_GRID_TUNING=1 in a dedicated benchmark process");
-    benchmark_gate_up_activation_atom_staging_storage().store(
-        enabled ? 1 : 0, std::memory_order_relaxed);
-}
-
-inline bool benchmark_gate_up_activation_atom_staging_for_testing() {
-    return benchmark_gate_up_activation_atom_staging_enabled();
-}
-
 /// The accumulators' scratch band and their names, for the reader.
 inline std::tuple<std::int64_t, std::vector<std::string>>
 phase_clock_metadata_for_testing() {
     std::vector<std::string> names;
     for (const char *const name : kPhaseClockNames) names.emplace_back(name);
     return {static_cast<std::int64_t>(kPhaseClockBegin), names};
-}
-
-inline std::tuple<std::int64_t, std::int64_t, std::vector<std::string>>
-gate_up_subphase_metadata_for_testing() {
-    std::vector<std::string> names;
-    for (const char *const name : kGateUpSubphaseNames) {
-        names.emplace_back(name);
-    }
-    return {
-        static_cast<std::int64_t>(kGateUpSubphaseTraceBytes),
-        static_cast<std::int64_t>(kGateUpSubphaseTraceCtas),
-        names};
 }
 
 inline void set_benchmark_grid_ctas_for_testing(const std::int64_t grid_ctas) {
@@ -430,8 +379,7 @@ void kimi_k3_decode_persistent_kernel(
     int *__restrict__ error_flag,
     const int tp_rank,
     const int active_tokens,
-    const int profile_phases,
-    const int split_gate_up_activation_atoms
+    const int profile_phases
 ) {
     extern __shared__ __align__(16) int shared_raw[];
     std::uint8_t *const shared = reinterpret_cast<std::uint8_t *>(shared_raw);
@@ -589,10 +537,6 @@ void kimi_k3_decode_persistent_kernel(
     const int expert_units = static_cast<int>(
         min(published, static_cast<std::uint32_t>(kNumExperts)));
     const int routed_batch = routed_claim_batch(active_tokens);
-    if (clocks.enabled()) {
-        clocks.clear_gate_up_subphases();
-        __syncthreads();
-    }
 
     // -----------------------------------------------------------------------
     // Phase 3: routed gate/up units interleaved with the shared gate/up units.
@@ -613,7 +557,6 @@ void kimi_k3_decode_persistent_kernel(
                 scratch, kGateUpQueue, units, routed_batch, &claim_slot,
                 &claim_end_slot);
             mark = clocks.lap(kClockRoutedQueue, queue_mark);
-            clocks.add_gate_up_subphase(kGateUpQueueClaim, mark - queue_mark);
             if (batch_begin < 0) break;
             for (int unit = batch_begin; unit < claim_end_slot; ++unit) {
                 if (unit < shared_units) {
@@ -649,8 +592,7 @@ void kimi_k3_decode_persistent_kernel(
                     expert_w1_scale, expert_w3_packed, expert_w3_scale,
                     scratch, expert, begin,
                     scratch.expert_offsets[expert + 1] - begin,
-                    routed % routed_units_per_expert,
-                    split_gate_up_activation_atoms != 0, clocks);
+                    routed % routed_units_per_expert, clocks);
                 __syncthreads();
                 publish_count_at(&scratch.expert_counts[expert]);
                 mark = clocks.lap(kClockRoutedGateUp, mark);
@@ -948,7 +890,6 @@ struct LaunchArguments {
     int available_sms;
     int grid_ctas;
     int profile_phases;
-    int split_gate_up_activation_atoms;
 };
 
 template<bool TENSOR_PATH>
@@ -1004,8 +945,7 @@ static __host__ void launch_persistent(
             reinterpret_cast<int *>(arguments.error_flag.data_ptr()),
             arguments.tp_rank,
             arguments.active_tokens,
-            arguments.profile_phases,
-            arguments.split_gate_up_activation_atoms);
+            arguments.profile_phases);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

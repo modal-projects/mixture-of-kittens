@@ -52,7 +52,6 @@ static __device__ void routed_gate_up_unit(
     const int assignment_begin,
     const int batch_rows,
     const int output_tile,
-    const bool split_activation_atoms,
     const PhaseClocks clocks
 ) {
     using namespace kittens;
@@ -78,20 +77,8 @@ static __device__ void routed_gate_up_unit(
     mixed_result_tile (&second_result_shared) =
         results.allocate<mixed_result_tile>();
 
-    const int thread = static_cast<int>(threadIdx.x);
-    unsigned long long *const unit_subphases =
-        reinterpret_cast<unsigned long long *>(
-            reinterpret_cast<std::uint8_t *>(shared_raw)
-            + kGateUpUnitSharedBytes);
-    if (clocks.enabled()) {
-        if (thread < kGateUpSubphaseCount) {
-            unit_subphases[thread] = 0ull;
-        }
-        __syncthreads();
-    }
-    const unsigned long long setup_mark = clocks.now();
-
     __shared__ semaphore gate_up_done;
+    const int thread = static_cast<int>(threadIdx.x);
     if (thread == 0) init_semaphore(gate_up_done, 0, 1);
 
     mixed_accumulator_tile first_accumulator =
@@ -115,8 +102,6 @@ static __device__ void routed_gate_up_unit(
         clear_scale_tile(activation_scale_shared[quad]);
     }
     __syncthreads();
-    clocks.lap_gate_up_subphase(
-        unit_subphases, kGateUpUnitSetup, setup_mark);
 
     // One MMA batch is 128 rows and an expert never collects more, because a
     // token's sixteen routes are sixteen distinct experts. The staging indexes
@@ -159,100 +144,53 @@ static __device__ void routed_gate_up_unit(
     // not write.
     uint4 payload[kGateUpRoundGroups];
     std::uint32_t scale_words[kGateUpScaleTiles];
-    const auto read_weight_payload_round = [&](
+    const auto read_weight_round = [&](
         const int group_base,
-        uint4 (&into)[kGateUpRoundGroups]
+        uint4 (&into)[kGateUpRoundGroups],
+        std::uint32_t (&scales)[kGateUpScaleTiles]
     ) {
         #pragma unroll
         for (int slot = 0; slot < kGateUpRoundGroups; ++slot) {
             into[slot] = *reinterpret_cast<const uint4 *>(
                 weight_row_bytes + (group_base + slot) * (kMmaK / 2));
         }
-    };
-    const auto read_weight_scale_round = [&](
-        const int group_base,
-        std::uint32_t (&scales)[kGateUpScaleTiles]
-    ) {
         #pragma unroll
         for (int quad = 0; quad < kGateUpScaleTiles; ++quad) {
             scales[quad] = *reinterpret_cast<const std::uint32_t *>(
                 weight_row_scales + group_base + quad * kScaleGroupsPerTile);
         }
     };
-    unsigned long long subphase_mark = clocks.now();
-    read_weight_payload_round(0, payload);
-    subphase_mark = clocks.lap_gate_up_subphase(
-        unit_subphases, kGateUpWeightGlobalLoad, subphase_mark);
-    read_weight_scale_round(0, scale_words);
-    clocks.lap_gate_up_subphase(
-        unit_subphases, kGateUpScaleStageCopy, subphase_mark);
+    read_weight_round(0, payload, scale_words);
 
     int compute_phase = 0;
     unsigned long long mark = clocks.now();
     for (int round = 0; round < kGateUpRounds; ++round) {
         const int group_base = round * kGateUpRoundGroups;
 
-        subphase_mark = clocks.now();
         #pragma unroll
         for (int slot = 0; slot < kGateUpRoundGroups; ++slot) {
             stage_weight_row(weight_tile[slot], weight_row, payload[slot]);
         }
-        clocks.lap_gate_up_subphase(
-            unit_subphases, kGateUpWeightSharedStoreSwizzle, subphase_mark);
-
-        subphase_mark = clocks.now();
         #pragma unroll
         for (int quad = 0; quad < kGateUpScaleTiles; ++quad) {
             stage_scale_quad(
                 weight_scale_shared[quad], weight_row, scale_words[quad]);
         }
-        clocks.lap_gate_up_subphase(
-            unit_subphases, kGateUpScaleStageCopy, subphase_mark);
 
-        // The benchmark candidate gives one thread to each sixteen-byte atom.
-        // At M16 that makes a one-row round's sixteen adjacent global atoms one
-        // coalesced warp instruction instead of eight lanes each issuing two.
-        // The production mapping remains the established one-thread-per-row
-        // path unless the guarded benchmark launch requests the candidate.
-        subphase_mark = clocks.now();
-        if (split_activation_atoms) {
-            constexpr int atoms_per_round =
-                kGateUpRoundGroups * kActivationAtomsPerRow;
-            for (int index = thread;
-                 index
-                     < rows * kGateUpRoundGroups * kActivationAtomsPerRow;
-                 index += kDecodeCtaThreads) {
-                const int row = index / atoms_per_round;
-                const int within_row = index % atoms_per_round;
-                const int slot = within_row / kActivationAtomsPerRow;
-                const int atom = within_row % kActivationAtomsPerRow;
-                const int token =
-                    scratch.assignment_tokens[assignment_begin + row];
-                stage_activation_atom(
-                    activation_tile[slot], row, atom,
-                    scratch.latent_mxfp8
-                        + static_cast<long long>(token) * kLatentSize
-                        + (group_base + slot) * kMmaK
-                        + atom * static_cast<int>(sizeof(uint4)));
-            }
-        } else {
-            for (int index = thread; index < rows * kGateUpRoundGroups;
-                 index += kDecodeCtaThreads) {
-                const int row = index / kGateUpRoundGroups;
-                const int slot = index % kGateUpRoundGroups;
-                const int token =
-                    scratch.assignment_tokens[assignment_begin + row];
-                stage_activation_row(
-                    activation_tile[slot], row,
-                    scratch.latent_mxfp8
-                        + static_cast<long long>(token) * kLatentSize
-                        + (group_base + slot) * kMmaK);
-            }
+        // The batch is at most 128 rows and usually one, so the activation is
+        // spread over whatever threads its rows and groups need.
+        for (int index = thread; index < rows * kGateUpRoundGroups;
+             index += kDecodeCtaThreads) {
+            const int row = index / kGateUpRoundGroups;
+            const int slot = index % kGateUpRoundGroups;
+            const int token =
+                scratch.assignment_tokens[assignment_begin + row];
+            stage_activation_row(
+                activation_tile[slot], row,
+                scratch.latent_mxfp8
+                    + static_cast<long long>(token) * kLatentSize
+                    + (group_base + slot) * kMmaK);
         }
-        clocks.lap_gate_up_subphase(
-            unit_subphases, kGateUpActivationStage, subphase_mark);
-
-        subphase_mark = clocks.now();
         for (int index = thread; index < rows * kGateUpScaleTiles;
              index += kDecodeCtaThreads) {
             const int row = index / kGateUpScaleTiles;
@@ -266,36 +204,23 @@ static __device__ void routed_gate_up_unit(
                     + static_cast<long long>(token) * kLatentGroups
                     + group_base + quad * kScaleGroupsPerTile));
         }
-        clocks.lap_gate_up_subphase(
-            unit_subphases, kGateUpScaleStageCopy, subphase_mark);
 
         // Both staging loops above have consumed `payload` and `scale_words`,
         // so the round's own bytes are dead and the registers can be reloaded
         // in place with the next round's. The last round has no next round and
         // leaves them alone; nothing below reads them again.
         if (round + 1 < kGateUpRounds) {
-            subphase_mark = clocks.now();
-            read_weight_payload_round(
-                group_base + kGateUpRoundGroups, payload);
-            subphase_mark = clocks.lap_gate_up_subphase(
-                unit_subphases, kGateUpWeightGlobalLoad, subphase_mark);
-            read_weight_scale_round(
-                group_base + kGateUpRoundGroups, scale_words);
-            clocks.lap_gate_up_subphase(
-                unit_subphases, kGateUpScaleStageCopy, subphase_mark);
+            read_weight_round(
+                group_base + kGateUpRoundGroups, payload, scale_words);
         }
 
-        subphase_mark = clocks.now();
         asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
         __syncthreads();
-        clocks.lap_gate_up_subphase(
-            unit_subphases, kGateUpSyncTmaTmemWait, subphase_mark);
         mark = clocks.lap(kClockRoutedGateUpStage, mark);
         // `tcgen05.cp`, `tcgen05.mma`, and `tcgen05.commit` are single-thread
         // issues, but `tcgen05.wait::st` is `.sync.aligned`, so the whole warp
         // has to reach it.
         if (warpid() == 0) {
-            subphase_mark = clocks.now();
             if (laneid() == 0) {
                 #pragma unroll
                 for (int quad = 0; quad < kGateUpScaleTiles; ++quad) {
@@ -311,12 +236,7 @@ static __device__ void routed_gate_up_unit(
                         second_scale, second_scale_shared[quad]);
                 }
             }
-            clocks.lap_gate_up_subphase(
-                unit_subphases, kGateUpScaleStageCopy, subphase_mark);
-            subphase_mark = clocks.now();
             tensor_store_wait();
-            clocks.lap_gate_up_subphase(
-                unit_subphases, kGateUpSyncTmaTmemWait, subphase_mark);
             if (laneid() == 0) {
                 #pragma unroll
                 for (int slot = 0; slot < kGateUpRoundGroups; ++slot) {
@@ -337,29 +257,10 @@ static __device__ void routed_gate_up_unit(
                 detail::tcgen05::commit<1>(gate_up_done);
             }
         }
-        subphase_mark = clocks.now();
         wait(gate_up_done, compute_phase);
         __syncthreads();
-        clocks.lap_gate_up_subphase(
-            unit_subphases, kGateUpSyncTmaTmemWait, subphase_mark);
         mark = clocks.lap(kClockRoutedGateUpMma, mark);
         compute_phase ^= 1;
-    }
-
-    if (clocks.enabled() && thread == 0) {
-        clocks.add_gate_up_subphase(kGateUpWeightGlobalLoad,
-            unit_subphases[kGateUpWeightGlobalLoad]);
-        clocks.add_gate_up_subphase(kGateUpWeightSharedStoreSwizzle,
-            unit_subphases[kGateUpWeightSharedStoreSwizzle]);
-        clocks.add_gate_up_subphase(kGateUpActivationStage,
-            unit_subphases[kGateUpActivationStage]);
-        clocks.add_gate_up_subphase(kGateUpScaleStageCopy,
-            unit_subphases[kGateUpScaleStageCopy]);
-        clocks.add_gate_up_subphase(kGateUpSyncTmaTmemWait,
-            unit_subphases[kGateUpSyncTmaTmemWait]);
-        clocks.add_gate_up_subphase(kGateUpUnitSetup,
-            unit_subphases[kGateUpUnitSetup]);
-        clocks.add_gate_up_subphase(kGateUpUnits, 1ull);
     }
 
     store_accumulator(first_accumulator, first_result_shared);
@@ -600,7 +501,7 @@ void kimi_k3_routed_experts_kernel(
                     shared_raw, tensor_pool, expert_w1_packed, expert_w1_scale,
                     expert_w3_packed, expert_w3_scale, scratch, expert,
                     assignment_begin, batch_rows, output_tile,
-                    false, PhaseClocks{nullptr});
+                    PhaseClocks{nullptr});
             }
 
             for (int output_tile = 0; output_tile < kDownTiles;
