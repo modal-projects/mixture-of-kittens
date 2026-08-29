@@ -616,11 +616,11 @@ void expert_probe_kernel(
     }
 }
 
-inline constexpr int kBatchProbeSharedBytes =
-    kGateUpStagingBytes > kDownStagingBytes
-        ? kGateUpStagingBytes
-        : kDownStagingBytes;
-static_assert(kBatchProbeSharedBytes == 102400);
+// The nominal tile extents under-count the swizzled shared addresses touched
+// by scale staging and register-tile stores. Match the production expert
+// launch's architecture-safe reservation, which includes the following
+// swizzle atom those mappings can address.
+inline constexpr int kBatchProbeSharedBytes = kProbeSharedBytes;
 
 static __host__ void batched_expert_probe_entrypoint(
     const at::Tensor &latent_x,
@@ -737,7 +737,7 @@ static __host__ void batched_expert_probe_entrypoint(
                 reinterpret_cast<std::uint8_t *>(scratch.data_ptr()),
                 static_cast<int>(expert), static_cast<int>(rows));
     } else {
-        constexpr int baseline_shared_bytes = kGateUpUnitSharedBytes;
+        constexpr int baseline_shared_bytes = kBatchProbeSharedBytes;
         C10_CUDA_CHECK(cudaFuncSetAttribute(
             expert_probe_kernel<false>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,

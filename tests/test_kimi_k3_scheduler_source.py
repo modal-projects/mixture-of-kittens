@@ -69,6 +69,8 @@ def test_batched_expert_probe_is_a_transposed_m128x8x32_microprototype() -> None
     assert "kBatchProbeM = 128" in probe
     assert "kBatchProbeN = 8" in probe
     assert "kBatchProbePhysicalN = 16" in probe
+    assert "kBatchProbeSharedBytes = kProbeSharedBytes" in probe
+    assert "baseline_shared_bytes = kBatchProbeSharedBytes" in probe
     assert "(5u << 7)" in probe
     assert "(0u << 10)" in probe
     assert "kBatchProbeN / 8" in probe
