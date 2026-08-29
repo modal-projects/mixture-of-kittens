@@ -328,11 +328,11 @@ inline std::int64_t benchmark_gate_up_group_size_for_testing() {
     return benchmark_gate_up_group_size();
 }
 
-/// Enable one dependency-aware gate/up-to-down transition in a benchmark.
+/// Select the production dependency-aware gate/up-to-down transition.
 ///
-/// The production path always returns false. The candidate is a separate
-/// compile-time kernel instantiation, so the shipped launch pays no runtime
-/// branch or readiness-counter overhead.
+/// Unguarded calls always use readiness counters. The captured baseline remains
+/// selectable only in the dedicated benchmark process until the production
+/// verification run is complete.
 static __host__ std::atomic<int> &
 benchmark_gate_up_down_pipeline_storage() {
     static std::atomic<int> enabled{0};
@@ -346,7 +346,7 @@ inline bool benchmark_gate_up_down_pipeline_guard_enabled() {
 }
 
 inline bool benchmark_gate_up_down_pipeline() {
-    if (!benchmark_gate_up_down_pipeline_guard_enabled()) return false;
+    if (!benchmark_gate_up_down_pipeline_guard_enabled()) return true;
     return benchmark_gate_up_down_pipeline_storage().load(
                std::memory_order_relaxed)
         != 0;
@@ -985,8 +985,8 @@ inline void validate_residency(
 inline std::int64_t resident_blocks_per_sm_for_testing(
     const bool tensor_path
 ) {
-    return tensor_path ? resident_blocks_per_sm<true>()
-                       : resident_blocks_per_sm<false>();
+    return tensor_path ? resident_blocks_per_sm<true, 0, true>()
+                       : resident_blocks_per_sm<false, 0, true>();
 }
 
 template<int GATE_UP_GROUP_SIZE, bool PIPELINE_GATE_UP_DOWN = false>
@@ -1199,8 +1199,9 @@ static __host__ void launch_selected_decode(
 
 /// Run one whole TP8 Kimi K3 decode step in one selected persistent launch.
 ///
-/// The unguarded production path always selects zero. A benchmark may select
-/// one or two, but each selection is still exactly one kernel launch.
+/// The unguarded production path selects baseline gate/up arithmetic with the
+/// dependency-aware transition. A benchmark may still select the captured
+/// barrier baseline or grouped gate/up variants until verification completes.
 static __host__ void launch_decode(const LaunchArguments &arguments) {
     const int group_size = benchmark_gate_up_group_size();
     if (benchmark_gate_up_down_pipeline()) {
