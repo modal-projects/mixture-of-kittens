@@ -40,7 +40,7 @@ namespace persistent {
 // The public production grid defaults to one CTA per B300 SM. A guarded
 // benchmark may launch a smaller candidate, but a launch's CTA count never
 // varies with the token count. The logical work -- up to 128 router tasks,
-// 28 latent-column tasks, 2 688 routed gate/up tasks, 25 088 routed down
+// 28 latent-column tasks, 2 688 routed gate/up tasks, 6 272 routed down
 // tasks, the shared expert tasks, and the tail's three roles -- is handed out
 // through the device queues in `persistent_sync.cuh` rather than mapped one
 // task to one block. Six generation-tagged grid barriers separate the phases:
@@ -104,6 +104,10 @@ static_assert(kPersistentSharedBytes <= kittens::MAX_SHARED_MEMORY - 1024,
               "the persistent grid must leave room for static shared memory");
 static_assert(kPersistentSharedBytes >= kWidestStageSharedBytes,
               "the persistent grid must fit its widest stage");
+static_assert(
+    kPersistentSharedBytes
+        >= expert_mxfp4::grouped_pipeline::kGroupedDownPersistentSharedBytes,
+    "the persistent grid must fit grouped routed down");
 static_assert(kPersistentSharedBytes >= router::kSharedBytes,
               "the persistent grid must fit the router's scoring buffer");
 
@@ -136,7 +140,8 @@ inline constexpr TaskPlan task_plan(const int active_tokens) {
                      : shared_experts::kCoreGateCtas)
             + experts * expert_mxfp4::kGateUpTiles,
         (tensor_path ? shared_experts::kActivationCtas : 0)
-            + experts * expert_mxfp4::kDownTiles
+            + experts
+                  * expert_mxfp4::grouped_pipeline::kGroupedDownUnits
             + (tensor_path ? shared_experts::kTensorDownCtas
                            : shared_experts::kCoreDownCtas),
         tail::kCoordinatorCtas + tail::kReduceCtas
@@ -150,8 +155,8 @@ inline constexpr TaskPlan task_plan(const int active_tokens) {
 /// Folded over `task_plan` rather than written out, because which phase is
 /// widest is not obvious: the core path's shared-down role is 112 units to the
 /// tensor path's 62, but the core path only ever runs eight rows, which caps it
-/// at 128 occupied experts and so at 3 696 units. The widest is the tensor
-/// path's down phase at a full 896 experts.
+/// at 128 occupied experts. The widest is the tensor path's grouped down phase
+/// at a full 896 experts.
 inline constexpr int longest_queue_units() {
     int longest = 0;
     for (int tokens = 1; tokens <= kMaxTokens; ++tokens) {
@@ -178,14 +183,14 @@ inline constexpr int kLongestQueueRounded =
 inline constexpr int kLongestQueueTicket =
     kLongestQueueRounded + kRoutedClaimBatch * kMaximumBenchmarkCtas;
 
-static_assert(kLongestQueueUnits == 25150,
-              "the widest phase is 6 activation + 56 shared-down + 896 * 28 "
+static_assert(kLongestQueueUnits == 6334,
+              "the widest phase is 6 activation + 56 shared-down + 896 * 7 "
               "routed down units");
 static_assert(kLongestQueueTicket
                   == kLongestQueueRounded
                        + kRoutedClaimBatch * kPersistentCtas,
               "the ticket bound must cover the largest production grid");
-static_assert(kLongestQueueTicket == 25744,
+static_assert(kLongestQueueTicket == 6928,
               "the rounded widest phase plus one refused batch per CTA");
 static_assert(static_cast<unsigned int>(kLongestQueueTicket)
                   < 0xffffffffu / 2u,
@@ -262,38 +267,6 @@ inline void set_benchmark_phase_profile_for_testing(const bool enabled) {
 
 inline bool benchmark_phase_profile_for_testing() {
     return benchmark_phase_profile_enabled();
-}
-
-/// Select the grouped expert pipeline only in a dedicated benchmark process.
-static __host__ std::atomic<int> &benchmark_grouped_pipeline_storage() {
-    static std::atomic<int> grouped{0};
-    return grouped;
-}
-
-inline bool benchmark_grouped_pipeline_guard_enabled() {
-    const char *const enabled =
-        std::getenv("MOK_KIMI_K3_ENABLE_GROUPED_PIPELINE");
-    return enabled != nullptr && std::strcmp(enabled, "1") == 0;
-}
-
-inline bool benchmark_grouped_pipeline_enabled() {
-    return benchmark_grouped_pipeline_guard_enabled()
-        && benchmark_grouped_pipeline_storage().load(
-               std::memory_order_relaxed) != 0;
-}
-
-inline void set_benchmark_grouped_pipeline_for_testing(const bool enabled) {
-    TORCH_CHECK(
-        benchmark_grouped_pipeline_guard_enabled(),
-        "MoK: Kimi K3 grouped expert pipeline is benchmark-only; set "
-        "MOK_KIMI_K3_ENABLE_GROUPED_PIPELINE=1 in a dedicated benchmark "
-        "process");
-    benchmark_grouped_pipeline_storage().store(
-        enabled ? 1 : 0, std::memory_order_relaxed);
-}
-
-inline bool benchmark_grouped_pipeline_for_testing() {
-    return benchmark_grouped_pipeline_enabled();
 }
 
 /// The accumulators' scratch band and their names, for the reader.
@@ -375,7 +348,7 @@ using layouts_t = std::conditional_t<TENSOR_PATH, TensorLayouts,
 // The single production kernel.
 // ---------------------------------------------------------------------------
 
-template<bool TENSOR_PATH, bool GROUPED_DOWN>
+template<bool TENSOR_PATH>
 __global__ __launch_bounds__(kDecodeCtaThreads, 1)
 void kimi_k3_decode_persistent_kernel(
     const __nv_bfloat16 *__restrict__ hidden_states,
@@ -633,9 +606,7 @@ void kimi_k3_decode_persistent_kernel(
             : shared_experts::kCoreDownCtas;
         constexpr int shared_units = activation_units + shared_down_units;
         constexpr int routed_units_per_expert =
-            GROUPED_DOWN
-                ? expert_mxfp4::grouped_pipeline::kGroupedDownUnits
-                : expert_mxfp4::kDownTiles;
+            expert_mxfp4::grouped_pipeline::kGroupedDownUnits;
         const int units = shared_units + expert_units * routed_units_per_expert;
         int batch_begin;
         while ((batch_begin = claim_unit_batch(
@@ -670,21 +641,12 @@ void kimi_k3_decode_persistent_kernel(
                 const int expert =
                     scratch.unit_expert[routed / routed_units_per_expert];
                 const int begin = scratch.expert_offsets[expert];
-                if constexpr (GROUPED_DOWN) {
-                    expert_mxfp4::grouped_pipeline::grouped_down_unit(
-                        shared_raw, tensor_pool, expert_w2_packed,
-                        expert_w2_scale, scratch, expert, begin,
-                        scratch.expert_offsets[expert + 1] - begin,
-                        routed % routed_units_per_expert, active_tokens,
-                        clocks);
-                } else {
-                    expert_mxfp4::routed_down_unit(
-                        shared_raw, tensor_pool, expert_w2_packed,
-                        expert_w2_scale, scratch, expert, begin,
-                        scratch.expert_offsets[expert + 1] - begin,
-                        routed % routed_units_per_expert, active_tokens,
-                        clocks);
-                }
+                expert_mxfp4::grouped_pipeline::grouped_down_unit(
+                    shared_raw, tensor_pool, expert_w2_packed,
+                    expert_w2_scale, scratch, expert, begin,
+                    scratch.expert_offsets[expert + 1] - begin,
+                    routed % routed_units_per_expert, active_tokens,
+                    clocks);
                 __syncthreads();
                 mark = clocks.lap(kClockRoutedDown, mark);
             }
@@ -794,7 +756,7 @@ static __host__ std::int64_t shared_memory_reservations_for_testing(
 /// graph capture would have to record. The measured occupancy is then checked
 /// on every call, so a device that cannot host the grid is rejected every time
 /// rather than only on the first launch of a process.
-template<bool TENSOR_PATH, bool GROUPED_DOWN = false>
+template<bool TENSOR_PATH>
 static __host__ int resident_blocks_per_sm() {
     static std::array<std::atomic<int>, kMaxCudaDevices> measured{};
     static std::array<std::once_flag, kMaxCudaDevices> reserved;
@@ -804,26 +766,19 @@ static __host__ int resident_blocks_per_sm() {
                 "MoK: kimi_k3_decode saw an unexpected device ordinal ",
                 device);
     std::call_once(reserved[static_cast<std::size_t>(device)], [device] {
-        constexpr int shared_bytes =
-            GROUPED_DOWN
-                ? expert_mxfp4::grouped_pipeline::
-                      kGroupedDownPersistentSharedBytes
-                : kPersistentSharedBytes;
         C10_CUDA_CHECK(cudaFuncSetAttribute(
-            kimi_k3_decode_persistent_kernel<TENSOR_PATH, GROUPED_DOWN>,
+            kimi_k3_decode_persistent_kernel<TENSOR_PATH>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
-            shared_bytes));
+            kPersistentSharedBytes));
         int blocks = 0;
         C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &blocks,
-            kimi_k3_decode_persistent_kernel<TENSOR_PATH, GROUPED_DOWN>,
-            kDecodeCtaThreads, shared_bytes));
+            kimi_k3_decode_persistent_kernel<TENSOR_PATH>,
+            kDecodeCtaThreads, kPersistentSharedBytes));
         measured[static_cast<std::size_t>(device)].store(
             blocks, std::memory_order_relaxed);
-        if constexpr (!GROUPED_DOWN) {
-            shared_memory_reservations()[static_cast<std::size_t>(device)]
-                .fetch_add(1, std::memory_order_relaxed);
-        }
+        shared_memory_reservations()[static_cast<std::size_t>(device)]
+            .fetch_add(1, std::memory_order_relaxed);
     });
     return measured[static_cast<std::size_t>(device)].load(
         std::memory_order_relaxed);
@@ -867,15 +822,6 @@ inline std::int64_t resident_blocks_per_sm_for_testing(
                        : resident_blocks_per_sm<false>();
 }
 
-inline std::tuple<std::int64_t, std::int64_t>
-grouped_pipeline_resource_for_testing(const bool tensor_path) {
-    return {
-        expert_mxfp4::grouped_pipeline::kGroupedDownPersistentSharedBytes,
-        tensor_path ? resident_blocks_per_sm<true, true>()
-                    : resident_blocks_per_sm<false, true>(),
-    };
-}
-
 /// Every pointer, alias, and count one persistent launch needs.
 ///
 /// The kernel takes twenty-odd arguments and the two capacity paths pass the
@@ -912,14 +858,14 @@ struct LaunchArguments {
     int profile_phases;
 };
 
-template<bool TENSOR_PATH, bool GROUPED_DOWN>
+template<bool TENSOR_PATH>
 static __host__ void launch_persistent(
     const LaunchArguments &arguments,
     const layouts_t<TENSOR_PATH> &layouts
 ) {
     validate_grid_residency(
         arguments.available_sms,
-        resident_blocks_per_sm<TENSOR_PATH, GROUPED_DOWN>(),
+        resident_blocks_per_sm<TENSOR_PATH>(),
         arguments.grid_ctas);
 
     const auto bf16 = [](const at::Tensor &tensor) {
@@ -929,13 +875,8 @@ static __host__ void launch_persistent(
         return reinterpret_cast<const std::uint8_t *>(tensor.data_ptr());
     };
 
-    constexpr int shared_bytes =
-        GROUPED_DOWN
-            ? expert_mxfp4::grouped_pipeline::
-                  kGroupedDownPersistentSharedBytes
-            : kPersistentSharedBytes;
-    kimi_k3_decode_persistent_kernel<TENSOR_PATH, GROUPED_DOWN>
-        <<<arguments.grid_ctas, kDecodeCtaThreads, shared_bytes,
+    kimi_k3_decode_persistent_kernel<TENSOR_PATH>
+        <<<arguments.grid_ctas, kDecodeCtaThreads, kPersistentSharedBytes,
            at::cuda::getCurrentCUDAStream()>>>(
             bf16(arguments.hidden_states),
             bf16(arguments.router_weight),
@@ -1027,46 +968,13 @@ static __host__ TensorLayouts tensor_layouts(
     };
 }
 
-template<bool TENSOR_PATH>
-static __host__ void launch_production_decode(
-    const LaunchArguments &arguments
-) {
-    if constexpr (TENSOR_PATH) {
-        launch_persistent<true, false>(
-            arguments, tensor_layouts(arguments));
-    } else {
-        launch_persistent<false, false>(arguments, NoTensorLayouts{});
-    }
-}
-
-template<bool TENSOR_PATH>
-static __host__ void launch_grouped_decode(
-    const LaunchArguments &arguments
-) {
-    if constexpr (TENSOR_PATH) {
-        launch_persistent<true, true>(
-            arguments, tensor_layouts(arguments));
-    } else {
-        launch_persistent<false, true>(arguments, NoTensorLayouts{});
-    }
-}
-
-/// Run one whole TP8 Kimi K3 decode step in one selected persistent launch.
+/// Run one whole TP8 Kimi K3 decode step in one persistent launch.
 static __host__ void launch_decode(const LaunchArguments &arguments) {
-    const bool grouped = benchmark_grouped_pipeline_enabled();
     if (capacity_bucket(arguments.active_tokens) <= kMaxCoreCapacity) {
-        if (grouped) {
-            launch_grouped_decode<false>(arguments);
-        } else {
-            launch_production_decode<false>(arguments);
-        }
+        launch_persistent<false>(arguments, NoTensorLayouts{});
         return;
     }
-    if (grouped) {
-        launch_grouped_decode<true>(arguments);
-    } else {
-        launch_production_decode<true>(arguments);
-    }
+    launch_persistent<true>(arguments, tensor_layouts(arguments));
 }
 
 }  // namespace persistent
