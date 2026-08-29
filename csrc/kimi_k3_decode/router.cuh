@@ -67,8 +67,8 @@ static __device__ __forceinline__ float router_sigmoid(const float logit) {
 
 /// Build the expert-major assignment table for one decode step.
 ///
-/// Only the last router CTA runs this, so every count, offset, and assignment
-/// entry is written by a single CTA and the workspace never needs a host reset.
+/// Only one CTA runs this, so every count, offset, and assignment entry is
+/// written by a single CTA and the workspace never needs a host reset.
 static __device__ void build_assignments(
     std::uint8_t *__restrict__ shared,
     const Scratch &scratch,
@@ -327,6 +327,34 @@ static __device__ void select_token(
         scratch.expert_ids[route] = selected_ids[thread];
         scratch.expert_weights[route] = selected_weights[thread];
     }
+}
+
+/// Select one token's routes on the CTA that finishes its last score shard.
+///
+/// Each shard flushes its disjoint score range before taking a ticket. The
+/// last ticket therefore identifies one CTA that can acquire every range and
+/// select while the rest of the route/project queue is still draining.
+static __device__ void select_after_score_shard(
+    std::uint8_t *__restrict__ shared,
+    const float *__restrict__ router_correction_bias,
+    const Scratch &scratch,
+    const int token
+) {
+    const int thread = static_cast<int>(threadIdx.x);
+    __threadfence();
+    __syncthreads();
+
+    __shared__ int owns_selection;
+    if (thread == 0) {
+        const int ticket = atomicAdd(&scratch.expert_counts[token], 1);
+        owns_selection = ticket == kScoreShards - 1 ? 1 : 0;
+    }
+    __syncthreads();
+    if (owns_selection == 0) return;
+
+    __threadfence();
+    select_token(
+        shared, router_correction_bias, scratch, nullptr, nullptr, token);
 }
 
 /// Score all 896 experts for one token and publish its top-16 routes.

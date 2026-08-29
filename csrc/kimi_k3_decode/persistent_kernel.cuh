@@ -45,8 +45,8 @@ namespace persistent {
 // task to one block. Six generation-tagged grid barriers separate the phases:
 //
 //   0. clear this launch's queue counters and the routed accumulator;
-//   1. route every token and project the routed latent;
-//   2. build the expert-major assignment table and quantize that latent;
+//   1. score and select every token while projecting the routed latent;
+//   2. build the expert-major assignment table while quantizing that latent;
 //   3. routed gate/up units interleaved with the shared gate/up units;
 //   4. shared activation, routed down units, and the shared down units;
 //   5. publish this rank's routed partial into the symmetric collective buffer.
@@ -432,6 +432,9 @@ void kimi_k3_decode_persistent_kernel(
                 &scratch.phase[cleared_counter(thread)]),
             0u);
     }
+    if (block == 0 && thread < active_tokens) {
+        scratch.expert_counts[thread] = 0;
+    }
     const int routed_values = active_tokens * kLatentSize;
     for (int index = block * kDecodeCtaThreads + thread;
          index < routed_values;
@@ -461,10 +464,13 @@ void kimi_k3_decode_persistent_kernel(
         while ((unit = claim_unit(
                     scratch, kRouteLatentQueue, units, &claim_slot)) >= 0) {
             if (unit < score_units) {
+                const int token = unit / router::kScoreShards;
                 router::score_shard(
                     shared, hidden_states, router_weight, scratch,
-                    unit / router::kScoreShards,
+                    token,
                     unit % router::kScoreShards);
+                router::select_after_score_shard(
+                    shared, router_correction_bias, scratch, token);
                 __syncthreads();
                 mark = clocks.lap(kClockRouterScore, mark);
                 continue;
@@ -487,36 +493,14 @@ void kimi_k3_decode_persistent_kernel(
     mark = clocks.lap(kClockGridBarrier, mark);
 
     // -----------------------------------------------------------------------
-    // Phase 2: select every token's top-16 while the grid quantizes the
-    // latent.
+    // Phase 2: build the expert-major assignment table while the grid
+    // quantizes the latent.
     //
-    // Selection is one pass over 896 contracted scores, and a decode step
-    // never has more tokens than the grid has CTAs, so the tokens are dealt
-    // out by block index rather than through a queue. The quantization is
-    // independent of selection and covers the whole grid.
-    // -----------------------------------------------------------------------
-    if (block < active_tokens) {
-        // The persistent path has no returned router tensors: every consumer
-        // reads the routes straight out of scratch.
-        router::select_token(
-            shared, router_correction_bias, scratch, nullptr, nullptr, block);
-        __syncthreads();
-        mark = clocks.lap(kClockRouterScore, mark);
-    }
-    expert_mxfp4::quantize_latent_rows(
-        scratch.latent_x, scratch, active_tokens, block, grid_ctas);
-    __syncthreads();
-    mark = clocks.lap(kClockLatentQuantize, mark);
-    grid_barrier(scratch, error_flag, grid, grid_ctas);
-    mark = clocks.lap(kClockGridBarrier, mark);
-
-    // -----------------------------------------------------------------------
-    // Phase 2b: build the expert-major assignment table.
-    //
-    // The table is a single-CTA histogram and scan over every token's routes,
-    // so it cannot be split, and it can only start once every token has
-    // selected. It is small -- at most 2 048 routes -- and the barrier that
-    // follows is what publishes it to the routed workers.
+    // Route selection finished on each token's last score shard before the
+    // preceding barrier. Assignment construction and latent quantization are
+    // independent consumers, so block 0 builds the table while every other
+    // CTA starts quantizing rather than making the whole grid wait through a
+    // separate assignment phase.
     // -----------------------------------------------------------------------
     if (block == 0) {
         router::build_assignments(shared, scratch, active_tokens);
@@ -525,6 +509,10 @@ void kimi_k3_decode_persistent_kernel(
         __syncthreads();
         mark = clocks.lap(kClockAssignments, mark);
     }
+    expert_mxfp4::quantize_latent_rows(
+        scratch.latent_x, scratch, active_tokens, block, grid_ctas);
+    __syncthreads();
+    mark = clocks.lap(kClockLatentQuantize, mark);
     grid_barrier(scratch, error_flag, grid, grid_ctas);
     mark = clocks.lap(kClockGridBarrier, mark);
 

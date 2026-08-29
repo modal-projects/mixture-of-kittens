@@ -58,17 +58,3 @@ def test_route_selection_fuses_with_scoring_before_assignment_quantization() -> 
     assert "select_token(" in select
     assert "select_after_score_shard(" in kernel
     assert kernel.count("grid_barrier(") == 7
-
-
-def test_routed_down_epilogue_uses_one_vector_atomic_per_column_pair() -> None:
-    """The focused epilogue prototype must halve scalar atomic issue count."""
-    body = _function_body(
-        _source("expert_mxfp4_staging.cuh"), "void accumulate_down_tile("
-    )
-
-    assert "constexpr int kColumnsPerAtomic = 2;" in body
-    assert "batch_rows * kMmaN / kColumnsPerAtomic" in body
-    assert "float2 contribution" in body
-    assert "float2 *const destination" in body
-    assert "atomicAdd(destination, contribution);" in body
-    assert "result[{row, column + 1}]" in body

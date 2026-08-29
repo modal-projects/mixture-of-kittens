@@ -677,8 +677,8 @@ def test_the_launch_is_correct_across_the_unsigned_serial_wrap(
     actual = _decode(workspace, weights, hidden)
     torch.cuda.synchronize(device)
     assert_decode_close(actual, expected)
-    # Seven barriers from three short of the wrap lands four past it.
-    assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 4
+    # Six barriers from three short of the wrap lands three past it.
+    assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 3
     assert_identical_across_ranks(actual)
 
 
@@ -878,7 +878,7 @@ def test_a_profiled_launch_reports_its_own_cycles_and_costs_one_barrier(
     _synchronize_ranks(workspace)
     _decode(workspace, weights, hidden)
     torch.cuda.synchronize(device)
-    assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 7
+    assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 6
     assert set(_phase_clocks(workspace).values()) == {0}
 
     with _phase_profiling():
@@ -888,7 +888,7 @@ def test_a_profiled_launch_reports_its_own_cycles_and_costs_one_barrier(
         first_result = _decode(workspace, weights, hidden).clone()
         torch.cuda.synchronize(device)
         first = _phase_clocks(workspace)
-        assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 8
+        assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 7
 
         # Every byte of the band set to one is 0x0101010101010101 in each
         # counter, 7.2e16 cycles: eight orders of magnitude above anything a
@@ -914,11 +914,11 @@ def test_a_profiled_launch_reports_its_own_cycles_and_costs_one_barrier(
         assert 0 < cycles < poison_floor, (name, cycles)
 
     # Profiling is off again, so the band stops moving and the launch is back
-    # to the seven generations a measured replay spends.
+    # to the six generations a measured replay spends.
     assert not _C._kimi_k3_decode_phase_profile()
     _phase(workspace.scratch)[GRID_GENERATION].zero_()
     _synchronize_ranks(workspace)
     _decode(workspace, weights, hidden)
     torch.cuda.synchronize(device)
-    assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 7
+    assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 6
     assert _phase_clocks(workspace) == second
