@@ -430,16 +430,20 @@ def test_the_gate_up_rounds_never_read_a_prefetch_they_did_not_make() -> None:
     assert "uint4 payload[kGateUpRoundGroups];" in declarations[0]
     assert "std::uint32_t scale_words[kGateUpScaleTiles];" in declarations[1]
 
-    # The prefetch is the loop's only reload, it targets the one buffer, and
-    # it is the only thing the last-round test guards.
+    # The payload and scale prefetches are the loop's only reloads. Profiling
+    # gives them separate helpers, but both target their one live buffer and
+    # both remain inside the same last-round guard.
     guarded = re.findall(
         r"if \(round \+ 1 < kGateUpRounds\) \{(?P<block>(?:[^{}]|\{[^{}]*\})*)\}",
         loop,
     )
     assert len(guarded) == 1, loop
-    assert "read_weight_round(" in guarded[0]
-    assert "payload, scale_words);" in guarded[0]
-    assert len(re.findall(r"read_weight_round\(", loop)) == 1
+    assert "read_weight_payload_round(" in guarded[0]
+    assert "read_weight_scale_round(" in guarded[0]
+    assert "kGateUpRoundGroups, payload);" in guarded[0]
+    assert "kGateUpRoundGroups, scale_words);" in guarded[0]
+    assert len(re.findall(r"read_weight_payload_round\(", loop)) == 1
+    assert len(re.findall(r"read_weight_scale_round\(", loop)) == 1
 
     # No copy forward, because there is nothing to copy from.
     assert not re.search(r"\bnext_(?:payload|scale_words)\b", body), body
