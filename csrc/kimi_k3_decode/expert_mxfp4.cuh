@@ -222,6 +222,10 @@ static __device__ void routed_gate_up_unit(
             }
             tensor_store_wait();
             if (laneid() == 0) {
+                st_descriptor<direct_weight_stage, transpose::N>
+                    first_weight_descriptor(first_weight_stage[stage]);
+                st_descriptor<direct_weight_stage, transpose::N>
+                    second_weight_descriptor(second_weight_stage[stage]);
                 #pragma unroll
                 for (int slot = 0; slot < kGateUpRoundGroups; ++slot) {
                     const int quad = slot / kScaleGroupsPerTile;
@@ -229,12 +233,14 @@ static __device__ void routed_gate_up_unit(
                     const bool accumulate = round != 0 || slot != 0;
                     mixed_mma_direct(
                         first_accumulator, activation_tile[slot],
-                        first_weight_stage[stage], slot, scale_slot(quad),
+                        first_weight_descriptor.chunk_descriptor(slot),
+                        scale_slot(quad),
                         scale_slot(kGateUpScaleTiles + quad),
                         scale_factor_id, accumulate);
                     mixed_mma_direct(
                         second_accumulator, activation_tile[slot],
-                        second_weight_stage[stage], slot, scale_slot(quad),
+                        second_weight_descriptor.chunk_descriptor(slot),
+                        scale_slot(quad),
                         scale_slot(2 * kGateUpScaleTiles + quad),
                         scale_factor_id, accumulate);
                 }
@@ -379,11 +385,13 @@ static __device__ void routed_down_unit(
             }
             tensor_store_wait();
             if (laneid() == 0) {
+                st_descriptor<direct_weight_stage, transpose::N>
+                    weight_descriptor(weight_stage[stage]);
                 #pragma unroll
                 for (int slot = 0; slot < kDownRoundGroups; ++slot) {
                     mixed_mma_direct(
                         accumulator, activation_tile[slot],
-                        weight_stage[stage], slot,
+                        weight_descriptor.chunk_descriptor(slot),
                         scale_slot(0), scale_slot(kDownScaleTiles),
                         slot, round != 0 || slot != 0);
                 }
