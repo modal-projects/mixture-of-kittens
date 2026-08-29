@@ -35,7 +35,10 @@ from pathlib import Path
 
 import modal
 
-from benchmarks.compare_kimi_k3_frameworks import comparison_artifact_files
+from benchmarks.compare_kimi_k3_frameworks import (
+    comparison_artifact_files,
+    pinned_image_reference,
+)
 from benchmarks.kimi_k3_artifacts import reproducible_tar_bytes
 
 
@@ -146,9 +149,15 @@ B300_IMAGE = build_image(SPECS["B300"])
 # PyTorch and CUDA ABI, so no wheel ever crosses an ABI boundary. The images ship
 # pip-installed CUDA wheels rather than a full toolkit, so the compile needs
 # CPATH pointed at the nvidia package headers.
+#
+# The reference is `repository@sha256:<digest>` resolved from
+# `benchmarks/framework_manifest.json`, not the `:kimi-k3` tag those digests
+# were captured from. A tag is a moving pointer, and an archive that recorded a
+# digest while its image was built from whatever the tag resolved to that
+# morning would be reporting a pin it never used.
 COMPARISON_IMAGES = {
-    "vllm": "vllm/vllm-openai:kimi-k3",
-    "sglang": "lmsysorg/sglang:kimi-k3",
+    framework: pinned_image_reference(framework)
+    for framework in ("vllm", "sglang")
 }
 _NVIDIA_INCLUDE_GLOB = "/usr/local/lib/python3.12/dist-packages/nvidia/*/include"
 _CPATH_SNIPPET = (
@@ -168,11 +177,16 @@ COMPARISON_BUILD_DIRS = BUILD_DIRS
 COMPARISON_RUNTIME_DIRS = RUNTIME_DIRS
 
 
-def framework_comparison_image(registry_tag: str) -> modal.Image:
-    """Derive a comparison image from one official Kimi K3 serving image."""
+def framework_comparison_image(registry_reference: str) -> modal.Image:
+    """Derive a comparison image from one pinned Kimi K3 serving digest."""
+    if "@sha256:" not in registry_reference:
+        raise ValueError(
+            "a comparison image must be built from a pinned digest, got "
+            f"{registry_reference!r}"
+        )
     image = (
         modal.Image.from_registry(
-            registry_tag,
+            registry_reference,
             setup_dockerfile_commands=[
                 "RUN ln -sf /usr/bin/python3 /usr/local/bin/python "
                 "&& python --version",
@@ -372,6 +386,8 @@ def _run_framework_comparison(
         raise ValueError("git_sha must be the full 40-character commit SHA")
     with tempfile.TemporaryDirectory(prefix=f"kimi-k3-{framework}-") as directory:
         output_dir = Path(directory) / "artifacts"
+        reference = COMPARISON_IMAGES[framework]
+        print(f"{framework} comparison image: {reference}")
         arguments = [
             "-m",
             "benchmarks.compare_kimi_k3_frameworks",
@@ -391,7 +407,13 @@ def _run_framework_comparison(
         _run_kimi_k3_torchrun(
             arguments,
             timeout=79_000,
-            environment={"MOK_GIT_SHA": git_sha},
+            environment={
+                "MOK_GIT_SHA": git_sha,
+                # The driver records this in the archive manifest and refuses
+                # it if it is not the digest the manifest pins, so the archive
+                # names the image it was actually produced by.
+                "MOK_COMPARISON_IMAGE_REF": reference,
+            },
         )
         measured = [mode for mode in modes.split(",") if mode]
         expected = set(comparison_artifact_files(measured))
@@ -456,8 +478,17 @@ def compare(
     tokens: str = "",
     frameworks: str = "vllm,sglang",
 ) -> None:
-    """Run the framework comparisons and unpack their archives locally."""
+    """Run the framework comparisons, combine them, and enforce both gates.
+
+    The two archives are unpacked, then joined into one combined numerical and
+    performance verdict that is written next to them. Every artifact is on disk
+    before the verdict is signalled, so a failing gate leaves a complete run
+    behind rather than an aborted one.
+    """
+    import json
     import tarfile
+
+    from benchmarks.compare_kimi_k3_frameworks import combine_archives
 
     entrypoints = {"vllm": compare_vllm, "sglang": compare_sglang}
     root = Path(output_dir)
@@ -472,6 +503,7 @@ def compare(
         for name in frameworks.split(",")
         if name
     }
+    directories = []
     for name, handle in handles.items():
         destination = root / name
         destination.mkdir(parents=True, exist_ok=True)
@@ -479,7 +511,30 @@ def compare(
         (root / f"{name}.tar").write_bytes(archive)
         with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
             tar.extractall(destination, filter="data")
+        directories.append(destination)
         print(f"{name}: {sorted(path.name for path in destination.iterdir())}")
+
+    summary = combine_archives(directories, root / "combined")
+    print(
+        json.dumps(
+            {
+                "passed": summary["passed"],
+                "numerical_gates": {
+                    "passed": summary["numerical_gates"]["passed"],
+                    "row_count": summary["numerical_gates"]["row_count"],
+                    "violations": summary["numerical_gates"]["violations"],
+                },
+                "performance_gates": summary["performance_gates"],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    if not summary["passed"]:
+        raise SystemExit(
+            "Kimi K3 comparison gates failed; artifacts are in "
+            f"{root} and the verdict is in {root / 'combined'}"
+        )
 
 
 @app.local_entrypoint()
