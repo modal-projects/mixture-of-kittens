@@ -749,15 +749,15 @@ __device__ __forceinline__ void native_gate_up_candidate(
             const unsigned long long started =
                 static_cast<unsigned long long>(clock64());
             if (laneid() == 0) {
+                auto first_scale = scale_slot(stage, 0);
+                auto second_scale = scale_slot(stage, 1);
+                auto activation_scale = scale_slot(stage, 2);
                 load_mxnv_scale_async(
-                    scale_slot(stage, 0),
-                    shared.first_scale.stage[stage]);
+                    first_scale, shared.first_scale.stage[stage]);
                 load_mxnv_scale_async(
-                    scale_slot(stage, 1),
-                    shared.second_scale.stage[stage]);
+                    second_scale, shared.second_scale.stage[stage]);
                 load_mxnv_scale_async(
-                    scale_slot(stage, 2),
-                    shared.activation_scale.stage[stage]);
+                    activation_scale, shared.activation_scale.stage[stage]);
             }
             tensor_store_wait();
             asm volatile(
@@ -1044,15 +1044,17 @@ static __device__ void native_gate_up_reference_capture(
             if (laneid() == 0) {
                 #pragma unroll
                 for (int quad = 0; quad < kGateUpScaleTiles; ++quad) {
+                    auto activation_scale = scale_slot(quad);
+                    auto first_scale =
+                        scale_slot(kGateUpScaleTiles + quad);
+                    auto second_scale =
+                        scale_slot(2 * kGateUpScaleTiles + quad);
                     load_mxnv_scale_async(
-                        scale_slot(quad),
-                        activation_scale_shared[quad]);
+                        activation_scale, activation_scale_shared[quad]);
                     load_mxnv_scale_async(
-                        scale_slot(kGateUpScaleTiles + quad),
-                        first_scale_shared[quad]);
+                        first_scale, first_scale_shared[quad]);
                     load_mxnv_scale_async(
-                        scale_slot(2 * kGateUpScaleTiles + quad),
-                        second_scale_shared[quad]);
+                        second_scale, second_scale_shared[quad]);
                 }
             }
             tensor_store_wait();
