@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,7 @@ MATERIAL_TAIL_GAIN = 0.10
 OUTPUT_TILES = 7
 REDUCE_CTAS = 32
 SHARD_BEGIN = 33
+DEBUG_LOG_PATH = Path("/opt/cursor/logs/debug.log")
 RESOURCE_NAMES = (
     "threads_per_cta",
     "dynamic_shared_bytes",
@@ -60,6 +62,31 @@ RESOURCE_NAMES = (
     "static_shared_bytes",
     "local_bytes",
 )
+
+
+def _debug_log(
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    payload: dict[str, Any],
+) -> None:
+    # region agent log
+    DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with DEBUG_LOG_PATH.open("a", encoding="utf-8") as stream:
+        stream.write(
+            json.dumps(
+                {
+                    "hypothesisId": hypothesis_id,
+                    "location": location,
+                    "message": message,
+                    "data": payload,
+                    "timestamp": time.time_ns() // 1_000_000,
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
+    # endregion
 
 
 def candidate_plan(active_tokens: int) -> dict[str, int]:
@@ -662,6 +689,24 @@ def run(
     traces: dict[str, Any] = {}
     resources: dict[str, Any] = {}
 
+    if rank == 0:
+        # region agent log
+        _debug_log(
+            "F",
+            "benchmarks/kimi_k3_tail_m128n_probe.py:run",
+            "m128xN probe entry",
+            {
+                "warmup_count": warmup_count,
+                "sample_count": sample_count,
+                "repeats": repeats,
+                "candidate_plans": {
+                    str(tokens): candidate_plan(tokens)
+                    for tokens in TOKEN_COUNTS
+                },
+            },
+        )
+        # endregion
+
     for tokens in TOKEN_COUNTS:
         plan = candidate_plan(tokens)
         entry = _build_entry(base_weights, router, device, tokens)
@@ -763,6 +808,66 @@ def run(
     result: dict[str, Any] = {}
     if rank == 0:
         decision = integration_decision(rows)
+        # region agent log
+        _debug_log(
+            "F",
+            "benchmarks/kimi_k3_tail_m128n_probe.py:run",
+            "tail wall and shard phase comparison",
+            {
+                str(row["tokens"]): {
+                    "baseline_us": row["baseline_median_of_repeats_us"],
+                    "candidate_us": row["candidate_median_of_repeats_us"],
+                    "improvement_fraction": row["improvement_fraction"],
+                    "baseline_shard_mma_us": (
+                        row["baseline_phase"]["max_shard_mma_us"]
+                    ),
+                    "candidate_shard_mma_us": (
+                        row["candidate_phase"]["max_shard_mma_us"]
+                    ),
+                }
+                for row in rows
+            },
+        )
+        # endregion
+        # region agent log
+        _debug_log(
+            "G",
+            "benchmarks/kimi_k3_tail_m128n_probe.py:run",
+            "numerical comparison",
+            {
+                str(row["tokens"]): row["numerical"]
+                for row in rows
+            },
+        )
+        # endregion
+        # region agent log
+        _debug_log(
+            "H",
+            "benchmarks/kimi_k3_tail_m128n_probe.py:run",
+            "resource and launch gates",
+            {
+                str(row["tokens"]): {
+                    "resources": row["resources"],
+                    "single_launch": row["single_launch"],
+                }
+                for row in rows
+            },
+        )
+        # endregion
+        # region agent log
+        _debug_log(
+            "I",
+            "benchmarks/kimi_k3_tail_m128n_probe.py:run",
+            "m128xN probe exit and integration decision",
+            {
+                "token_verdicts": {
+                    str(row["tokens"]): row["passed"]
+                    for row in rows
+                },
+                "decision": decision,
+            },
+        )
+        # endregion
         result = {
             "passed": all(bool(row["passed"]) for row in rows),
             "rows": rows,
@@ -782,6 +887,10 @@ def run(
         _write_json(output_dir / "phase_cycles.json", phase_rows)
         _write_json(output_dir / "kernel_traces.json", traces)
         _write_json(output_dir / "resources.json", resources)
+        if DEBUG_LOG_PATH.is_file():
+            (output_dir / "debug.ndjson").write_bytes(
+                DEBUG_LOG_PATH.read_bytes()
+            )
         print(json.dumps(result, indent=2, sort_keys=True))
 
     _barrier(device)

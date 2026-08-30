@@ -629,6 +629,7 @@ def bench_kimi_k3_tail_m128n_probe(
             },
         )
         expected = {
+            "debug.ndjson",
             "kernel_traces.json",
             "manifest.json",
             "phase_cycles.json",
@@ -737,6 +738,9 @@ def tail_m128n_probe(
     (destination / "artifacts.tar").write_bytes(archive)
     with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
         bundle.extractall(destination, filter="data")
+    local_debug = Path("/opt/cursor/logs/debug.log")
+    local_debug.parent.mkdir(parents=True, exist_ok=True)
+    local_debug.write_bytes((destination / "debug.ndjson").read_bytes())
     print(
         "m128xN tail probe artifacts: "
         f"{sorted(path.name for path in destination.iterdir())}"
