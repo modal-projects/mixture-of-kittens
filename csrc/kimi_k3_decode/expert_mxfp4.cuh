@@ -40,7 +40,7 @@ namespace expert_mxfp4 {
 /// `tensor_pool` is owned by the caller because a CTA may allocate tensor
 /// memory only once: the persistent kernel provisions one pool at entry and
 /// hands it to every unit, and the private kernel provisions one of its own.
-template<bool FUSED_W13 = false>
+template<bool FUSED_W13>
 static __device__ void routed_gate_up_unit(
     int *__restrict__ shared_raw,
     kittens::tensor_allocator<1, 1> &tensor_pool,
@@ -279,6 +279,28 @@ static __device__ void routed_gate_up_unit(
         first_result_shared, second_result_shared, scratch, assignment_begin,
         rows, output_base);
     __syncthreads();
+}
+
+/// Preserve the production unit's original call surface. The fused-W13
+/// specialization is selected explicitly only by the private benchmark path.
+static __device__ __forceinline__ void routed_gate_up_unit(
+    int *__restrict__ shared_raw,
+    kittens::tensor_allocator<1, 1> &tensor_pool,
+    const std::uint8_t *__restrict__ expert_w1_packed,
+    const std::uint8_t *__restrict__ expert_w1_scale,
+    const std::uint8_t *__restrict__ expert_w3_packed,
+    const std::uint8_t *__restrict__ expert_w3_scale,
+    const Scratch &scratch,
+    const int expert,
+    const int assignment_begin,
+    const int batch_rows,
+    const int output_tile,
+    const PhaseClocks clocks
+) {
+    routed_gate_up_unit<false>(
+        shared_raw, tensor_pool, expert_w1_packed, expert_w1_scale,
+        expert_w3_packed, expert_w3_scale, scratch, expert, assignment_begin,
+        batch_rows, output_tile, clocks);
 }
 
 /// Contract one expert batch's down tile and weight it into the accumulator.
