@@ -22,7 +22,7 @@ from collections.abc import Callable
 from dataclasses import FrozenInstanceError, fields, replace
 from functools import partial
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -51,6 +51,36 @@ WEIGHT_FIELDS = (
 LOW_LEVEL_ARGUMENTS = (
     "hidden_states",
     *WEIGHT_FIELDS[:-1],
+    "scratch",
+    "collective_buffer",
+    "collective_buffer_ptrs",
+    "collective_buffer_multicast_ptr",
+    "output_mailbox",
+    "output_mailbox_ptrs",
+    "output_mailbox_multicast_ptr",
+    "barrier_buffer",
+    "barrier_buffer_ptrs",
+    "barrier_buffer_multicast_ptr",
+    "barrier_target",
+    "error_flag",
+    "tp_rank",
+    "active_tokens",
+    "workspace_signature",
+)
+FUSED_W13_BENCHMARK_ARGUMENTS = (
+    "hidden_states",
+    "router_weight",
+    "router_correction_bias",
+    "routed_expert_down_proj",
+    "routed_expert_up_proj",
+    "routed_latent_rmsnorm_weight",
+    "expert_w13_packed",
+    "expert_w13_scale",
+    "expert_w2_packed",
+    "expert_w2_scale",
+    "shared_gate_proj",
+    "shared_up_proj",
+    "shared_down_proj",
     "scratch",
     "collective_buffer",
     "collective_buffer_ptrs",
@@ -125,6 +155,7 @@ def _load_contract_modules() -> tuple[ModuleType, ModuleType, ModuleType]:
     package.__package__ = "mok"
     extension = ModuleType("mok._C")
     extension.kimi_k3_decode = lambda *args: None
+    extension._kimi_k3_decode_fused_w13_benchmark = lambda *args: None
     extension.kimi_k3_decode_workspace_bytes = lambda: 0
     package._C = extension
     sys.modules["mok"] = package
@@ -194,6 +225,20 @@ def _fake_operator_args(hidden_states: torch.Tensor) -> tuple[object, ...]:
         0,
         16,
         TRACE_SIGNATURE,
+    )
+
+
+def _fake_fused_w13_benchmark_args(
+    hidden_states: torch.Tensor,
+) -> tuple[object, ...]:
+    public = _fake_operator_args(hidden_states)
+    fused_packed = hidden_states.new_empty((1,), dtype=torch.uint8)
+    fused_scale = hidden_states.new_empty((1,), dtype=torch.uint8)
+    return (
+        *public[:6],
+        fused_packed,
+        fused_scale,
+        *public[10:],
     )
 
 
@@ -382,6 +427,94 @@ def check_fake_decode_signature_matches_custom_op() -> None:
     ) == LOW_LEVEL_MUTATED_ARGUMENTS
 
 
+def check_fused_w13_benchmark_schema_is_private_and_exact() -> None:
+    kimi_k3, _, fake_impls = _load_contract_modules()
+    schema = torch.ops.mok._kimi_k3_decode_fused_w13_benchmark.default._schema
+    schema_names = tuple(argument.name for argument in schema.arguments)
+
+    assert schema_names == FUSED_W13_BENCHMARK_ARGUMENTS
+    assert tuple(
+        inspect.signature(
+            fake_impls._kimi_k3_decode_fused_w13_benchmark_fake
+        ).parameters
+    ) == schema_names
+    assert schema.returns == []
+    assert tuple(
+        argument.name
+        for argument in schema.arguments
+        if argument.alias_info is not None and argument.alias_info.is_write
+    ) == LOW_LEVEL_MUTATED_ARGUMENTS
+    assert "_kimi_k3_decode_fused_w13_benchmark" not in kimi_k3.__all__
+    assert not hasattr(kimi_k3, "_kimi_k3_decode_fused_w13_benchmark")
+
+
+def check_fused_w13_benchmark_operator_requires_explicit_guard() -> None:
+    _, ops, _ = _load_contract_modules()
+    with FakeTensorMode():
+        hidden_states = torch.empty(
+            16, 7168, dtype=torch.bfloat16, device="cuda"
+        )
+        with pytest.raises(RuntimeError, match="benchmark-only"):
+            ops._kimi_k3_decode_fused_w13_benchmark(
+                *_fake_fused_w13_benchmark_args(hidden_states)
+            )
+
+
+def check_public_decode_never_dispatches_fused_w13_benchmark() -> None:
+    kimi_k3, _, _ = _load_contract_modules()
+    hidden_states = torch.empty(
+        16, 7168, dtype=torch.bfloat16, device="meta"
+    )
+    calls: list[str] = []
+    operators = SimpleNamespace(
+        kimi_k3_decode=lambda *args: calls.append("public"),
+        _kimi_k3_decode_fused_w13_benchmark=lambda *args: calls.append(
+            "private_fused_w13"
+        ),
+    )
+    workspace = kimi_k3.KimiK3DecodeWorkspace(
+        group_name="contract",
+        tp_rank=0,
+        tp_size=8,
+        device=torch.device("meta"),
+        max_tokens=128,
+        scratch=torch.empty(1, dtype=torch.uint8, device="meta"),
+        collective_buffer=torch.empty(
+            128, 10752, dtype=torch.bfloat16, device="meta"
+        ),
+        collective_handle=None,
+        collective_ptrs=list(range(8)),
+        collective_multicast_ptr=1,
+        output_mailbox=torch.empty(
+            128, 8, 896, dtype=torch.bfloat16, device="meta"
+        ),
+        output_mailbox_handle=None,
+        output_mailbox_ptrs=list(range(8)),
+        output_mailbox_multicast_ptr=2,
+        barrier_buffer=torch.empty(1, dtype=torch.int32, device="meta"),
+        barrier_handle=None,
+        barrier_ptrs=list(range(8)),
+        barrier_multicast_ptr=3,
+        barrier_target=torch.empty(1, dtype=torch.int32, device="meta"),
+        error_flag=torch.empty(1, dtype=torch.int32, device="meta"),
+        workspace_signature=4,
+    )
+    original_operators = kimi_k3._operators
+    kimi_k3._operators = lambda: operators
+    try:
+        result = kimi_k3.kimi_k3_decode(
+            kimi_k3.KimiK3DecodeConfig(),
+            workspace,
+            _valid_weights(kimi_k3),
+            hidden_states,
+        )
+    finally:
+        kimi_k3._operators = original_operators
+
+    assert calls == ["public"]
+    assert result.shape == hidden_states.shape
+
+
 CHECKS: dict[str, Callable[[], None]] = {
     "weight_contract_has_exact_immutable_fields":
         check_weight_contract_has_exact_immutable_fields,
@@ -427,6 +560,12 @@ CHECKS: dict[str, Callable[[], None]] = {
         check_fake_decode_requires_the_placeholder_signature,
     "fake_decode_signature_matches_custom_op":
         check_fake_decode_signature_matches_custom_op,
+    "fused_w13_benchmark_schema_is_private_and_exact":
+        check_fused_w13_benchmark_schema_is_private_and_exact,
+    "fused_w13_benchmark_operator_requires_explicit_guard":
+        check_fused_w13_benchmark_operator_requires_explicit_guard,
+    "public_decode_never_dispatches_fused_w13_benchmark":
+        check_public_decode_never_dispatches_fused_w13_benchmark,
 }
 
 
