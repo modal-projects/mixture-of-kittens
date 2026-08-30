@@ -375,6 +375,48 @@ def bench_kimi_k3_decode(git_sha: str) -> bytes:
         return first_archive
 
 
+@app.function(image=B300_IMAGE, gpu="B300:8", timeout=21_600)
+def bench_kimi_k3_fused_w13(
+    git_sha: str,
+    warmup_count: int = 500,
+    sample_count: int = 1000,
+    repeats: int = 5,
+) -> bytes:
+    """Reproduce the private fused-W13 full-step candidate on TP8 B300."""
+    if len(git_sha) != 40:
+        raise ValueError("git_sha must be the full 40-character commit SHA")
+    with tempfile.TemporaryDirectory(
+        prefix="kimi-k3-fused-w13-"
+    ) as directory:
+        output = Path(directory) / "fused_w13_full_step.json"
+        _run_kimi_k3_torchrun(
+            [
+                "-m",
+                "benchmarks.kimi_k3_fused_w13_benchmark",
+                "--output",
+                str(output),
+                "--warmup-count",
+                str(warmup_count),
+                "--sample-count",
+                str(sample_count),
+                "--repeats",
+                str(repeats),
+            ],
+            timeout=21_300,
+            environment={
+                "MOK_GIT_SHA": git_sha,
+                "MOK_KIMI_K3_DEBUG_LOG": "1",
+                "MOK_KIMI_K3_ENABLE_FUSED_W13_BENCHMARK": "1",
+            },
+        )
+        result = output.read_text(encoding="utf-8")
+        print(result)
+        debug_log = Path("/opt/cursor/logs/debug.log")
+        if not debug_log.is_file():
+            raise RuntimeError("fused-W13 reproduction produced no debug log")
+        return debug_log.read_bytes()
+
+
 @app.function(image=B300_IMAGE, gpu="B300", timeout=7_200)
 def bench_kimi_k3_batched_expert_probe(
     git_sha: str,
