@@ -83,13 +83,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "", pybind11::arg("enabled"));
     m.def("_kimi_k3_decode_phase_profile",
           &kimi_k3_decode::persistent::benchmark_phase_profile_for_testing);
-    m.def("_kimi_k3_decode_set_projection_first",
-          &kimi_k3_decode::persistent::
-              set_benchmark_projection_first_for_testing,
-          "", pybind11::arg("enabled"));
-    m.def("_kimi_k3_decode_projection_first",
-          &kimi_k3_decode::persistent::
-              benchmark_projection_first_for_testing);
     m.def("_kimi_k3_decode_phase_clock_metadata",
           &kimi_k3_decode::persistent::phase_clock_metadata_for_testing);
     m.def("_kimi_k3_decode_benchmark_grids", []() {
