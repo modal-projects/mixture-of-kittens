@@ -592,6 +592,179 @@ def tail_probe(
     )
 
 
+@app.function(image=B300_IMAGE, gpu="B300:8", timeout=86_400)
+def bench_kimi_k3_tail_m128n_probe(
+    git_sha: str,
+    warmup_count: int = 500,
+    sample_count: int = 1000,
+    repeats: int = 5,
+    clock_ghz: float = 1.96,
+) -> bytes:
+    """Compare current and output-channel-M tail paths on eight B300s."""
+    if len(git_sha) != 40:
+        raise ValueError("git_sha must be the full 40-character commit SHA")
+    with tempfile.TemporaryDirectory(
+        prefix="kimi-k3-tail-m128n-"
+    ) as directory:
+        output_dir = Path(directory) / "artifacts"
+        _run_kimi_k3_torchrun(
+            [
+                "-m",
+                "benchmarks.kimi_k3_tail_m128n_probe",
+                "--output-dir",
+                str(output_dir),
+                "--warmup-count",
+                str(warmup_count),
+                "--sample-count",
+                str(sample_count),
+                "--repeats",
+                str(repeats),
+                "--clock-ghz",
+                str(clock_ghz),
+            ],
+            timeout=86_100,
+            environment={
+                "MOK_GIT_SHA": git_sha,
+                "MOK_KIMI_K3_ENABLE_TAIL_M128N_PROBE": "1",
+            },
+        )
+        expected = {
+            "kernel_traces.json",
+            "manifest.json",
+            "phase_cycles.json",
+            "raw_samples.json",
+            "resources.json",
+            "results.json",
+        }
+        actual = {path.name for path in output_dir.iterdir()}
+        if actual != expected:
+            raise RuntimeError(
+                "m128xN tail probe artifacts differ: "
+                f"missing={sorted(expected - actual)}, "
+                f"unexpected={sorted(actual - expected)}"
+            )
+        archive = reproducible_tar_bytes(output_dir)
+        if archive != reproducible_tar_bytes(output_dir):
+            raise RuntimeError("normalized m128xN archive is not reproducible")
+        return archive
+
+
+@app.function(image=B300_IMAGE, gpu="B300:8", timeout=14_400)
+def diagnose_kimi_k3_tail_m128n_probe(
+    tokens: int = 16,
+    variant: str = "candidate",
+    sanitizer: bool = True,
+) -> dict[str, int | str]:
+    """Run one synchronized TP8 tail candidate, optionally under memcheck."""
+    if tokens not in (16, 32, 128):
+        raise ValueError("tokens must be 16, 32, or 128")
+    if variant not in ("setup", "baseline", "candidate", "both"):
+        raise ValueError(
+            "variant must be setup, baseline, candidate, or both"
+        )
+    probe_command = [
+        "python",
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc-per-node=8",
+        "-m",
+        "benchmarks.kimi_k3_tail_m128n_probe",
+        "--focus-tokens",
+        str(tokens),
+        "--focus-variant",
+        variant,
+    ]
+    command = (
+        [
+            "compute-sanitizer",
+            "--tool",
+            "memcheck",
+            "--target-processes",
+            "all",
+            "--error-exitcode",
+            "99",
+            "--show-backtrace",
+            "yes",
+            *probe_command,
+        ]
+        if sanitizer
+        else probe_command
+    )
+    print(f"Launching: {' '.join(command)} on 8 x B300")
+    completed = subprocess.run(
+        command,
+        cwd=REMOTE_ROOT,
+        env={
+            **os.environ,
+            "MOK_KIMI_K3_ENABLE_TAIL_M128N_PROBE": "1",
+            "PYTHONUNBUFFERED": "1",
+        },
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+        timeout=14_100,
+    )
+    print(completed.stdout, end="")
+    print(f"focused m128xN probe exit code: {completed.returncode}")
+    return {
+        "command": " ".join(command),
+        "exit_code": completed.returncode,
+        "output": completed.stdout,
+    }
+
+
+@app.local_entrypoint()
+def tail_m128n_probe(
+    git_sha: str,
+    output_dir: str = "kimi_k3_tail_m128n_probe",
+    warmup_count: int = 500,
+    sample_count: int = 1000,
+    repeats: int = 5,
+    clock_ghz: float = 1.96,
+) -> None:
+    """Run and unpack the focused eight-B300 tail orientation benchmark."""
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    archive = bench_kimi_k3_tail_m128n_probe.remote(
+        git_sha,
+        warmup_count=warmup_count,
+        sample_count=sample_count,
+        repeats=repeats,
+        clock_ghz=clock_ghz,
+    )
+    (destination / "artifacts.tar").write_bytes(archive)
+    with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
+        bundle.extractall(destination, filter="data")
+    print(
+        "m128xN tail probe artifacts: "
+        f"{sorted(path.name for path in destination.iterdir())}"
+    )
+
+
+@app.local_entrypoint()
+def tail_m128n_diagnostic(
+    tokens: int = 16,
+    variant: str = "candidate",
+    sanitizer: bool = True,
+    output_path: str = "kimi_k3_tail_m128n_diagnostic.log",
+) -> None:
+    """Run and persist one focused eight-B300 tail diagnostic."""
+    result = diagnose_kimi_k3_tail_m128n_probe.remote(
+        tokens=tokens,
+        variant=variant,
+        sanitizer=sanitizer,
+    )
+    rendered = (
+        f"command: {result['command']}\n"
+        f"exit_code: {result['exit_code']}\n"
+        f"{result['output']}"
+    )
+    Path(output_path).write_text(rendered, encoding="utf-8")
+    print(rendered, end="")
+
+
 @app.local_entrypoint()
 def batched_expert_diagnostic(
     variant: str = "candidate",
