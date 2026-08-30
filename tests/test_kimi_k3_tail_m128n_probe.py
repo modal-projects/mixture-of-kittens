@@ -99,6 +99,39 @@ def test_probe_source_contains_phase_and_single_launch_gates() -> None:
     assert "candidate_shard_mma_us" in source
 
 
+def test_isolated_shard_harness_preserves_candidate_contract() -> None:
+    root = Path(__file__).parents[1]
+    header = (
+        root / "csrc" / "kimi_k3_decode" / "tail_m128n_probe.cuh"
+    ).read_text(encoding="utf-8")
+    benchmark = (
+        root / "benchmarks" / "kimi_k3_tail_m128n_probe.py"
+    ).read_text(encoding="utf-8")
+
+    assert "_kimi_k3_tail_m128n_shard_probe" in benchmark
+    assert "run_isolated_shard" in benchmark
+    assert "(tokens, LATENT)" in benchmark
+    assert "(HIDDEN, LATENT)" in benchmark
+    assert "(tokens, SHARD_COLUMNS)" in benchmark
+    assert "torch.bfloat16" in benchmark
+    assert "reference.float()" in benchmark
+
+    assert "kimi_k3_tail_m128n_shard_probe_kernel" in header
+    assert "shard_tensor_m128n<TOKEN_TILE_N, false>" in header
+    assert "store_octet(" in header
+    isolated_kernel = header.split(
+        "void kimi_k3_tail_m128n_shard_probe_kernel", 1
+    )[1].split("inline bool guard_enabled", 1)[0]
+    for forbidden in (
+        "coordinate_ranks(",
+        "drain_ranks(",
+        "publish_generation(",
+        "wait_for_generation(",
+        "multimem_",
+    ):
+        assert forbidden not in isolated_kernel
+
+
 def test_production_persistent_kernel_does_not_call_the_candidate() -> None:
     root = Path(__file__).parents[1]
     persistent = (
@@ -118,5 +151,13 @@ def test_modal_exposes_focused_8xb300_benchmark_and_memcheck() -> None:
     assert "def diagnose_kimi_k3_tail_m128n_probe(" in source
     assert "def tail_m128n_probe(" in source
     assert "def tail_m128n_diagnostic(" in source
+    assert "def diagnose_kimi_k3_tail_m128n_shard_probe(" in source
+    assert "def tail_m128n_shard_diagnostic(" in source
+    isolated = source.split(
+        "def diagnose_kimi_k3_tail_m128n_shard_probe(", 1
+    )[1].split("@app.", 1)[0]
+    assert 'gpu="B300"' in source
+    assert "torch.distributed.run" not in isolated
+    assert "--isolated-shard-tokens" in isolated
     assert '"compute-sanitizer"' in source
     assert 'gpu="B300:8"' in source

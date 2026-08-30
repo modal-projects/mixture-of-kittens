@@ -716,6 +716,64 @@ def diagnose_kimi_k3_tail_m128n_probe(
     }
 
 
+@app.function(image=B300_IMAGE, gpu="B300", timeout=7_200)
+def diagnose_kimi_k3_tail_m128n_shard_probe(
+    tokens: int = 16,
+    tp_rank: int = 0,
+    sanitizer: bool = True,
+) -> dict[str, int | str]:
+    """Memcheck one candidate shard using only ordinary CUDA buffers."""
+    if tokens not in (16, 32, 128):
+        raise ValueError("tokens must be 16, 32, or 128")
+    if tp_rank < 0 or tp_rank >= 8:
+        raise ValueError("tp_rank must be between 0 and 7")
+    probe_command = [
+        "python",
+        "-m",
+        "benchmarks.kimi_k3_tail_m128n_probe",
+        "--isolated-shard-tokens",
+        str(tokens),
+        "--isolated-shard-rank",
+        str(tp_rank),
+    ]
+    command = (
+        [
+            "compute-sanitizer",
+            "--tool",
+            "memcheck",
+            "--error-exitcode",
+            "99",
+            "--show-backtrace",
+            "yes",
+            *probe_command,
+        ]
+        if sanitizer
+        else probe_command
+    )
+    print(f"Launching: {' '.join(command)} on 1 x B300")
+    completed = subprocess.run(
+        command,
+        cwd=REMOTE_ROOT,
+        env={
+            **os.environ,
+            "MOK_KIMI_K3_ENABLE_TAIL_M128N_PROBE": "1",
+            "PYTHONUNBUFFERED": "1",
+        },
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+        timeout=7_100,
+    )
+    print(completed.stdout, end="")
+    print(f"isolated m128xN shard exit code: {completed.returncode}")
+    return {
+        "command": " ".join(command),
+        "exit_code": completed.returncode,
+        "output": completed.stdout,
+    }
+
+
 @app.local_entrypoint()
 def tail_m128n_probe(
     git_sha: str,
@@ -758,6 +816,28 @@ def tail_m128n_diagnostic(
     result = diagnose_kimi_k3_tail_m128n_probe.remote(
         tokens=tokens,
         variant=variant,
+        sanitizer=sanitizer,
+    )
+    rendered = (
+        f"command: {result['command']}\n"
+        f"exit_code: {result['exit_code']}\n"
+        f"{result['output']}"
+    )
+    Path(output_path).write_text(rendered, encoding="utf-8")
+    print(rendered, end="")
+
+
+@app.local_entrypoint()
+def tail_m128n_shard_diagnostic(
+    tokens: int = 16,
+    tp_rank: int = 0,
+    sanitizer: bool = True,
+    output_path: str = "kimi_k3_tail_m128n_shard_memcheck.log",
+) -> None:
+    """Run and persist the ordinary-buffer single-B300 shard diagnostic."""
+    result = diagnose_kimi_k3_tail_m128n_shard_probe.remote(
+        tokens=tokens,
+        tp_rank=tp_rank,
         sanitizer=sanitizer,
     )
     rendered = (

@@ -53,6 +53,9 @@ MATERIAL_TAIL_GAIN = 0.10
 OUTPUT_TILES = 7
 REDUCE_CTAS = 32
 SHARD_BEGIN = 33
+LATENT = 3584
+HIDDEN = 7168
+SHARD_COLUMNS = HIDDEN // TP_SIZE
 DEBUG_LOG_PATH = Path("/opt/cursor/logs/debug.log")
 RESOURCE_NAMES = (
     "threads_per_cta",
@@ -634,6 +637,192 @@ def _write_json(path: Path, value: object) -> None:
     )
 
 
+def _cpu_bf16(
+    shape: tuple[int, ...],
+    *,
+    seed: int,
+    scale: float,
+) -> torch.Tensor:
+    value = torch.empty(shape, dtype=torch.bfloat16)
+    value.normal_(generator=torch.Generator().manual_seed(seed))
+    value.mul_(scale)
+    return value.contiguous()
+
+
+def _isolated_shard_inputs(
+    tokens: int,
+    tp_rank: int,
+    device: torch.device,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    normalized_cpu = _cpu_bf16(
+        (tokens, LATENT),
+        seed=81_000 + tokens,
+        scale=0.25,
+    )
+    latent_up_cpu = _cpu_bf16(
+        (HIDDEN, LATENT),
+        seed=82_000,
+        scale=1.0 / math.sqrt(LATENT),
+    )
+    beta_cpu = _cpu_bf16(
+        (tokens, SHARD_COLUMNS),
+        seed=83_000 + tp_rank,
+        scale=0.125,
+    )
+    shard_begin = tp_rank * SHARD_COLUMNS
+    reference = (
+        normalized_cpu.float()
+        @ latent_up_cpu[
+            shard_begin:shard_begin + SHARD_COLUMNS
+        ].float().T
+        + beta_cpu.float()
+    ).bfloat16()
+    sentinel = torch.tensor(-31.75, dtype=torch.bfloat16)
+    output_storage_cpu = torch.full(
+        (tokens + 2, SHARD_COLUMNS),
+        sentinel,
+        dtype=torch.bfloat16,
+    )
+    return (
+        normalized_cpu.to(device),
+        latent_up_cpu.to(device),
+        beta_cpu.to(device),
+        output_storage_cpu.to(device),
+        reference,
+    )
+
+
+def run_isolated_shard(*, tokens: int, tp_rank: int = 0) -> dict[str, Any]:
+    """Run only the candidate shard on ordinary single-GPU buffers."""
+    if tokens not in TOKEN_COUNTS:
+        raise ValueError("isolated shard tokens must be 16, 32, or 128")
+    if tp_rank < 0 or tp_rank >= TP_SIZE:
+        raise ValueError("isolated shard rank must be between 0 and 7")
+    # region agent log
+    _debug_log(
+        "J",
+        "benchmarks/kimi_k3_tail_m128n_probe.py:run_isolated_shard",
+        "isolated ordinary-buffer shard entry",
+        {
+            "tokens": tokens,
+            "tp_rank": tp_rank,
+            "candidate_plan": candidate_plan(tokens),
+        },
+    )
+    # endregion
+    _require_gpu_dependencies()
+    if not torch.cuda.is_available():
+        raise RuntimeError("the isolated m128xN shard probe requires CUDA")
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
+    if torch.cuda.get_device_capability(device) != (10, 3):
+        raise RuntimeError(
+            "the isolated m128xN shard probe requires an SM103 B300"
+        )
+    (
+        normalized,
+        latent_up,
+        beta,
+        output_storage,
+        reference,
+    ) = _isolated_shard_inputs(tokens, tp_rank, device)
+    output = output_storage[1:tokens + 1]
+    torch.cuda.synchronize(device)
+    # region agent log
+    _debug_log(
+        "K",
+        "benchmarks/kimi_k3_tail_m128n_probe.py:run_isolated_shard",
+        "before isolated candidate launch",
+        {
+            "normalized_shape": list(normalized.shape),
+            "latent_up_shape": list(latent_up.shape),
+            "beta_shape": list(beta.shape),
+            "output_shape": list(output.shape),
+            "input_dtype": str(normalized.dtype),
+            "output_dtype": str(output.dtype),
+            "ordinary_cuda_tensors": True,
+        },
+    )
+    # endregion
+    _C._kimi_k3_tail_m128n_shard_probe(
+        normalized,
+        latent_up,
+        beta,
+        output,
+        tp_rank,
+    )
+    torch.cuda.synchronize(device)
+    observed_storage = output_storage.cpu()
+    observed = observed_storage[1:tokens + 1]
+    difference = observed.float() - reference.float()
+    denominator = reference.float().abs().sum().clamp_min(1e-12)
+    cosine = torch.nn.functional.cosine_similarity(
+        observed.float().flatten(),
+        reference.float().flatten(),
+        dim=0,
+    )
+    guards_intact = bool(
+        torch.equal(
+            observed_storage[0],
+            torch.full_like(observed_storage[0], -31.75),
+        )
+        and torch.equal(
+            observed_storage[-1],
+            torch.full_like(observed_storage[-1], -31.75),
+        )
+    )
+    result: dict[str, Any] = {
+        "tokens": tokens,
+        "tp_rank": tp_rank,
+        "plan": candidate_plan(tokens),
+        "normalized_shape": list(normalized.shape),
+        "latent_up_shape": list(latent_up.shape),
+        "beta_shape": list(beta.shape),
+        "output_shape": list(output.shape),
+        "input_dtype": str(normalized.dtype),
+        "accumulator_dtype": "torch.float32",
+        "output_dtype": str(output.dtype),
+        "ordinary_cuda_tensors": True,
+        "symmetric_allocations": False,
+        "rank_barriers": False,
+        "mailbox_multimem": False,
+        "dynamic_shared_bytes": int(
+            _C._kimi_k3_tail_m128n_resource_metadata(
+                candidate_plan(tokens)["mma_n"]
+            )[1]
+        ),
+        "launch_synchronized": True,
+        "finite": bool(torch.isfinite(observed.float()).all()),
+        "guards_intact": guards_intact,
+        "checksum": float(observed.float().sum()),
+        "relative_l1": float(difference.abs().sum() / denominator),
+        "cosine_similarity": float(cosine),
+        "max_abs": float(difference.abs().max()),
+        "bitwise_equal": bool(torch.equal(observed, reference)),
+    }
+    # region agent log
+    _debug_log(
+        "L",
+        "benchmarks/kimi_k3_tail_m128n_probe.py:run_isolated_shard",
+        "isolated candidate synchronized",
+        {
+            "finite": result["finite"],
+            "guards_intact": result["guards_intact"],
+            "checksum": result["checksum"],
+            "relative_l1": result["relative_l1"],
+            "max_abs": result["max_abs"],
+        },
+    )
+    # endregion
+    return result
+
+
 def _manifest(
     *,
     warmup_count: int,
@@ -1017,6 +1206,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--repeats", type=int, default=REPEATS)
     parser.add_argument("--clock-ghz", type=float, default=CLOCK_GHZ)
     parser.add_argument("--focus-tokens", type=int)
+    parser.add_argument("--isolated-shard-tokens", type=int)
+    parser.add_argument("--isolated-shard-rank", type=int, default=0)
     parser.add_argument(
         "--focus-variant",
         choices=("setup", "baseline", "candidate", "both"),
@@ -1027,6 +1218,13 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     arguments = _parse_args()
+    if arguments.isolated_shard_tokens is not None:
+        result = run_isolated_shard(
+            tokens=arguments.isolated_shard_tokens,
+            tp_rank=arguments.isolated_shard_rank,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
     if arguments.focus_tokens is not None:
         result = run_focused(
             tokens=arguments.focus_tokens,

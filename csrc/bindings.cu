@@ -252,6 +252,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("tp_rank"),
         pybind11::arg("active_tokens"));
     m.def(
+        "_kimi_k3_tail_m128n_shard_probe",
+        &kimi_k3_decode::tail::m128n_probe::launch_shard_probe,
+        "",
+        pybind11::arg("normalized"),
+        pybind11::arg("latent_up_proj"),
+        pybind11::arg("beta"),
+        pybind11::arg("output"),
+        pybind11::arg("tp_rank"));
+    m.def(
         "_kimi_k3_tail_m128n_plan",
         &kimi_k3_decode::tail::m128n_probe::plan_for_testing,
         "",

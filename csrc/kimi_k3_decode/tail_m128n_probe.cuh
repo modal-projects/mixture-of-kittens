@@ -25,6 +25,7 @@
 #include <cstring>
 #include <mutex>
 #include <tuple>
+#include <utility>
 
 namespace kimi_k3_decode {
 namespace tail {
@@ -68,14 +69,14 @@ inline constexpr int shard_ctas(const int active_tokens) {
     return kOutputTiles * token_tiles<TOKEN_TILE_N>(active_tokens);
 }
 
-template<int TOKEN_TILE_N>
+template<int TOKEN_TILE_N, bool MULTICAST_OUTPUT>
 static __device__ void shard_tensor_m128n(
     int *__restrict__ const shared_raw,
     kittens::tensor_allocator<1, 1> &tensor_pool,
     const input_layout<TOKEN_TILE_N> &normalized,
     const weight_layout &latent_up_proj,
-    const Scratch &scratch,
-    __nv_bfloat16 *__restrict__ const mailbox_multicast,
+    const __nv_bfloat16 *__restrict__ const beta,
+    __nv_bfloat16 *__restrict__ const output,
     const int shard_unit,
     const int tp_rank,
     const int active_tokens,
@@ -171,18 +172,25 @@ static __device__ void shard_tensor_m128n(
         #pragma unroll
         for (int pair = 0; pair < 4; ++pair) {
             const int tile_column = tile_group * kOctetLanes + 2 * pair;
-            const long long beta =
+            const long long beta_index =
                 static_cast<long long>(row) * kShardColumns
                 + column + 2 * pair;
             value.pair[pair] = pack_bf16(
                 result_shared[{tile_column, local_row}]
-                    + __bfloat162float(scratch.tail_shared_shard[beta]),
+                    + __bfloat162float(beta[beta_index]),
                 result_shared[{tile_column + 1, local_row}]
-                    + __bfloat162float(
-                        scratch.tail_shared_shard[beta + 1]));
+                    + __bfloat162float(beta[beta_index + 1]));
         }
-        publish_shard_octet(
-            mailbox_multicast, value, row, tp_rank, column);
+        if constexpr (MULTICAST_OUTPUT) {
+            publish_shard_octet(
+                output, value, row, tp_rank, column);
+        } else {
+            store_octet(
+                output
+                    + static_cast<long long>(row) * kShardColumns
+                    + column,
+                value);
+        }
     }
     clocks.lap(kTailClockMailboxMulticast, mark);
 }
@@ -248,10 +256,10 @@ void kimi_k3_tail_m128n_probe_kernel(
             scratch, error_flag, kTailReduceGeneration, baseline,
             kErrorTailShardReduce);
         clocks.lap(kTailClockShardReduceWait, mark);
-        shard_tensor_m128n<TOKEN_TILE_N>(
-            shared_raw, tensor_pool, normalized, latent_up_proj, scratch,
-            mailbox_multicast, block - kShardBegin, tp_rank, active_tokens,
-            clocks);
+        shard_tensor_m128n<TOKEN_TILE_N, true>(
+            shared_raw, tensor_pool, normalized, latent_up_proj,
+            scratch.tail_shared_shard, mailbox_multicast,
+            block - kShardBegin, tp_rank, active_tokens, clocks);
         mark = clocks.now();
         publish_generation(
             scratch, kTailShardArrivals, kTailShardGeneration,
@@ -263,6 +271,23 @@ void kimi_k3_tail_m128n_probe_kernel(
         scratch, error_flag, &baseline_slot,
         kReduceCtas + candidate_shard_ctas, clocks);
     clocks.lap(kTailClockTotal, total_mark);
+}
+
+template<int TOKEN_TILE_N>
+__global__ __launch_bounds__(kDecodeCtaThreads, 1)
+void kimi_k3_tail_m128n_shard_probe_kernel(
+    const __grid_constant__ input_layout<TOKEN_TILE_N> normalized,
+    const __grid_constant__ weight_layout latent_up_proj,
+    const __nv_bfloat16 *__restrict__ beta,
+    __nv_bfloat16 *__restrict__ output,
+    const int active_tokens
+) {
+    extern __shared__ __align__(16) int shared_raw[];
+    kittens::tensor_allocator<1, 1> tensor_pool{};
+    const int shard_unit = static_cast<int>(blockIdx.x);
+    shard_tensor_m128n<TOKEN_TILE_N, false>(
+        shared_raw, tensor_pool, normalized, latent_up_proj, beta, output,
+        shard_unit, 0, active_tokens, TailClocks{nullptr});
 }
 
 inline bool guard_enabled() {
@@ -296,6 +321,22 @@ static __host__ void reserve_shared_memory() {
     std::call_once(reserved[static_cast<std::size_t>(device)], [] {
         C10_CUDA_CHECK(cudaFuncSetAttribute(
             kimi_k3_tail_m128n_probe_kernel<TOKEN_TILE_N>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            kProbeDynamicBytes));
+    });
+}
+
+template<int TOKEN_TILE_N>
+static __host__ void reserve_shard_probe_shared_memory() {
+    static std::array<std::once_flag, 32> reserved;
+    int device = 0;
+    C10_CUDA_CHECK(cudaGetDevice(&device));
+    TORCH_CHECK(
+        device >= 0 && device < static_cast<int>(reserved.size()),
+        "MoK: m128xN shard probe saw an unexpected device ordinal ", device);
+    std::call_once(reserved[static_cast<std::size_t>(device)], [] {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(
+            kimi_k3_tail_m128n_shard_probe_kernel<TOKEN_TILE_N>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             kProbeDynamicBytes));
     });
@@ -493,6 +534,126 @@ static __host__ void launch(
         barrier_buffer, barrier_buffer_multicast_ptr, barrier_target,
         scratch, error_flag, static_cast<int>(tp_rank),
         static_cast<int>(active_tokens), properties.multiProcessorCount);
+}
+
+template<int TOKEN_TILE_N>
+static __host__ void launch_shard_variant(
+    const at::Tensor &normalized,
+    const at::Tensor &latent_up_proj,
+    const at::Tensor &beta,
+    const at::Tensor &output,
+    const int tp_rank,
+    const int active_tokens
+) {
+    const input_layout<TOKEN_TILE_N> normalized_view{
+        reinterpret_cast<kittens::bf16 *>(normalized.data_ptr()),
+        nullptr, nullptr, static_cast<size_t>(active_tokens),
+        static_cast<size_t>(kLatentSize)};
+    const weight_layout latent_up_view{
+        const_cast<kittens::bf16 *>(
+            reinterpret_cast<const kittens::bf16 *>(
+                latent_up_proj.data_ptr())
+            + static_cast<long long>(tp_rank) * kShardColumns * kLatentSize),
+        nullptr, nullptr, static_cast<size_t>(kShardColumns),
+        static_cast<size_t>(kLatentSize)};
+
+    reserve_shard_probe_shared_memory<TOKEN_TILE_N>();
+    kimi_k3_tail_m128n_shard_probe_kernel<TOKEN_TILE_N>
+        <<<shard_ctas<TOKEN_TILE_N>(active_tokens), kDecodeCtaThreads,
+           kProbeDynamicBytes, at::cuda::getCurrentCUDAStream()>>>(
+            normalized_view, latent_up_view,
+            reinterpret_cast<const __nv_bfloat16 *>(beta.data_ptr()),
+            reinterpret_cast<__nv_bfloat16 *>(output.data_ptr()),
+            active_tokens);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+static __host__ void launch_shard_probe(
+    const at::Tensor &normalized,
+    const at::Tensor &latent_up_proj,
+    const at::Tensor &beta,
+    const at::Tensor &output,
+    const std::int64_t tp_rank
+) {
+    TORCH_CHECK(
+        guard_enabled(),
+        "MoK: _kimi_k3_tail_m128n_shard_probe is benchmark-only; set "
+        "MOK_KIMI_K3_ENABLE_TAIL_M128N_PROBE=1");
+    TORCH_CHECK(
+        normalized.is_cuda() && normalized.is_contiguous()
+            && normalized.scalar_type() == at::kBFloat16
+            && normalized.dim() == 2
+            && normalized.size(1) == kLatentSize,
+        "MoK: _kimi_k3_tail_m128n_shard_probe requires contiguous CUDA "
+        "BF16 normalized [M, 3584]");
+    const std::int64_t active_tokens = normalized.size(0);
+    TORCH_CHECK(
+        active_tokens == 16 || active_tokens == 32 || active_tokens == 128,
+        "MoK: _kimi_k3_tail_m128n_shard_probe requires M in {16, 32, 128}");
+    TORCH_CHECK(
+        latent_up_proj.is_cuda() && latent_up_proj.is_contiguous()
+            && latent_up_proj.scalar_type() == at::kBFloat16
+            && latent_up_proj.dim() == 2
+            && latent_up_proj.size(0) == kHiddenSize
+            && latent_up_proj.size(1) == kLatentSize,
+        "MoK: _kimi_k3_tail_m128n_shard_probe requires contiguous CUDA "
+        "BF16 latent-up weight [7168, 3584]");
+    for (const auto &named : {
+             std::pair<const at::Tensor *, const char *>{&beta, "beta"},
+             std::pair<const at::Tensor *, const char *>{&output, "output"}}) {
+        const at::Tensor &tensor = *named.first;
+        TORCH_CHECK(
+            tensor.is_cuda() && tensor.is_contiguous()
+                && tensor.scalar_type() == at::kBFloat16
+                && tensor.dim() == 2
+                && tensor.size(0) == active_tokens
+                && tensor.size(1) == kShardColumns,
+            "MoK: _kimi_k3_tail_m128n_shard_probe requires contiguous CUDA "
+            "BF16 ", named.second, " [M, 896]");
+    }
+    TORCH_CHECK(
+        tp_rank >= 0 && tp_rank < kTensorParallelSize,
+        "MoK: _kimi_k3_tail_m128n_shard_probe requires tp_rank in [0, 7]");
+
+    const at::Device device = normalized.device();
+    for (const at::Tensor *tensor : {
+             &latent_up_proj, &beta, &output}) {
+        TORCH_CHECK(
+            tensor->device() == device,
+            "MoK: _kimi_k3_tail_m128n_shard_probe requires one CUDA device");
+    }
+    for (const auto &named : {
+             std::pair<const at::Tensor *, const char *>{
+                 &normalized, "normalized"},
+             std::pair<const at::Tensor *, const char *>{
+                 &latent_up_proj, "latent_up_proj"},
+             std::pair<const at::Tensor *, const char *>{&beta, "beta"},
+             std::pair<const at::Tensor *, const char *>{&output, "output"}}) {
+        TORCH_CHECK(
+            reinterpret_cast<std::uintptr_t>(named.first->data_ptr())
+                    % VECTOR_ALIGNMENT
+                == 0,
+            "MoK: _kimi_k3_tail_m128n_shard_probe requires 16-byte aligned ",
+            named.second);
+    }
+
+    const c10::cuda::CUDAGuard device_guard(device);
+    cudaDeviceProp properties{};
+    C10_CUDA_CHECK(cudaGetDeviceProperties(
+        &properties, device.index()));
+    TORCH_CHECK(
+        properties.major == 10 && properties.minor == 3,
+        "MoK: _kimi_k3_tail_m128n_shard_probe requires an SM103 B300");
+
+    if (active_tokens == 16) {
+        launch_shard_variant<16>(
+            normalized, latent_up_proj, beta, output,
+            static_cast<int>(tp_rank), static_cast<int>(active_tokens));
+        return;
+    }
+    launch_shard_variant<32>(
+        normalized, latent_up_proj, beta, output,
+        static_cast<int>(tp_rank), static_cast<int>(active_tokens));
 }
 
 }  // namespace m128n_probe
