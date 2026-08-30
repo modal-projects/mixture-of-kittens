@@ -335,7 +335,11 @@ def run(
                 hypothesis_id="A,B,E",
                 location="benchmarks/kimi_k3_fused_w13_benchmark.py:run",
                 message="fused W13 full-step timing verdict",
-                data={"tokens": tokens, **verdict},
+                data={
+                    "tokens": tokens,
+                    "phase_cycles": profiles,
+                    **verdict,
+                },
             )
             # endregion
             rows.append(
