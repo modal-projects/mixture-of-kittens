@@ -358,22 +358,15 @@ static __device__ void coordinate_ranks(
     int *__restrict__ const error_flag,
     std::uint32_t *const barrier_multicast,
     const std::uint32_t *const barrier_local,
-    unsigned int *const barrier_target,
-    const TailClocks &clocks
+    unsigned int *const barrier_target
 ) {
     if (threadIdx.x != 0) return;
 
     // Entry: every rank has finished writing its routed and shared partials
     // into its own copy of the collective buffer.
-    // #region agent log
-    unsigned long long mark = clocks.now();
-    // #endregion
     barrier_ranks(scratch, error_flag, barrier_multicast, barrier_local,
                   barrier_target, kTailEntryGeneration,
                   kErrorTailEntryRendezvous);
-    // #region agent log
-    mark = clocks.lap(kTailClockEntryRankRendezvous, mark);
-    // #endregion
     __threadfence_system();
     atomicAdd(
         reinterpret_cast<unsigned int *>(&scratch.phase[kTailEntryGeneration]),
@@ -392,18 +385,12 @@ static __device__ void coordinate_ranks(
         }
         __nanosleep(64);
     }
-    // #region agent log
-    mark = clocks.lap(kTailClockCoordinatorShardWait, mark);
-    // #endregion
 
     // Exit: every rank has multicast its own shard, so after this rendezvous
     // all eight mailbox slots on this rank hold the current launch's data.
     barrier_ranks(scratch, error_flag, barrier_multicast, barrier_local,
                   barrier_target, kTailExitGeneration,
                   kErrorTailExitRendezvous);
-    // #region agent log
-    clocks.lap(kTailClockExitRankRendezvous, mark);
-    // #endregion
     __threadfence_system();
     atomicAdd(
         reinterpret_cast<unsigned int *>(&scratch.phase[kTailExitGeneration]),
@@ -418,21 +405,14 @@ static __device__ void drain_ranks(
     const Scratch &scratch,
     int *__restrict__ const error_flag,
     std::uint32_t *const baseline_slot,
-    const int consumer_ctas,
-    const TailClocks &clocks
+    const int consumer_ctas
 ) {
-    // #region agent log
-    const unsigned long long mark = clocks.now();
-    // #endregion
     const std::uint32_t baseline =
         latch_generation(scratch, kTailDrainGeneration, baseline_slot);
     wait_for_generation(scratch, error_flag, kTailExitGeneration, baseline,
                         kErrorTailDrainExit);
     publish_generation(
         scratch, kTailDrainArrivals, kTailDrainGeneration, consumer_ctas);
-    // #region agent log
-    clocks.lap(kTailClockDrain, mark);
-    // #endregion
 }
 
 }  // namespace tail

@@ -715,89 +715,46 @@ void kimi_k3_decode_persistent_kernel(
     // -----------------------------------------------------------------------
     constexpr int shard_ctas =
         TENSOR_PATH ? tail::kTensorShardCtas : tail::kCoreShardCtas;
-    // #region agent log
-    const TailClocks tail_trace =
-        tail_clocks(scratch, profile_phases != 0);
-    tail_trace.clear();
-    __syncthreads();
-    const unsigned long long tail_total_mark = tail_trace.now();
-    // #endregion
     if (block < tail::kReduceBegin) {
         tail::coordinate_ranks(scratch, error_flag, barrier_multicast,
-                               barrier_local, barrier_target, tail_trace);
-        // #region agent log
-        tail_trace.lap(kTailClockTotal, tail_total_mark);
-        // #endregion
+                               barrier_local, barrier_target);
         clocks.lap(kClockTail, mark);
         return;
     }
-    if (block >= tail::kShardBegin + shard_ctas) {
-        // #region agent log
-        tail_trace.lap(kTailClockNonTailIdle, tail_total_mark);
-        tail_trace.lap(kTailClockTotal, tail_total_mark);
-        // #endregion
-        return;
-    }
+    if (block >= tail::kShardBegin + shard_ctas) return;
 
     if (block < tail::kShardBegin) {
         const std::uint32_t baseline = tail::latch_generation(
             scratch, kTailReduceGeneration, &latch_slot);
-        // #region agent log
-        unsigned long long tail_mark = tail_trace.now();
-        // #endregion
         tail::wait_for_generation(scratch, error_flag, kTailEntryGeneration,
                                   baseline, kErrorTailReduceEntry);
-        // #region agent log
-        tail_trace.lap(kTailClockReduceEntryWait, tail_mark);
-        // #endregion
         tail::reduce_rows(
             collective_multicast, routed_latent_rmsnorm_weight, scratch,
-            block - tail::kReduceBegin, tp_rank, active_tokens, tail_trace);
-        // #region agent log
-        tail_mark = tail_trace.now();
-        // #endregion
+            block - tail::kReduceBegin, tp_rank, active_tokens);
         tail::publish_generation(
             scratch, kTailReduceArrivals, kTailReduceGeneration,
             tail::kReduceCtas);
-        // #region agent log
-        tail_trace.lap(kTailClockReducePublish, tail_mark);
-        // #endregion
     } else {
         const std::uint32_t baseline = tail::latch_generation(
             scratch, kTailShardGeneration, &latch_slot);
-        // #region agent log
-        unsigned long long tail_mark = tail_trace.now();
-        // #endregion
         tail::wait_for_generation(scratch, error_flag, kTailReduceGeneration,
                                   baseline, kErrorTailShardReduce);
-        // #region agent log
-        tail_trace.lap(kTailClockShardReduceWait, tail_mark);
-        // #endregion
         if constexpr (TENSOR_PATH) {
             tail::shard_tensor(
                 shared_raw, tensor_pool, layouts.normalized, layouts.latent_up,
                 scratch, mailbox_multicast, block - tail::kShardBegin, tp_rank,
-                active_tokens, tail_trace);
+                active_tokens);
         } else {
             tail::shard_core<kMaxCoreCapacity>(
                 shared, scratch, routed_expert_up_proj, mailbox_multicast,
-                block - tail::kShardBegin, tp_rank, active_tokens, tail_trace);
+                block - tail::kShardBegin, tp_rank, active_tokens);
         }
-        // #region agent log
-        tail_mark = tail_trace.now();
-        // #endregion
         tail::publish_generation(
             scratch, kTailShardArrivals, kTailShardGeneration, shard_ctas);
-        // #region agent log
-        tail_trace.lap(kTailClockShardPublish, tail_mark);
-        // #endregion
     }
 
     tail::drain_ranks(scratch, error_flag, &latch_slot,
-                      tail::kReduceCtas + shard_ctas, tail_trace);
-    // #region agent log
-    tail_trace.lap(kTailClockTotal, tail_total_mark);
-    // #endregion
+                      tail::kReduceCtas + shard_ctas);
     clocks.lap(kClockTail, mark);
 }
 
@@ -898,25 +855,6 @@ inline std::int64_t resident_blocks_per_sm_for_testing(
     return tensor_path ? resident_blocks_per_sm<true>()
                        : resident_blocks_per_sm<false>();
 }
-
-// #region agent log
-inline std::tuple<std::int64_t, std::int64_t, std::int64_t, std::int64_t,
-                  std::int64_t, std::int64_t, std::int64_t>
-tensor_resource_metadata_for_testing() {
-    const int blocks = resident_blocks_per_sm<true>();
-    cudaFuncAttributes attributes{};
-    C10_CUDA_CHECK(cudaFuncGetAttributes(
-        &attributes, kimi_k3_decode_persistent_kernel<true>));
-    return {
-        static_cast<std::int64_t>(kPersistentCtas),
-        static_cast<std::int64_t>(kDecodeCtaThreads),
-        static_cast<std::int64_t>(kPersistentSharedBytes),
-        static_cast<std::int64_t>(blocks),
-        static_cast<std::int64_t>(attributes.numRegs),
-        static_cast<std::int64_t>(attributes.sharedSizeBytes),
-        static_cast<std::int64_t>(attributes.maxDynamicSharedSizeBytes)};
-}
-// #endregion
 
 /// Every pointer, alias, and count one persistent launch needs.
 ///

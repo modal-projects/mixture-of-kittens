@@ -95,44 +95,6 @@ def phase_clock_cycles(
     return dict(zip(names, counters, strict=True))
 
 
-@contextlib.contextmanager
-def tail_profiling() -> Iterator[None]:
-    """Turn the private tail kernel's temporary per-CTA clocks on."""
-    previous_guard = os.environ.get("MOK_KIMI_K3_ENABLE_GRID_TUNING")
-    os.environ["MOK_KIMI_K3_ENABLE_GRID_TUNING"] = "1"
-    _C._kimi_k3_tail_set_profile(True)
-    try:
-        yield
-    finally:
-        _C._kimi_k3_tail_set_profile(False)
-        if previous_guard is None:
-            os.environ.pop("MOK_KIMI_K3_ENABLE_GRID_TUNING", None)
-        else:
-            os.environ["MOK_KIMI_K3_ENABLE_GRID_TUNING"] = previous_guard
-
-
-def tail_clock_rows(
-    workspace: KimiK3DecodeWorkspace,
-    *,
-    launch_ctas: int,
-) -> list[dict[str, int]]:
-    """Read temporary per-CTA tail clocks from the dead router-score region."""
-    byte_offset, trace_ctas, names = _C._kimi_k3_tail_clock_metadata()
-    if not 1 <= launch_ctas <= trace_ctas:
-        raise ValueError(
-            f"launch_ctas must be in [1, {trace_ctas}], got {launch_ctas}"
-        )
-    byte_count = trace_ctas * len(names) * 8
-    words = workspace.scratch[
-        byte_offset : byte_offset + byte_count
-    ].cpu()
-    matrix = words.view(torch.int64).reshape(trace_ctas, len(names))
-    return [
-        dict(zip(names, matrix[cta].tolist(), strict=True))
-        for cta in range(launch_ctas)
-    ]
-
-
 def _e8m0_scale_bytes(absolute_max: torch.Tensor) -> torch.Tensor:
     mantissa, exponent = torch.frexp(absolute_max.float())
     scale_exponent = torch.where(mantissa <= 0.875, exponent - 9, exponent - 8)
@@ -389,6 +351,4 @@ __all__ = [
     "decode_step",
     "profiled_kernel_names",
     "recorded_allocator_events",
-    "tail_clock_rows",
-    "tail_profiling",
 ]

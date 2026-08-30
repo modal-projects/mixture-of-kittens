@@ -1,7 +1,6 @@
 #include "kimi_k3_decode/entrypoints.cuh"
 #include "kimi_k3_decode/expert_mxfp4.cuh"
 #include "kimi_k3_decode/expert_mxfp4_batch_probe.cuh"
-#include "kimi_k3_decode/tail_m128n_probe.cuh"
 #include "megakernel/entrypoints.cuh"
 #include "mxfp8.cuh"
 #include "scheduler.cuh"
@@ -86,10 +85,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &kimi_k3_decode::persistent::benchmark_phase_profile_for_testing);
     m.def("_kimi_k3_decode_phase_clock_metadata",
           &kimi_k3_decode::persistent::phase_clock_metadata_for_testing);
-    // #region agent log
-    m.def("_kimi_k3_decode_tensor_resource_metadata",
-          &kimi_k3_decode::persistent::tensor_resource_metadata_for_testing);
-    // #endregion
     m.def("_kimi_k3_decode_benchmark_grids", []() {
         const auto &grids =
             kimi_k3_decode::persistent::kBenchmarkGridCtas;
@@ -200,17 +195,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("started"), pybind11::arg("current"));
     m.def("_kimi_k3_tail_timeout_metadata",
           &kimi_k3_decode::tail::timeout_metadata_for_testing);
-    // #region agent log
-    m.def("_kimi_k3_tail_set_profile",
-          &kimi_k3_decode::tail::set_benchmark_tail_profile_for_testing,
-          "", pybind11::arg("enabled"));
-    m.def("_kimi_k3_tail_profile",
-          &kimi_k3_decode::tail::benchmark_tail_profile_for_testing);
-    m.def("_kimi_k3_tail_clock_metadata",
-          &kimi_k3_decode::tail::tail_clock_metadata_for_testing);
-    m.def("_kimi_k3_tail_tensor_resource_metadata",
-          &kimi_k3_decode::tail::tail_tensor_resource_metadata_for_testing);
-    // #endregion
     m.def("pack_kimi_k3_mxfp4", &kimi_k3_decode::mxfp4::pack_entrypoint, "",
           pybind11::arg("weight"), pybind11::arg("padded_k"));
     m.def("dequant_kimi_k3_mxfp4", &kimi_k3_decode::mxfp4::dequant_entrypoint, "",
@@ -236,40 +220,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("scratch"),
         pybind11::arg("expert"),
         pybind11::arg("use_batch_probe"));
-    m.def(
-        "_kimi_k3_tail_m128n_probe",
-        &kimi_k3_decode::tail::m128n_probe::launch,
-        "",
-        pybind11::arg("routed_latent_rmsnorm_weight"),
-        pybind11::arg("latent_up_proj"),
-        pybind11::arg("collective_buffer_multicast_ptr"),
-        pybind11::arg("output_mailbox_multicast_ptr"),
-        pybind11::arg("barrier_buffer"),
-        pybind11::arg("barrier_buffer_multicast_ptr"),
-        pybind11::arg("barrier_target"),
-        pybind11::arg("scratch"),
-        pybind11::arg("error_flag"),
-        pybind11::arg("tp_rank"),
-        pybind11::arg("active_tokens"));
-    m.def(
-        "_kimi_k3_tail_m128n_shard_probe",
-        &kimi_k3_decode::tail::m128n_probe::launch_shard_probe,
-        "",
-        pybind11::arg("normalized"),
-        pybind11::arg("latent_up_proj"),
-        pybind11::arg("beta"),
-        pybind11::arg("output"),
-        pybind11::arg("tp_rank"));
-    m.def(
-        "_kimi_k3_tail_m128n_plan",
-        &kimi_k3_decode::tail::m128n_probe::plan_for_testing,
-        "",
-        pybind11::arg("active_tokens"));
-    m.def(
-        "_kimi_k3_tail_m128n_resource_metadata",
-        &kimi_k3_decode::tail::m128n_probe::resource_metadata_for_testing,
-        "",
-        pybind11::arg("token_tile_n"));
     m.def("all_gather_top_experts", &utils::all_gather_top_experts::all_gather_top_experts_entrypoint, "",
           pybind11::arg("top_experts"), pybind11::arg("all_gather_top_experts_buffer"),
           pybind11::arg("all_gather_top_experts_buffer_multicast_ptr"), pybind11::arg("rank"), pybind11::arg("chunk_bytes"));

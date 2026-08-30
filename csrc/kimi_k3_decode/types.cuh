@@ -271,60 +271,6 @@ inline constexpr const char *kPhaseClockNames[] = {
 static_assert(sizeof(kPhaseClockNames) / sizeof(kPhaseClockNames[0])
                   == kPhaseClockCount);
 
-// #region agent log
-// Temporary TP8 tail probe. The router-score matrix is dead before the tail
-// starts, so profiled launches reuse its first bytes for one row of per-CTA
-// clocks without moving any production scratch offset.
-enum TailClock : int {
-    kTailClockTotal = 0,
-    kTailClockEntryRankRendezvous,
-    kTailClockReduceEntryWait,
-    kTailClockRoutedMultimemReduce,
-    kTailClockRmsNorm,
-    kTailClockSharedMultimemReduce,
-    kTailClockReducePublish,
-    kTailClockShardReduceWait,
-    kTailClockLatentUpShardMma,
-    kTailClockMailboxMulticast,
-    kTailClockShardPublish,
-    kTailClockCoordinatorShardWait,
-    kTailClockExitRankRendezvous,
-    kTailClockDrain,
-    kTailClockNonTailIdle,
-    kTailClockCount,
-};
-
-inline constexpr const char *kTailClockNames[] = {
-    "total",
-    "entry_rank_rendezvous",
-    "reduce_entry_wait",
-    "routed_multimem_reduce_and_squares",
-    "rmsnorm_scale_weight_store",
-    "shared_multimem_reduce",
-    "reduce_publish",
-    "shard_reduce_wait",
-    "latent_up_shard_mma",
-    "mailbox_multicast_and_beta",
-    "shard_publish",
-    "coordinator_shard_wait",
-    "exit_rank_rendezvous",
-    "drain",
-    "non_tail_idle",
-};
-
-inline constexpr int kTailClockTraceCtas = 148;
-inline constexpr int kTailClockTraceBytes = kRouterScoreBytes;
-inline constexpr int kTailClockTraceEnd =
-    kTailClockTraceBytes
-    + kTailClockTraceCtas * kTailClockCount
-        * static_cast<int>(sizeof(unsigned long long));
-
-static_assert(
-    sizeof(kTailClockNames) / sizeof(kTailClockNames[0]) == kTailClockCount);
-static_assert(kTailClockTraceBytes % alignof(unsigned long long) == 0);
-static_assert(kTailClockTraceEnd <= SCRATCH_BYTES);
-// #endregion
-
 // ---------------------------------------------------------------------------
 // Timeout diagnostics.
 //
@@ -480,51 +426,6 @@ struct PhaseClocks {
         return current;
     }
 };
-
-// #region agent log
-struct TailClocks {
-    unsigned long long *counters;
-
-    __device__ __forceinline__ bool enabled() const {
-        return counters != nullptr;
-    }
-
-    __device__ __forceinline__ void clear() const {
-        if (counters != nullptr
-            && static_cast<int>(threadIdx.x) < kTailClockCount) {
-            counters[threadIdx.x] = 0ull;
-        }
-    }
-
-    __device__ __forceinline__ unsigned long long now() const {
-        return counters == nullptr
-            ? 0ull
-            : static_cast<unsigned long long>(clock64());
-    }
-
-    __device__ __forceinline__ unsigned long long lap(
-        const TailClock clock,
-        const unsigned long long started
-    ) const {
-        if (counters == nullptr) return 0ull;
-        const unsigned long long current =
-            static_cast<unsigned long long>(clock64());
-        if (threadIdx.x == 0) counters[clock] += current - started;
-        return current;
-    }
-};
-
-__device__ __forceinline__ TailClocks tail_clocks(
-    const Scratch &scratch,
-    const bool profiled
-) {
-    return TailClocks{
-        profiled
-            ? reinterpret_cast<unsigned long long *>(scratch.router_scores)
-                + static_cast<int>(blockIdx.x) * kTailClockCount
-            : nullptr};
-}
-// #endregion
 
 __device__ __forceinline__ PhaseClocks phase_clocks(
     const Scratch &scratch,
