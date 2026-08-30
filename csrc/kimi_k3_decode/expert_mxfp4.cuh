@@ -40,6 +40,7 @@ namespace expert_mxfp4 {
 /// `tensor_pool` is owned by the caller because a CTA may allocate tensor
 /// memory only once: the persistent kernel provisions one pool at entry and
 /// hands it to every unit, and the private kernel provisions one of its own.
+template<bool FUSED_W13>
 static __device__ void routed_gate_up_unit(
     int *__restrict__ shared_raw,
     kittens::tensor_allocator<1, 1> &tensor_pool,
@@ -122,9 +123,18 @@ static __device__ void routed_gate_up_unit(
     mixed_scale_tile *const weight_scale_shared =
         weight_half == 0 ? first_scale_shared : second_scale_shared;
     const int output_base = output_tile * kMmaN;
+    // Production stores two independent [E, 384, K] tensors. The private
+    // fused-W13 benchmark stores [E, 768, K], gate rows first, so both the
+    // per-expert stride and the up-half row offset have to change together.
+    // These are compile-time branches and leave the public instantiation's
+    // address calculation unchanged.
+    constexpr int expert_rows =
+        FUSED_W13 ? 2 * kExpertW1W3PackedRows : kExpertW1W3PackedRows;
+    const int half_row =
+        FUSED_W13 ? weight_half * kExpertW1W3PackedRows : 0;
     const long long weight_index =
-        static_cast<long long>(expert) * kExpertW1W3PackedRows
-        + output_base + weight_row;
+        static_cast<long long>(expert) * expert_rows
+        + half_row + output_base + weight_row;
     const std::uint8_t *const weight_row_bytes =
         weight_packed + weight_index * kExpertW1W3PackedColumns;
     const std::uint8_t *const weight_row_scales =
@@ -497,7 +507,7 @@ void kimi_k3_routed_experts_kernel(
 
             for (int output_tile = 0; output_tile < kGateUpTiles;
                  ++output_tile) {
-                routed_gate_up_unit(
+                routed_gate_up_unit<false>(
                     shared_raw, tensor_pool, expert_w1_packed, expert_w1_scale,
                     expert_w3_packed, expert_w3_scale, scratch, expert,
                     assignment_begin, batch_rows, output_tile,

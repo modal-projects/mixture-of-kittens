@@ -1,3 +1,5 @@
+import os
+
 import torch
 from torch._subclasses.fake_tensor import is_fake
 
@@ -354,6 +356,202 @@ def kimi_k3_decode(
         expert_w1_scale,
         expert_w3_packed,
         expert_w3_scale,
+        expert_w2_packed,
+        expert_w2_scale,
+        shared_gate_proj,
+        shared_up_proj,
+        shared_down_proj,
+        scratch,
+        collective_buffer,
+        collective_buffer_ptrs,
+        collective_buffer_multicast_ptr,
+        output_mailbox,
+        output_mailbox_ptrs,
+        output_mailbox_multicast_ptr,
+        barrier_buffer,
+        barrier_buffer_ptrs,
+        barrier_buffer_multicast_ptr,
+        barrier_target,
+        error_flag,
+        tp_rank,
+        active_tokens,
+        workspace_signature,
+    )
+
+
+# PRIVATE BENCHMARK-ONLY: this schema is intentionally not part of
+# ``mok.kimi_k3`` or its prepared-weight contract. It exists only to measure
+# the full-step effect of consuming the serving adapters' transformed fused
+# W13 payload. Both the Python dispatcher and the compiled binding require the
+# explicit process guard below.
+_FUSED_W13_BENCHMARK_GUARD = "MOK_KIMI_K3_ENABLE_FUSED_W13_BENCHMARK"
+_FUSED_W13_BENCHMARK_ALIGNMENT = (
+    ("hidden_states", 16),
+    ("router_weight", 16),
+    ("routed_expert_down_proj", 16),
+    ("routed_expert_up_proj", 16),
+    ("routed_latent_rmsnorm_weight", 16),
+    ("expert_w13_packed", 16),
+    ("expert_w13_scale", 16),
+    ("expert_w2_packed", 16),
+    ("expert_w2_scale", 16),
+    ("shared_gate_proj", 16),
+    ("shared_up_proj", 16),
+    ("shared_down_proj", 16),
+    ("collective_buffer", 16),
+    ("output_mailbox", 16),
+    ("scratch", 256),
+)
+_FUSED_W13_BENCHMARK_SCHEMA = (
+    "_kimi_k3_decode_fused_w13_benchmark("
+    "Tensor hidden_states, Tensor router_weight, "
+    "Tensor router_correction_bias, Tensor routed_expert_down_proj, "
+    "Tensor routed_expert_up_proj, Tensor routed_latent_rmsnorm_weight, "
+    "Tensor expert_w13_packed, Tensor expert_w13_scale, "
+    "Tensor expert_w2_packed, Tensor expert_w2_scale, "
+    "Tensor shared_gate_proj, Tensor shared_up_proj, Tensor shared_down_proj, "
+    "Tensor(a!) scratch, "
+    "Tensor(b!) collective_buffer, int[] collective_buffer_ptrs, "
+    "int collective_buffer_multicast_ptr, "
+    "Tensor(c!) output_mailbox, int[] output_mailbox_ptrs, "
+    "int output_mailbox_multicast_ptr, "
+    "Tensor(d!) barrier_buffer, int[] barrier_buffer_ptrs, "
+    "int barrier_buffer_multicast_ptr, Tensor(e!) barrier_target, "
+    "Tensor(f!) error_flag, int tp_rank, int active_tokens, "
+    "int workspace_signature"
+    ") -> ()"
+)
+_DECODE_LIBRARY.define(_FUSED_W13_BENCHMARK_SCHEMA)
+
+
+def _require_fused_w13_benchmark_guard() -> None:
+    if os.environ.get(_FUSED_W13_BENCHMARK_GUARD) != "1":
+        raise RuntimeError(
+            "MoK: fused-W13 decode is a private benchmark-only operator; set "
+            f"{_FUSED_W13_BENCHMARK_GUARD}=1 in a dedicated benchmark process"
+        )
+
+
+@torch.library.impl("mok::_kimi_k3_decode_fused_w13_benchmark", "cuda")
+def _kimi_k3_decode_fused_w13_benchmark_cuda(
+    hidden_states: torch.Tensor,
+    router_weight: torch.Tensor,
+    router_correction_bias: torch.Tensor,
+    routed_expert_down_proj: torch.Tensor,
+    routed_expert_up_proj: torch.Tensor,
+    routed_latent_rmsnorm_weight: torch.Tensor,
+    expert_w13_packed: torch.Tensor,
+    expert_w13_scale: torch.Tensor,
+    expert_w2_packed: torch.Tensor,
+    expert_w2_scale: torch.Tensor,
+    shared_gate_proj: torch.Tensor,
+    shared_up_proj: torch.Tensor,
+    shared_down_proj: torch.Tensor,
+    scratch: torch.Tensor,
+    collective_buffer: torch.Tensor,
+    collective_buffer_ptrs: list[int],
+    collective_buffer_multicast_ptr: int,
+    output_mailbox: torch.Tensor,
+    output_mailbox_ptrs: list[int],
+    output_mailbox_multicast_ptr: int,
+    barrier_buffer: torch.Tensor,
+    barrier_buffer_ptrs: list[int],
+    barrier_buffer_multicast_ptr: int,
+    barrier_target: torch.Tensor,
+    error_flag: torch.Tensor,
+    tp_rank: int,
+    active_tokens: int,
+    workspace_signature: int,
+) -> None:
+    _require_fused_w13_benchmark_guard()
+    _C._kimi_k3_decode_fused_w13_benchmark(
+        hidden_states,
+        router_weight,
+        router_correction_bias,
+        routed_expert_down_proj,
+        routed_expert_up_proj,
+        routed_latent_rmsnorm_weight,
+        expert_w13_packed,
+        expert_w13_scale,
+        expert_w2_packed,
+        expert_w2_scale,
+        shared_gate_proj,
+        shared_up_proj,
+        shared_down_proj,
+        scratch,
+        collective_buffer,
+        collective_buffer_ptrs,
+        collective_buffer_multicast_ptr,
+        output_mailbox,
+        output_mailbox_ptrs,
+        output_mailbox_multicast_ptr,
+        barrier_buffer,
+        barrier_buffer_ptrs,
+        barrier_buffer_multicast_ptr,
+        barrier_target,
+        error_flag,
+        tp_rank,
+        active_tokens,
+        workspace_signature,
+    )
+
+
+def _kimi_k3_decode_fused_w13_benchmark(
+    hidden_states: torch.Tensor,
+    router_weight: torch.Tensor,
+    router_correction_bias: torch.Tensor,
+    routed_expert_down_proj: torch.Tensor,
+    routed_expert_up_proj: torch.Tensor,
+    routed_latent_rmsnorm_weight: torch.Tensor,
+    expert_w13_packed: torch.Tensor,
+    expert_w13_scale: torch.Tensor,
+    expert_w2_packed: torch.Tensor,
+    expert_w2_scale: torch.Tensor,
+    shared_gate_proj: torch.Tensor,
+    shared_up_proj: torch.Tensor,
+    shared_down_proj: torch.Tensor,
+    scratch: torch.Tensor,
+    collective_buffer: torch.Tensor,
+    collective_buffer_ptrs: list[int],
+    collective_buffer_multicast_ptr: int,
+    output_mailbox: torch.Tensor,
+    output_mailbox_ptrs: list[int],
+    output_mailbox_multicast_ptr: int,
+    barrier_buffer: torch.Tensor,
+    barrier_buffer_ptrs: list[int],
+    barrier_buffer_multicast_ptr: int,
+    barrier_target: torch.Tensor,
+    error_flag: torch.Tensor,
+    tp_rank: int,
+    active_tokens: int,
+    workspace_signature: int,
+) -> None:
+    """Dispatch the isolated full-step fused-W13 benchmark candidate."""
+    _require_fused_w13_benchmark_guard()
+    arguments = locals()
+    for field, alignment in _FUSED_W13_BENCHMARK_ALIGNMENT:
+        if is_fake(arguments[field]):
+            continue
+        past = arguments[field].data_ptr() % alignment
+        if past:
+            raise RuntimeError(
+                "MoK: _kimi_k3_decode_fused_w13_benchmark requires "
+                f"{field} aligned to {alignment} bytes, got a pointer "
+                f"{past} bytes past one"
+            )
+    _check_k3_symmetric_pointers(
+        "_kimi_k3_decode_fused_w13_benchmark",
+        arguments,
+    )
+    torch.ops.mok._kimi_k3_decode_fused_w13_benchmark(
+        hidden_states,
+        router_weight,
+        router_correction_bias,
+        routed_expert_down_proj,
+        routed_expert_up_proj,
+        routed_latent_rmsnorm_weight,
+        expert_w13_packed,
+        expert_w13_scale,
         expert_w2_packed,
         expert_w2_scale,
         shared_gate_proj,

@@ -55,10 +55,12 @@ ROUTED_EXPERTS_SYMBOL = "kimi_k3_routed_experts_kernel"
 # pressure, not a claim that 48 is acceptable.
 PRIVATE_ROUTED_STACK_CEILING = 48
 
-# Itanium mangling spells the two ``bool TENSOR_PATH`` instantiations out, so
-# the core and tcgen05 builds of the production template can be told apart.
-PRODUCTION_CORE_MANGLING = "ILb0EE"
-PRODUCTION_TENSOR_MANGLING = "ILb1EE"
+# Itanium mangling spells ``TENSOR_PATH`` and the private ``FUSED_W13``
+# benchmark flag out in order. Production is the pair whose second flag is
+# false; the private pair remains visible to the benchmark without being
+# mistaken for a public kernel here.
+PRODUCTION_CORE_MANGLING = "ILb0ELb0EE"
+PRODUCTION_TENSOR_MANGLING = "ILb1ELb0EE"
 
 # Blackwell SASS, from the SM103 build. ``UTCQMMA`` is the native mixed
 # MXFP4-by-MXFP8 tcgen05 contraction, ``UTCHMMA`` its BF16 sibling, ``LDGMC``
@@ -143,7 +145,13 @@ def _mnemonics(path: Path, mangled: str) -> frozenset[str]:
 def persistent_symbols(extension_path: Path) -> dict[str, str]:
     """The two persistent instantiations, keyed by which capacity path they are."""
     usage = _resource_usage(extension_path)
-    found = [name for name in usage if PERSISTENT_SYMBOL in name]
+    all_persistent = [
+        name for name in usage if PERSISTENT_SYMBOL in name
+    ]
+    assert len(all_persistent) == 4, all_persistent
+    found = [
+        name for name in all_persistent if "ELb0EE" in name
+    ]
     assert len(found) == 2, found
     symbols = {
         "core": next(
