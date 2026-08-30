@@ -905,11 +905,65 @@ def run_focused(*, tokens: int, variant: str) -> dict[str, Any]:
         raise ValueError(
             "focused variant must be setup, baseline, candidate, or both"
         )
+    # region agent log
+    _debug_log(
+        "A",
+        "benchmarks/kimi_k3_tail_m128n_probe.py:run_focused",
+        "focused probe entry before distributed initialization",
+        {
+            "tokens": tokens,
+            "variant": variant,
+            "rank": os.environ.get("RANK"),
+            "world_size": os.environ.get("WORLD_SIZE"),
+            "local_rank": os.environ.get("LOCAL_RANK"),
+        },
+    )
+    # endregion
     rank, device = _init_distributed()
+    # region agent log
+    _debug_log(
+        "B",
+        "benchmarks/kimi_k3_tail_m128n_probe.py:run_focused",
+        "before full TP8 context and symmetric workspace allocation",
+        {"rank": rank, "device": str(device)},
+    )
+    # endregion
     base_weights, router, workspace = _build_context(device, rank)
+    # region agent log
+    _debug_log(
+        "C",
+        "benchmarks/kimi_k3_tail_m128n_probe.py:run_focused",
+        "full TP8 context allocation completed",
+        {
+            "rank": rank,
+            "collective_multicast_positive": (
+                workspace.collective_multicast_ptr > 0
+            ),
+            "mailbox_multicast_positive": (
+                workspace.output_mailbox_multicast_ptr > 0
+            ),
+            "barrier_multicast_positive": (
+                workspace.barrier_multicast_ptr > 0
+            ),
+        },
+    )
+    # endregion
     entry = _build_entry(base_weights, router, device, tokens)
     _seed_tail(workspace, entry)
     torch.cuda.synchronize(device)
+    # region agent log
+    _debug_log(
+        "D",
+        "benchmarks/kimi_k3_tail_m128n_probe.py:run_focused",
+        "tail seed completed before focused variant launch",
+        {
+            "rank": rank,
+            "tokens": tokens,
+            "variant": variant,
+            "candidate_plan": candidate_plan(tokens),
+        },
+    )
+    # endregion
     result: dict[str, Any] = {
         "tokens": tokens,
         "variant": variant,
@@ -930,6 +984,22 @@ def run_focused(*, tokens: int, variant: str) -> dict[str, Any]:
         result["checksum"] = float(
             _output(workspace, tokens).float().sum()
         )
+    # region agent log
+    _debug_log(
+        "E",
+        "benchmarks/kimi_k3_tail_m128n_probe.py:run_focused",
+        "focused variant completed",
+        {
+            "rank": rank,
+            "variant": variant,
+            "launch_synchronized": result.get(
+                "launch_synchronized", False
+            ),
+            "finite": result.get("finite"),
+            "error_flag": int(workspace.error_flag.item()),
+        },
+    )
+    # endregion
     _barrier(device)
     dist.destroy_process_group()
     return result
