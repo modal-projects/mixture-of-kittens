@@ -391,6 +391,7 @@ def bench_kimi_k3_projection_first_ab(
         output_dir = Path(directory) / "artifacts"
         debug_log = Path("/opt") / "cursor" / "logs" / "debug.log"
         debug_log.parent.mkdir(parents=True, exist_ok=True)
+        debug_log.unlink(missing_ok=True)
         _run_kimi_k3_torchrun(
             [
                 "-m",
@@ -451,6 +452,9 @@ def projection_first_ab(
     (destination / "artifacts.tar").write_bytes(archive)
     with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
         bundle.extractall(destination, filter="data")
+    debug_log = Path("/opt") / "cursor" / "logs" / "debug.log"
+    debug_log.parent.mkdir(parents=True, exist_ok=True)
+    debug_log.write_bytes((destination / "debug.ndjson").read_bytes())
     print(
         "projection-first A/B artifacts: "
         f"{sorted(path.name for path in destination.iterdir())}"
