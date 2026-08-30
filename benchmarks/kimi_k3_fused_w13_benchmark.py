@@ -254,15 +254,6 @@ def run(
                 raise AssertionError(
                     f"fused-W13 full step differs at M={tokens}: {parity}"
                 )
-            # region agent log
-            runtime._agent_debug_log_once(
-                f"fused-w13-parity-{tokens}",
-                hypothesis_id="C",
-                location="benchmarks/kimi_k3_fused_w13_benchmark.py:run",
-                message="fused W13 candidate full-step parity",
-                data={"tokens": tokens, **parity},
-            )
-            # endregion
 
             profiles = {
                 variant: _phase_cycles(
@@ -329,19 +320,6 @@ def run(
                 measurements["production"],
                 measurements["fused_w13"],
             )
-            # region agent log
-            runtime._agent_debug_log_once(
-                f"fused-w13-timing-{tokens}",
-                hypothesis_id="A,B,E",
-                location="benchmarks/kimi_k3_fused_w13_benchmark.py:run",
-                message="fused W13 full-step timing verdict",
-                data={
-                    "tokens": tokens,
-                    "phase_cycles": profiles,
-                    **verdict,
-                },
-            )
-            # endregion
             rows.append(
                 {
                     "tokens": tokens,

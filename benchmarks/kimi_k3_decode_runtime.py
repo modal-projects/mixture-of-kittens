@@ -6,7 +6,6 @@ import contextlib
 import json
 import os
 import tempfile
-import time
 from collections.abc import Callable, Iterator
 
 import torch
@@ -33,31 +32,6 @@ GROUP = 32
 UNIT_SCALE = 0x7F
 DEQUANT_CHUNK = 16
 CONFIG = KimiK3DecodeConfig()
-_AGENT_DEBUG_LOGGED: set[str] = set()
-
-
-def _agent_debug_log_once(
-    key: str,
-    *,
-    hypothesis_id: str,
-    location: str,
-    message: str,
-    data: dict[str, object],
-) -> None:
-    if os.environ.get("MOK_KIMI_K3_DEBUG_LOG") != "1":
-        return
-    if key in _AGENT_DEBUG_LOGGED:
-        return
-    _AGENT_DEBUG_LOGGED.add(key)
-    payload = {
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": time.time_ns() // 1_000_000,
-    }
-    with open("/opt/cursor/logs/debug.log", "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
 def decode_device_step(
@@ -76,39 +50,6 @@ def decode_fused_w13_benchmark_device_step(
     hidden: torch.Tensor,
 ) -> torch.Tensor:
     """Run the guarded private fused-W13 candidate through the full step."""
-    # region agent log
-    _agent_debug_log_once(
-        "fused-w13-entry",
-        hypothesis_id="A,C",
-        location="benchmarks/kimi_k3_decode_runtime.py:decode_fused_w13_benchmark_device_step",
-        message="fused W13 candidate input layout",
-        data={
-            "active_tokens": hidden.shape[0],
-            "packed_shape": list(expert_w13_packed.shape),
-            "packed_stride": list(expert_w13_packed.stride()),
-            "scale_shape": list(expert_w13_scale.shape),
-            "scale_stride": list(expert_w13_scale.stride()),
-        },
-    )
-    # endregion
-    # region agent log
-    _agent_debug_log_once(
-        "fused-w13-dispatch",
-        hypothesis_id="D",
-        location="benchmarks/kimi_k3_decode_runtime.py:decode_fused_w13_benchmark_device_step",
-        message="dispatching private guarded fused W13 operator",
-        data={
-            "guard_enabled": (
-                os.environ.get(
-                    "MOK_KIMI_K3_ENABLE_FUSED_W13_BENCHMARK"
-                )
-                == "1"
-            ),
-            "tp_rank": workspace.tp_rank,
-            "weights_tp_rank": weights.tp_rank,
-        },
-    )
-    # endregion
     ops._kimi_k3_decode_fused_w13_benchmark(
         hidden,
         weights.router_weight,
@@ -143,18 +84,6 @@ def decode_fused_w13_benchmark_device_step(
     output = workspace.output_mailbox.view(
         tokens, ranks * shard_columns
     )[: hidden.shape[0]]
-    # region agent log
-    _agent_debug_log_once(
-        "fused-w13-exit",
-        hypothesis_id="C",
-        location="benchmarks/kimi_k3_decode_runtime.py:decode_fused_w13_benchmark_device_step",
-        message="private fused W13 operator returned mailbox view",
-        data={
-            "output_shape": list(output.shape),
-            "output_dtype": str(output.dtype),
-        },
-    )
-    # endregion
     return output
 
 

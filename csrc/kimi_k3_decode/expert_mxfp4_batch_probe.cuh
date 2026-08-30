@@ -590,7 +590,7 @@ void expert_probe_kernel(
                 expert_w3_packed, expert_w3_scale, scratch, expert, 0, rows,
                 output_tile);
         } else {
-            routed_gate_up_unit<false>(
+            routed_gate_up_unit(
                 shared_raw, tensor_pool, expert_w1_packed, expert_w1_scale,
                 expert_w3_packed, expert_w3_scale, scratch, expert, 0, rows,
                 output_tile, PhaseClocks{nullptr});

@@ -597,12 +597,21 @@ void kimi_k3_decode_persistent_kernel(
                 const int expert = scratch.unit_expert[
                     unit / routed_units_per_expert];
                 const int begin = scratch.expert_offsets[expert];
-                expert_mxfp4::routed_gate_up_unit<FUSED_W13>(
-                    shared_raw, tensor_pool, expert_w1_packed,
-                    expert_w1_scale, expert_w3_packed, expert_w3_scale,
-                    scratch, expert, begin,
-                    scratch.expert_offsets[expert + 1] - begin,
-                    unit % routed_units_per_expert, clocks);
+                if constexpr (FUSED_W13) {
+                    expert_mxfp4::routed_gate_up_unit<true>(
+                        shared_raw, tensor_pool, expert_w1_packed,
+                        expert_w1_scale, expert_w3_packed, expert_w3_scale,
+                        scratch, expert, begin,
+                        scratch.expert_offsets[expert + 1] - begin,
+                        unit % routed_units_per_expert, clocks);
+                } else {
+                    expert_mxfp4::routed_gate_up_unit(
+                        shared_raw, tensor_pool, expert_w1_packed,
+                        expert_w1_scale, expert_w3_packed, expert_w3_scale,
+                        scratch, expert, begin,
+                        scratch.expert_offsets[expert + 1] - begin,
+                        unit % routed_units_per_expert, clocks);
+                }
                 __syncthreads();
                 publish_count_at(&scratch.expert_counts[expert]);
                 mark = clocks.lap(kClockRoutedGateUp, mark);
@@ -1015,10 +1024,10 @@ static __host__ TensorLayouts tensor_layouts(
 /// Run one whole TP8 Kimi K3 decode step in one persistent launch.
 static __host__ void launch_decode(const LaunchArguments &arguments) {
     if (capacity_bucket(arguments.active_tokens) <= kMaxCoreCapacity) {
-        launch_persistent<false, false>(arguments, NoTensorLayouts{});
+        launch_persistent<false>(arguments, NoTensorLayouts{});
         return;
     }
-    launch_persistent<true, false>(arguments, tensor_layouts(arguments));
+    launch_persistent<true>(arguments, tensor_layouts(arguments));
 }
 
 /// PRIVATE BENCHMARK-ONLY: run the production scheduler and fused TP8 tail

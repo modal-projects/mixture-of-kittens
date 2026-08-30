@@ -405,16 +405,12 @@ def bench_kimi_k3_fused_w13(
             timeout=21_300,
             environment={
                 "MOK_GIT_SHA": git_sha,
-                "MOK_KIMI_K3_DEBUG_LOG": "1",
                 "MOK_KIMI_K3_ENABLE_FUSED_W13_BENCHMARK": "1",
             },
         )
         result = output.read_text(encoding="utf-8")
         print(result)
-        debug_log = Path("/opt/cursor/logs/debug.log")
-        if not debug_log.is_file():
-            raise RuntimeError("fused-W13 reproduction produced no debug log")
-        return debug_log.read_bytes()
+        return result.encode("utf-8")
 
 
 @app.function(image=B300_IMAGE, gpu="B300", timeout=7_200)
