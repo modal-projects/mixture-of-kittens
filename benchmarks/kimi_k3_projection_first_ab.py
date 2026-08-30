@@ -355,7 +355,7 @@ def _check_bitwise_parity(
         # endregion
         checks.append(
             {
-                "pool_index": entry.pool_index,
+                "pool_index": enumerated_pool_index,
                 "bitwise_ab": True,
                 "relative_l1": relative_l1,
                 "cosine_similarity": cosine,
