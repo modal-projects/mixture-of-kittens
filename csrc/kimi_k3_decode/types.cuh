@@ -21,9 +21,10 @@ inline constexpr float kRoutedAccumulatorScaleInverse = 0x1p-24f;
 static_assert(
     kRoutedAccumulatorScale * kRoutedAccumulatorScaleInverse == 1.0f);
 
-// The counters occupy one 256-byte scratch region either way, so the persistent
-// kernel's own slots come out of headroom that was already reserved.
-static constexpr int NUM_PHASE_COUNTERS = 64;
+// Dedicated benchmark barrier clocks temporarily extend this region to two
+// 256-byte bands. They are removed before a scheduling winner reaches
+// production.
+static constexpr int NUM_PHASE_COUNTERS = 80;
 static constexpr int SCRATCH_ALIGNMENT = 256;
 
 // Hidden states and both projection weights are read through 16-byte vector loads
@@ -135,20 +136,20 @@ inline constexpr int kRouterScoreBytes =
 static constexpr int SCRATCH_BYTES =
     kRouterScoreBytes + scratch_region_bytes(kMaxTokens * kNumExperts);
 
-static_assert(kLatentMxfp8Bytes == 40448);
-static_assert(kLatentScaleBytes == 499200);
-static_assert(kSituMxfp8Bytes == 513536);
-static_assert(kSituScaleBytes == 1299968);
-static_assert(kRoutedAccumulatorBytes == 1324544);
-static_assert(kSharedGateBytes == 4994560);
-static_assert(kSharedUpBytes == 5191168);
-static_assert(kSharedActivatedBytes == 5387776);
-static_assert(kTailNormalizedBytes == 5584384);
-static_assert(kTailSharedShardBytes == 6501888);
-static_assert(kLatentXBytes == 6731264);
-static_assert(kUnitExpertBytes == 7648768);
-static_assert(kRouterScoreBytes == 7652352);
-static_assert(SCRATCH_BYTES == 8111104);
+static_assert(kLatentMxfp8Bytes == 40704);
+static_assert(kLatentScaleBytes == 499456);
+static_assert(kSituMxfp8Bytes == 513792);
+static_assert(kSituScaleBytes == 1300224);
+static_assert(kRoutedAccumulatorBytes == 1324800);
+static_assert(kSharedGateBytes == 4994816);
+static_assert(kSharedUpBytes == 5191424);
+static_assert(kSharedActivatedBytes == 5388032);
+static_assert(kTailNormalizedBytes == 5584640);
+static_assert(kTailSharedShardBytes == 6502144);
+static_assert(kLatentXBytes == 6731520);
+static_assert(kUnitExpertBytes == 7649024);
+static_assert(kRouterScoreBytes == 7652608);
+static_assert(SCRATCH_BYTES == 8111360);
 
 // Generation-tagged completion counters. Each role's last CTA clears its arrival
 // counter and bumps its generation, so a reused workspace never needs a host reset.
@@ -235,7 +236,13 @@ enum PhaseClock : int {
     kClockRoutedDownStage,
     kClockRoutedDownMma,
     kClockSharedExperts,
-    kClockGridBarrier,
+    kClockProfileClearBarrier,
+    kClockClearBarrier,
+    kClockRouteLatentBarrier,
+    kClockRouteLatentMakespan,
+    kClockAssignmentQuantizeBarrier,
+    kClockDownBarrier,
+    kClockPublishBarrier,
     kClockTail,
     kPhaseClockCount,
 };
@@ -244,7 +251,7 @@ enum PhaseClock : int {
 inline constexpr int kPhaseClockBegin =
     NUM_PHASE_COUNTERS - 2 * kPhaseClockCount;
 
-static_assert(kPhaseClockBegin == 36);
+static_assert(kPhaseClockBegin == 40);
 static_assert(kPhaseClockBegin % 2 == 0,
               "a 64-bit accumulator must start on an aligned slot pair");
 static_assert(kPhaseClockBegin > kGateUpArrivals,
@@ -264,7 +271,13 @@ inline constexpr const char *kPhaseClockNames[] = {
     "routed_down_stage",
     "routed_down_mma",
     "shared_experts",
-    "grid_barrier",
+    "profile_clear_barrier",
+    "clear_barrier",
+    "route_latent_barrier",
+    "route_latent_makespan",
+    "assignment_quantize_barrier",
+    "down_barrier",
+    "publish_barrier",
     "tail",
 };
 
@@ -424,6 +437,18 @@ struct PhaseClocks {
             static_cast<unsigned long long>(clock64());
         add(index, current - started);
         return current;
+    }
+
+    /// Keep the longest CTA interval observed for one profiled region.
+    __device__ __forceinline__ void maximum(
+        const int index,
+        const unsigned long long started
+    ) const {
+        if (counters != nullptr && threadIdx.x == 0) {
+            atomicMax(
+                &counters[index],
+                static_cast<unsigned long long>(clock64()) - started);
+        }
     }
 };
 

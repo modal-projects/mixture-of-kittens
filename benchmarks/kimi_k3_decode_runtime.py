@@ -95,6 +95,22 @@ def phase_clock_cycles(
     return dict(zip(names, counters, strict=True))
 
 
+@contextlib.contextmanager
+def projection_first_scheduling(enabled: bool) -> Iterator[None]:
+    """Select one guarded route/latent order for graph capture."""
+    previous_guard = os.environ.get("MOK_KIMI_K3_ENABLE_GRID_TUNING")
+    os.environ["MOK_KIMI_K3_ENABLE_GRID_TUNING"] = "1"
+    _C._kimi_k3_decode_set_projection_first(enabled)
+    try:
+        yield
+    finally:
+        _C._kimi_k3_decode_set_projection_first(False)
+        if previous_guard is None:
+            os.environ.pop("MOK_KIMI_K3_ENABLE_GRID_TUNING", None)
+        else:
+            os.environ["MOK_KIMI_K3_ENABLE_GRID_TUNING"] = previous_guard
+
+
 def _e8m0_scale_bytes(absolute_max: torch.Tensor) -> torch.Tensor:
     mantissa, exponent = torch.frexp(absolute_max.float())
     scale_exponent = torch.where(mantissa <= 0.875, exponent - 9, exponent - 8)

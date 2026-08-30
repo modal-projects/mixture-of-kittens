@@ -53,7 +53,9 @@ def test_candidate_issues_projection_and_shared_work_before_scores() -> None:
 
     assert "projection_first ? projection_units + shared_units : 0" in route
     assert "projection_first ? shared_units : 0" in route
-    assert route.index("projection_unit") < route.index("score_unit")
+    assert route.index("const int projection_unit") < route.index(
+        "const int score_unit ="
+    )
     assert "const int shared_units = projection_first ? 0" in gate_up
     assert route.count("shared_experts::project_tensor(") == 1
     assert gate_up.count("shared_experts::project_tensor(") == 1
