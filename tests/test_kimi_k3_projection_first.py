@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+from dataclasses import dataclass
 import importlib
 from pathlib import Path
 
 import pytest
+import torch
 
 
 ROOT = Path(__file__).parents[1]
@@ -26,6 +29,48 @@ def _function_body(text: str, signature: str) -> str:
             if depth == 0:
                 return text[start : offset + 1]
     raise AssertionError(f"{signature} is never closed")
+
+
+@dataclass(frozen=True, slots=True)
+class _CpuRoutedInput:
+    hidden: torch.Tensor
+    weights: object
+    route_assignments: tuple[tuple[int, ...], ...]
+    distinct_experts: tuple[int, ...]
+
+
+class _CpuRuntime:
+    def projection_first_scheduling(self, enabled: bool) -> nullcontext[None]:
+        assert isinstance(enabled, bool)
+        return nullcontext()
+
+    def decode_step(
+        self,
+        workspace: object,
+        weights: object,
+        hidden: torch.Tensor,
+    ) -> torch.Tensor:
+        del workspace, weights
+        return hidden.clone()
+
+    def decode_reference(
+        self,
+        hidden: torch.Tensor,
+        weights: object,
+    ) -> torch.Tensor:
+        del weights
+        return hidden.clone()
+
+    def assert_decode_close(
+        self,
+        actual: torch.Tensor,
+        expected: torch.Tensor,
+    ) -> tuple[float, float, float]:
+        assert torch.equal(actual, expected)
+        return 0.0, 1.0, 0.0
+
+    def assert_identical_across_ranks(self, actual: torch.Tensor) -> None:
+        assert actual.device.type == "cpu"
 
 
 def test_projection_first_is_a_guarded_runtime_order_not_a_second_kernel() -> None:
@@ -95,6 +140,40 @@ def test_ab_orders_alternate_to_balance_temporal_drift() -> None:
         ("projection_first", "score_first"),
         ("score_first", "projection_first"),
     ]
+
+
+def test_bitwise_parity_carries_enumerated_pool_index_on_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = importlib.import_module(
+        "benchmarks.kimi_k3_projection_first_ab"
+    )
+    pool = [
+        _CpuRoutedInput(
+            hidden=torch.tensor([float(pool_index)]),
+            weights=object(),
+            route_assignments=((pool_index,),),
+            distinct_experts=(pool_index,),
+        )
+        for pool_index in range(2)
+    ]
+    monkeypatch.setattr(probe.torch.cuda, "synchronize", lambda device: None)
+
+    rows = probe._check_bitwise_parity(
+        object(),
+        pool,
+        runtime=_CpuRuntime(),
+        device=torch.device("cpu"),
+    )
+
+    assert [row["pool_index"] for row in rows] == [0, 1]
+    parity_source = _source(
+        "benchmarks/kimi_k3_projection_first_ab.py"
+    ).split("def _write_json", 1)[0].rsplit(
+        "def _check_bitwise_parity", 1
+    )[1]
+    assert "enumerate(pool)" in parity_source
+    assert '"pool_index": entry.pool_index' not in parity_source
 
 
 def test_material_gain_requires_effect_band_and_no_p99_regression() -> None:
