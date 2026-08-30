@@ -16,8 +16,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
 #include <mutex>
 #include <tuple>
 #include <vector>
@@ -730,7 +728,7 @@ static __host__ void kimi_k3_tail_entrypoint(
 /// spelled out above `kimi_k3_tail_entrypoint`: the cross-rank rendezvous is
 /// driven by one coordinator thread whose arrival does not depend on the count,
 /// so a divergent count returns mixed-generation rows rather than deadlocking.
-static __host__ void kimi_k3_decode_entrypoint_impl(
+static __host__ void kimi_k3_decode_entrypoint(
     const at::Tensor &hidden_states,
     const at::Tensor &router_weight,
     const at::Tensor &router_correction_bias,
@@ -760,11 +758,9 @@ static __host__ void kimi_k3_decode_entrypoint_impl(
     const at::Tensor &error_flag,
     std::int64_t tp_rank,
     std::int64_t active_tokens,
-    std::int64_t workspace_signature_value,
-    const bool fused_w13,
-    const char *const operation
+    std::int64_t workspace_signature_value
 ) {
-    const char *const kOperation = operation;
+    constexpr const char *kOperation = "kimi_k3_decode";
     constexpr int shard_columns = kHiddenSize / kTensorParallelSize;
     constexpr int collective_columns = kLatentSize + kHiddenSize;
     constexpr int shared_intermediate =
@@ -863,39 +859,25 @@ static __host__ void kimi_k3_decode_entrypoint_impl(
                 "MoK: kimi_k3_decode requires a float32 "
                 "router_correction_bias [", kNumExperts, "]");
 
-    const auto check_expert = [kOperation](const at::Tensor &tensor,
-                                          const char *name,
-                                          const int rows,
-                                          const int columns) {
+    const auto check_expert = [](const at::Tensor &tensor,
+                                 const char *name,
+                                 const int rows,
+                                 const int columns) {
         TORCH_CHECK(tensor.dim() == 3 && tensor.size(0) == kNumExperts
                         && tensor.size(1) == rows
                         && tensor.size(2) == columns
                         && tensor.scalar_type() == at::kByte,
-                    "MoK: ", kOperation, " requires uint8 ", name, " [",
+                    "MoK: kimi_k3_decode requires uint8 ", name, " [",
                     kNumExperts, ", ", rows, ", ", columns, "]");
     };
-    if (fused_w13) {
-        check_expert(expert_w1_packed, "expert_w13_packed",
-                     2 * kExpertW1W3PackedRows,
-                     kExpertW1W3PackedColumns);
-        check_expert(expert_w1_scale, "expert_w13_scale",
-                     2 * kExpertW1W3PackedRows,
-                     kExpertW1W3ScaleColumns);
-        TORCH_CHECK(
-            expert_w1_packed.data_ptr() == expert_w3_packed.data_ptr()
-                && expert_w1_scale.data_ptr() == expert_w3_scale.data_ptr(),
-            "MoK: ", kOperation,
-            " requires the fused W13 tensors to back both internal halves");
-    } else {
-        check_expert(expert_w1_packed, "expert_w1_packed",
-                     kExpertW1W3PackedRows, kExpertW1W3PackedColumns);
-        check_expert(expert_w1_scale, "expert_w1_scale",
-                     kExpertW1W3PackedRows, kExpertW1W3ScaleColumns);
-        check_expert(expert_w3_packed, "expert_w3_packed",
-                     kExpertW1W3PackedRows, kExpertW1W3PackedColumns);
-        check_expert(expert_w3_scale, "expert_w3_scale",
-                     kExpertW1W3PackedRows, kExpertW1W3ScaleColumns);
-    }
+    check_expert(expert_w1_packed, "expert_w1_packed", kExpertW1W3PackedRows,
+                 kExpertW1W3PackedColumns);
+    check_expert(expert_w1_scale, "expert_w1_scale", kExpertW1W3PackedRows,
+                 kExpertW1W3ScaleColumns);
+    check_expert(expert_w3_packed, "expert_w3_packed", kExpertW1W3PackedRows,
+                 kExpertW1W3PackedColumns);
+    check_expert(expert_w3_scale, "expert_w3_scale", kExpertW1W3PackedRows,
+                 kExpertW1W3ScaleColumns);
     check_expert(expert_w2_packed, "expert_w2_packed", kExpertW2PackedRows,
                  kExpertW2PackedColumns);
     check_expert(expert_w2_scale, "expert_w2_scale", kExpertW2PackedRows,
@@ -969,7 +951,7 @@ static __host__ void kimi_k3_decode_entrypoint_impl(
     // The step must run on the tensors' own device and that device's current
     // stream, whatever device happens to be current on entry.
     const c10::cuda::CUDAGuard device_guard(device);
-    const persistent::LaunchArguments arguments{
+    persistent::launch_decode(persistent::LaunchArguments{
         hidden_states,
         router_weight,
         router_correction_bias,
@@ -998,113 +980,7 @@ static __host__ void kimi_k3_decode_entrypoint_impl(
         properties.multiProcessorCount,
         static_cast<int>(persistent::benchmark_grid_ctas_for_testing()),
         persistent::benchmark_phase_profile_enabled() ? 1 : 0,
-    };
-    if (fused_w13) {
-        persistent::launch_decode_fused_w13_benchmark(arguments);
-    } else {
-        persistent::launch_decode(arguments);
-    }
-}
-
-static __host__ void kimi_k3_decode_entrypoint(
-    const at::Tensor &hidden_states,
-    const at::Tensor &router_weight,
-    const at::Tensor &router_correction_bias,
-    const at::Tensor &routed_expert_down_proj,
-    const at::Tensor &routed_expert_up_proj,
-    const at::Tensor &routed_latent_rmsnorm_weight,
-    const at::Tensor &expert_w1_packed,
-    const at::Tensor &expert_w1_scale,
-    const at::Tensor &expert_w3_packed,
-    const at::Tensor &expert_w3_scale,
-    const at::Tensor &expert_w2_packed,
-    const at::Tensor &expert_w2_scale,
-    const at::Tensor &shared_gate_proj,
-    const at::Tensor &shared_up_proj,
-    const at::Tensor &shared_down_proj,
-    const at::Tensor &scratch,
-    const at::Tensor &collective_buffer,
-    const std::vector<std::int64_t> &collective_buffer_ptrs,
-    std::int64_t collective_buffer_multicast_ptr,
-    const at::Tensor &output_mailbox,
-    const std::vector<std::int64_t> &output_mailbox_ptrs,
-    std::int64_t output_mailbox_multicast_ptr,
-    const at::Tensor &barrier_buffer,
-    const std::vector<std::int64_t> &barrier_buffer_ptrs,
-    std::int64_t barrier_buffer_multicast_ptr,
-    const at::Tensor &barrier_target,
-    const at::Tensor &error_flag,
-    std::int64_t tp_rank,
-    std::int64_t active_tokens,
-    std::int64_t workspace_signature_value
-) {
-    kimi_k3_decode_entrypoint_impl(
-        hidden_states, router_weight, router_correction_bias,
-        routed_expert_down_proj, routed_expert_up_proj,
-        routed_latent_rmsnorm_weight, expert_w1_packed, expert_w1_scale,
-        expert_w3_packed, expert_w3_scale, expert_w2_packed, expert_w2_scale,
-        shared_gate_proj, shared_up_proj, shared_down_proj, scratch,
-        collective_buffer, collective_buffer_ptrs,
-        collective_buffer_multicast_ptr, output_mailbox, output_mailbox_ptrs,
-        output_mailbox_multicast_ptr, barrier_buffer, barrier_buffer_ptrs,
-        barrier_buffer_multicast_ptr, barrier_target, error_flag, tp_rank,
-        active_tokens, workspace_signature_value, false, "kimi_k3_decode");
-}
-
-inline constexpr const char *kFusedW13BenchmarkGuard =
-    "MOK_KIMI_K3_ENABLE_FUSED_W13_BENCHMARK";
-
-/// PRIVATE BENCHMARK-ONLY: accept the serving adapters' transformed
-/// [896, 768, K] W13 payload while reusing the production scheduler and tail.
-/// This is deliberately absent from mok.kimi_k3 and cannot launch without the
-/// dedicated process guard, even when a caller bypasses the Python dispatcher.
-static __host__ void kimi_k3_decode_fused_w13_benchmark_entrypoint(
-    const at::Tensor &hidden_states,
-    const at::Tensor &router_weight,
-    const at::Tensor &router_correction_bias,
-    const at::Tensor &routed_expert_down_proj,
-    const at::Tensor &routed_expert_up_proj,
-    const at::Tensor &routed_latent_rmsnorm_weight,
-    const at::Tensor &expert_w13_packed,
-    const at::Tensor &expert_w13_scale,
-    const at::Tensor &expert_w2_packed,
-    const at::Tensor &expert_w2_scale,
-    const at::Tensor &shared_gate_proj,
-    const at::Tensor &shared_up_proj,
-    const at::Tensor &shared_down_proj,
-    const at::Tensor &scratch,
-    const at::Tensor &collective_buffer,
-    const std::vector<std::int64_t> &collective_buffer_ptrs,
-    std::int64_t collective_buffer_multicast_ptr,
-    const at::Tensor &output_mailbox,
-    const std::vector<std::int64_t> &output_mailbox_ptrs,
-    std::int64_t output_mailbox_multicast_ptr,
-    const at::Tensor &barrier_buffer,
-    const std::vector<std::int64_t> &barrier_buffer_ptrs,
-    std::int64_t barrier_buffer_multicast_ptr,
-    const at::Tensor &barrier_target,
-    const at::Tensor &error_flag,
-    std::int64_t tp_rank,
-    std::int64_t active_tokens,
-    std::int64_t workspace_signature_value
-) {
-    const char *const enabled = std::getenv(kFusedW13BenchmarkGuard);
-    TORCH_CHECK(
-        enabled != nullptr && std::strcmp(enabled, "1") == 0,
-        "MoK: fused-W13 decode is a private benchmark-only entrypoint; set ",
-        kFusedW13BenchmarkGuard, "=1 in a dedicated benchmark process");
-    kimi_k3_decode_entrypoint_impl(
-        hidden_states, router_weight, router_correction_bias,
-        routed_expert_down_proj, routed_expert_up_proj,
-        routed_latent_rmsnorm_weight, expert_w13_packed, expert_w13_scale,
-        expert_w13_packed, expert_w13_scale, expert_w2_packed, expert_w2_scale,
-        shared_gate_proj, shared_up_proj, shared_down_proj, scratch,
-        collective_buffer, collective_buffer_ptrs,
-        collective_buffer_multicast_ptr, output_mailbox, output_mailbox_ptrs,
-        output_mailbox_multicast_ptr, barrier_buffer, barrier_buffer_ptrs,
-        barrier_buffer_multicast_ptr, barrier_target, error_flag, tp_rank,
-        active_tokens, workspace_signature_value, true,
-        "_kimi_k3_decode_fused_w13_benchmark");
+    });
 }
 
 }  // namespace kimi_k3_decode

@@ -11,7 +11,7 @@ from collections.abc import Callable, Iterator
 import torch
 import torch.distributed as dist
 
-from mok import _C, ops
+from mok import _C
 from mok.kimi_k3 import (
     KIMI_K3_LATENT_SIZE,
     KIMI_K3_ROUTED_INTERMEDIATE_SIZE,
@@ -40,51 +40,6 @@ def decode_device_step(
     hidden: torch.Tensor,
 ) -> torch.Tensor:
     return kimi_k3_decode(CONFIG, workspace, weights, hidden)
-
-
-def decode_fused_w13_benchmark_device_step(
-    workspace: KimiK3DecodeWorkspace,
-    weights: KimiK3DecodeWeights,
-    expert_w13_packed: torch.Tensor,
-    expert_w13_scale: torch.Tensor,
-    hidden: torch.Tensor,
-) -> torch.Tensor:
-    """Run the guarded private fused-W13 candidate through the full step."""
-    ops._kimi_k3_decode_fused_w13_benchmark(
-        hidden,
-        weights.router_weight,
-        weights.router_correction_bias,
-        weights.routed_expert_down_proj,
-        weights.routed_expert_up_proj,
-        weights.routed_latent_rmsnorm_weight,
-        expert_w13_packed,
-        expert_w13_scale,
-        weights.expert_w2_packed,
-        weights.expert_w2_scale,
-        weights.shared_gate_proj,
-        weights.shared_up_proj,
-        weights.shared_down_proj,
-        workspace.scratch,
-        workspace.collective_buffer,
-        workspace.collective_ptrs,
-        workspace.collective_multicast_ptr,
-        workspace.output_mailbox,
-        workspace.output_mailbox_ptrs,
-        workspace.output_mailbox_multicast_ptr,
-        workspace.barrier_buffer,
-        workspace.barrier_ptrs,
-        workspace.barrier_multicast_ptr,
-        workspace.barrier_target,
-        workspace.error_flag,
-        workspace.tp_rank,
-        hidden.shape[0],
-        workspace.workspace_signature,
-    )
-    tokens, ranks, shard_columns = workspace.output_mailbox.shape
-    output = workspace.output_mailbox.view(
-        tokens, ranks * shard_columns
-    )[: hidden.shape[0]]
-    return output
 
 
 def check_decode_error(workspace: KimiK3DecodeWorkspace) -> None:
@@ -393,7 +348,6 @@ __all__ = [
     "check_decode_error",
     "decode_reference",
     "decode_device_step",
-    "decode_fused_w13_benchmark_device_step",
     "decode_step",
     "profiled_kernel_names",
     "recorded_allocator_events",

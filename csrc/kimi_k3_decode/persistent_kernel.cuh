@@ -351,7 +351,7 @@ using layouts_t = std::conditional_t<TENSOR_PATH, TensorLayouts,
 // The single production kernel.
 // ---------------------------------------------------------------------------
 
-template<bool TENSOR_PATH, bool FUSED_W13 = false>
+template<bool TENSOR_PATH>
 __global__ __launch_bounds__(kDecodeCtaThreads, 1)
 void kimi_k3_decode_persistent_kernel(
     const __nv_bfloat16 *__restrict__ hidden_states,
@@ -597,21 +597,12 @@ void kimi_k3_decode_persistent_kernel(
                 const int expert = scratch.unit_expert[
                     unit / routed_units_per_expert];
                 const int begin = scratch.expert_offsets[expert];
-                if constexpr (FUSED_W13) {
-                    expert_mxfp4::routed_gate_up_unit<true>(
-                        shared_raw, tensor_pool, expert_w1_packed,
-                        expert_w1_scale, expert_w3_packed, expert_w3_scale,
-                        scratch, expert, begin,
-                        scratch.expert_offsets[expert + 1] - begin,
-                        unit % routed_units_per_expert, clocks);
-                } else {
-                    expert_mxfp4::routed_gate_up_unit(
-                        shared_raw, tensor_pool, expert_w1_packed,
-                        expert_w1_scale, expert_w3_packed, expert_w3_scale,
-                        scratch, expert, begin,
-                        scratch.expert_offsets[expert + 1] - begin,
-                        unit % routed_units_per_expert, clocks);
-                }
+                expert_mxfp4::routed_gate_up_unit(
+                    shared_raw, tensor_pool, expert_w1_packed,
+                    expert_w1_scale, expert_w3_packed, expert_w3_scale,
+                    scratch, expert, begin,
+                    scratch.expert_offsets[expert + 1] - begin,
+                    unit % routed_units_per_expert, clocks);
                 __syncthreads();
                 publish_count_at(&scratch.expert_counts[expert]);
                 mark = clocks.lap(kClockRoutedGateUp, mark);
@@ -809,7 +800,7 @@ static __host__ std::int64_t shared_memory_reservations_for_testing(
 /// graph capture would have to record. The measured occupancy is then checked
 /// on every call, so a device that cannot host the grid is rejected every time
 /// rather than only on the first launch of a process.
-template<bool TENSOR_PATH, bool FUSED_W13 = false>
+template<bool TENSOR_PATH>
 static __host__ int resident_blocks_per_sm() {
     static std::array<std::atomic<int>, kMaxCudaDevices> measured{};
     static std::array<std::once_flag, kMaxCudaDevices> reserved;
@@ -820,13 +811,13 @@ static __host__ int resident_blocks_per_sm() {
                 device);
     std::call_once(reserved[static_cast<std::size_t>(device)], [device] {
         C10_CUDA_CHECK(cudaFuncSetAttribute(
-            kimi_k3_decode_persistent_kernel<TENSOR_PATH, FUSED_W13>,
+            kimi_k3_decode_persistent_kernel<TENSOR_PATH>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             kPersistentSharedBytes));
         int blocks = 0;
         C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &blocks,
-            kimi_k3_decode_persistent_kernel<TENSOR_PATH, FUSED_W13>,
+            kimi_k3_decode_persistent_kernel<TENSOR_PATH>,
             kDecodeCtaThreads, kPersistentSharedBytes));
         measured[static_cast<std::size_t>(device)].store(
             blocks, std::memory_order_relaxed);
@@ -911,14 +902,14 @@ struct LaunchArguments {
     int profile_phases;
 };
 
-template<bool TENSOR_PATH, bool FUSED_W13 = false>
+template<bool TENSOR_PATH>
 static __host__ void launch_persistent(
     const LaunchArguments &arguments,
     const layouts_t<TENSOR_PATH> &layouts
 ) {
     validate_grid_residency(
         arguments.available_sms,
-        resident_blocks_per_sm<TENSOR_PATH, FUSED_W13>(),
+        resident_blocks_per_sm<TENSOR_PATH>(),
         arguments.grid_ctas);
 
     const auto bf16 = [](const at::Tensor &tensor) {
@@ -928,7 +919,7 @@ static __host__ void launch_persistent(
         return reinterpret_cast<const std::uint8_t *>(tensor.data_ptr());
     };
 
-    kimi_k3_decode_persistent_kernel<TENSOR_PATH, FUSED_W13>
+    kimi_k3_decode_persistent_kernel<TENSOR_PATH>
         <<<arguments.grid_ctas, kDecodeCtaThreads, kPersistentSharedBytes,
            at::cuda::getCurrentCUDAStream()>>>(
             bf16(arguments.hidden_states),
@@ -1028,19 +1019,6 @@ static __host__ void launch_decode(const LaunchArguments &arguments) {
         return;
     }
     launch_persistent<true>(arguments, tensor_layouts(arguments));
-}
-
-/// PRIVATE BENCHMARK-ONLY: run the production scheduler and fused TP8 tail
-/// while interpreting the two gate/up pointers as one native fused-W13 tensor.
-/// Only the private guarded host entrypoint calls this instantiation.
-static __host__ void launch_decode_fused_w13_benchmark(
-    const LaunchArguments &arguments
-) {
-    if (capacity_bucket(arguments.active_tokens) <= kMaxCoreCapacity) {
-        launch_persistent<false, true>(arguments, NoTensorLayouts{});
-        return;
-    }
-    launch_persistent<true, true>(arguments, tensor_layouts(arguments));
 }
 
 }  // namespace persistent

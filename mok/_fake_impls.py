@@ -45,42 +45,6 @@ def _kimi_k3_decode_fake(
     return None
 
 
-@torch.library.register_fake("mok::_kimi_k3_decode_fused_w13_benchmark")
-def _kimi_k3_decode_fused_w13_benchmark_fake(
-    hidden_states: torch.Tensor,
-    router_weight: torch.Tensor,
-    router_correction_bias: torch.Tensor,
-    routed_expert_down_proj: torch.Tensor,
-    routed_expert_up_proj: torch.Tensor,
-    routed_latent_rmsnorm_weight: torch.Tensor,
-    expert_w13_packed: torch.Tensor,
-    expert_w13_scale: torch.Tensor,
-    expert_w2_packed: torch.Tensor,
-    expert_w2_scale: torch.Tensor,
-    shared_gate_proj: torch.Tensor,
-    shared_up_proj: torch.Tensor,
-    shared_down_proj: torch.Tensor,
-    scratch: torch.Tensor,
-    collective_buffer: torch.Tensor,
-    collective_buffer_ptrs: list[int],
-    collective_buffer_multicast_ptr: int,
-    output_mailbox: torch.Tensor,
-    output_mailbox_ptrs: list[int],
-    output_mailbox_multicast_ptr: int,
-    barrier_buffer: torch.Tensor,
-    barrier_buffer_ptrs: list[int],
-    barrier_buffer_multicast_ptr: int,
-    barrier_target: torch.Tensor,
-    error_flag: torch.Tensor,
-    tp_rank: int,
-    active_tokens: int,
-    workspace_signature: int,
-) -> None:
-    # PRIVATE BENCHMARK-ONLY: like the production fake, this trace mutates only
-    # caller-owned workspace tensors and allocates no result.
-    return None
-
-
 @torch.library.register_fake("mok::_kimi_k3_route_and_project")
 def _kimi_k3_route_and_project_fake(
     hidden_states: torch.Tensor,
