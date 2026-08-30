@@ -307,7 +307,18 @@ def _check_bitwise_parity(
     device: torch.device,
 ) -> list[dict[str, object]]:
     checks: list[dict[str, object]] = []
-    for entry in pool:
+    # region agent log
+    _agent_log(
+        location=(
+            "benchmarks/kimi_k3_projection_first_ab.py:"
+            "_check_bitwise_parity:entry"
+        ),
+        message="starting pool parity checks",
+        data={"pool_size": len(pool)},
+        hypothesis_id="F,G",
+    )
+    # endregion
+    for enumerated_pool_index, entry in enumerate(pool):
         with runtime.projection_first_scheduling(False):
             score = runtime.decode_step(
                 workspace, entry.weights, entry.hidden
@@ -324,6 +335,24 @@ def _check_bitwise_parity(
             projection, expected
         )
         runtime.assert_identical_across_ranks(projection)
+        # region agent log
+        _agent_log(
+            location=(
+                "benchmarks/kimi_k3_projection_first_ab.py:"
+                "_check_bitwise_parity:metadata"
+            ),
+            message="parity passed before result metadata serialization",
+            data={
+                "enumerated_pool_index": enumerated_pool_index,
+                "entry_type": type(entry).__name__,
+                "entry_fields": [
+                    field.name for field in dataclasses.fields(entry)
+                ],
+                "has_pool_index": hasattr(entry, "pool_index"),
+            },
+            hypothesis_id="F,G",
+        )
+        # endregion
         checks.append(
             {
                 "pool_index": entry.pool_index,
