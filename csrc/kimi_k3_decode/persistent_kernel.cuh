@@ -137,10 +137,11 @@ inline constexpr TaskPlan task_plan(const int active_tokens) {
         ? kTopK * active_tokens : kNumExperts;
     return TaskPlan{
         active_tokens * router::kScoreShards
-            + (tensor_path ? skinny_gemm::kTensorCtas : skinny_gemm::kCoreCtas),
-        (tensor_path ? 2 * shared_experts::kTensorGateCtas
-                     : shared_experts::kCoreGateCtas)
-            + experts * expert_mxfp4::kGateUpTiles,
+            + (tensor_path ? skinny_gemm::kTensorCtas
+                           : skinny_gemm::kCoreCtas)
+            + (tensor_path ? 2 * shared_experts::kTensorGateCtas
+                           : shared_experts::kCoreGateCtas),
+        experts * expert_mxfp4::kGateUpTiles,
         (tensor_path ? shared_experts::kActivationCtas : 0)
             + experts
                   * expert_mxfp4::grouped_pipeline::kGroupedDownUnits

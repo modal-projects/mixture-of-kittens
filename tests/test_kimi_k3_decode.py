@@ -578,11 +578,12 @@ def test_the_task_plan_covers_every_logical_task_of_the_step(
     assert grid == PERSISTENT_CTAS
     assert route_latent == tokens * SCORE_SHARDS + (
         TENSOR_PROJECTION_UNITS if tensor_path else CORE_PROJECTION_UNITS
-    )
-    assert gate_up == (
-        2 * TENSOR_SHARED_GATE_UNITS if tensor_path
+    ) + (
+        2 * TENSOR_SHARED_GATE_UNITS
+        if tensor_path
         else CORE_SHARED_GATE_UNITS
-    ) + experts * GATE_UP_TILES
+    )
+    assert gate_up == experts * GATE_UP_TILES
     assert down == (
         (ACTIVATION_UNITS + TENSOR_SHARED_DOWN_UNITS) if tensor_path
         else CORE_SHARED_DOWN_UNITS
@@ -623,9 +624,7 @@ def test_the_grid_claims_only_occupied_experts(
     assert int(counters[ACTIVE_EXPERT_UNITS].item()) == distinct
     assert distinct < EXPERTS
 
-    gate_up_units = (
-        2 * TENSOR_SHARED_GATE_UNITS + distinct * GATE_UP_TILES
-    )
+    gate_up_units = distinct * GATE_UP_TILES
     down_units = (
         ACTIVATION_UNITS
         + TENSOR_SHARED_DOWN_UNITS
@@ -638,7 +637,9 @@ def test_the_grid_claims_only_occupied_experts(
         (DOWN_QUEUE, down_units, 4),
         (
             ROUTE_LATENT_QUEUE,
-            tokens * SCORE_SHARDS + TENSOR_PROJECTION_UNITS,
+            tokens * SCORE_SHARDS
+            + TENSOR_PROJECTION_UNITS
+            + 2 * TENSOR_SHARED_GATE_UNITS,
             1,
         ),
     ):
