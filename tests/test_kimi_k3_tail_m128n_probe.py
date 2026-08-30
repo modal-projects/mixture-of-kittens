@@ -94,7 +94,7 @@ def test_probe_source_contains_phase_and_single_launch_gates() -> None:
 
     assert "_kimi_k3_tail_m128n_probe" in source
     assert "_kimi_k3_tail_m128n_resource_metadata" in source
-    assert "_kimi_k3_tail_set_profile" in source
+    assert "runtime.tail_profiling()" in source
     assert "kernel_count" in source
     assert "candidate_shard_mma_us" in source
 
