@@ -769,13 +769,18 @@ def diagnose_kimi_k3_route_finalize_baseline(
         str(samples),
     ]
     print(f"Launching: {' '.join(command)} on 8 x B300")
-    subprocess.run(
-        command,
-        cwd=REMOTE_ROOT,
-        env={**os.environ, "PYTHONUNBUFFERED": "1"},
-        check=True,
-        timeout=14_100,
-    )
+    try:
+        subprocess.run(
+            command,
+            cwd=REMOTE_ROOT,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            check=True,
+            timeout=14_100,
+        )
+    except subprocess.CalledProcessError:
+        if debug_log.exists():
+            print(debug_log.read_text(encoding="utf-8"), flush=True)
+        raise
     return debug_log.read_bytes(), output.read_bytes()
 
 
