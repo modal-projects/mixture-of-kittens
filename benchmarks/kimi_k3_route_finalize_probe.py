@@ -21,7 +21,11 @@ import torch.distributed as dist
 from benchmarks import kimi_k3_decode_data as data
 from benchmarks import kimi_k3_decode_runtime as runtime
 from benchmarks.compare_kimi_k3_frameworks import derive_phase_cycles
-from benchmarks.kimi_k3_timing import rank_max_samples, summarize_rank_max
+from benchmarks.kimi_k3_timing import (
+    rank_max_samples,
+    summarize_rank_max,
+    timing_extrema_ms,
+)
 from mok import kimi_k3
 from tests import kimi_k3_decode_support as decode_support
 
@@ -219,6 +223,7 @@ def _run(output: Path, samples: int) -> None:
                 _agent_log("A|B", "kimi_k3_route_finalize_probe.py:_run:timing", "timing mapping returned", {"mode": case.name, "tokens": case.tokens, "keys": sorted(timing), "summary": {key: value for key, value in timing.items() if key != "rank_max_samples_ms"}, "rank_max_sample_count": len(timing.get("rank_max_samples_ms", []))})
                 # endregion
             cycles = _profile(workspace, case, device)
+            minimum_ms, maximum_ms = timing_extrema_ms(timing)
             row = {
                 "mode": case.name,
                 "tokens": case.tokens,
@@ -226,8 +231,8 @@ def _run(output: Path, samples: int) -> None:
                 "sample_count": samples,
                 "median_ms": timing["median_ms"],
                 "p99_ms": timing["p99_ms"],
-                "minimum_ms": timing["minimum_ms"],
-                "maximum_ms": timing["maximum_ms"],
+                "minimum_ms": minimum_ms,
+                "maximum_ms": maximum_ms,
                 "cycles": cycles,
             }
             rows.append(row)

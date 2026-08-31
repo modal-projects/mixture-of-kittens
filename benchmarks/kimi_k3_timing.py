@@ -64,6 +64,16 @@ def summarize_rank_max(
     }
 
 
+def timing_extrema_ms(timing: Mapping[str, Any]) -> tuple[float, float]:
+    """Return extrema from a timing summary's retained rank-max samples."""
+    samples = [
+        float(sample) for sample in timing["rank_max_samples_ms"]
+    ]
+    if not samples:
+        raise ValueError("timing extrema require at least one sample")
+    return min(samples), max(samples)
+
+
 class TimingEvent(Protocol):
     """The part of ``torch.cuda.Event`` a replay measurement uses."""
 
@@ -216,4 +226,5 @@ __all__ = [
     "rotating_candidate_orders",
     "select_grid_with_effect_band",
     "summarize_rank_max",
+    "timing_extrema_ms",
 ]
