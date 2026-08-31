@@ -751,9 +751,8 @@ def bench_kimi_k3_decode_persisted(git_sha: str) -> bytes:
 @app.function(image=B300_IMAGE, gpu="B300:8", timeout=14_400)
 def diagnose_kimi_k3_route_finalize_baseline(
     samples: int = 1000,
-) -> tuple[bytes, bytes]:
+) -> bytes:
     """Collect routed-down baseline clocks and latency on TP8 B300."""
-    debug_log = Path("/opt/cursor/logs/debug.log")
     output = Path("/tmp/kimi_k3_route_finalize_baseline.json")
     command = [
         "python",
@@ -769,19 +768,14 @@ def diagnose_kimi_k3_route_finalize_baseline(
         str(samples),
     ]
     print(f"Launching: {' '.join(command)} on 8 x B300")
-    try:
-        subprocess.run(
-            command,
-            cwd=REMOTE_ROOT,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
-            check=True,
-            timeout=14_100,
-        )
-    except subprocess.CalledProcessError:
-        if debug_log.exists():
-            print(debug_log.read_text(encoding="utf-8"), flush=True)
-        raise
-    return debug_log.read_bytes(), output.read_bytes()
+    subprocess.run(
+        command,
+        cwd=REMOTE_ROOT,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        check=True,
+        timeout=14_100,
+    )
+    return output.read_bytes()
 
 
 @app.local_entrypoint()
@@ -789,16 +783,14 @@ def route_finalize_baseline(
     output_dir: str = "kimi_k3_route_finalize_baseline",
     samples: int = 1000,
 ) -> None:
-    """Run the pre-candidate B300 probe and retrieve its debug evidence."""
-    debug_log, report = diagnose_kimi_k3_route_finalize_baseline.remote(
+    """Run the pre-candidate B300 probe and retrieve its report."""
+    report = diagnose_kimi_k3_route_finalize_baseline.remote(
         samples=samples,
     )
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
     (destination / "baseline.json").write_bytes(report)
-    Path("/opt/cursor/logs/debug.log").write_bytes(debug_log)
     print(f"baseline report: {destination / 'baseline.json'}")
-    print("debug log: /opt/cursor/logs/debug.log")
 
 
 K3_GATES = ("tests", "sass", "benchmark", "memcheck", "racecheck")

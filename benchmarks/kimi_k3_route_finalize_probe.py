@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,7 +29,6 @@ from mok import kimi_k3
 from tests import kimi_k3_decode_support as decode_support
 
 
-DEBUG_LOG_PATH = "/opt/cursor/logs/debug.log"
 DEFAULT_SAMPLES = 1000
 PROFILE_TOKENS = (16, 32, 128)
 
@@ -42,19 +40,6 @@ class ProbeCase:
     hidden: torch.Tensor
     weights: Any
     distinct_experts: int
-
-
-def _agent_log(
-    hypothesis_id: str,
-    location: str,
-    message: str,
-    payload: dict[str, Any],
-) -> None:
-    Path(DEBUG_LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
-    # region agent log
-    with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"hypothesisId": hypothesis_id, "location": location, "message": message, "data": payload, "timestamp": time.time_ns() // 1_000_000}, sort_keys=True) + "\n")
-    # endregion
 
 
 def _init_distributed() -> tuple[int, torch.device]:
@@ -194,16 +179,8 @@ def _run(output: Path, samples: int) -> None:
         )
         base_weights = data.build_weights(device, rank)
         cases = _cases(base_weights, device)
-        if rank == 0:
-            # region agent log
-            _agent_log("A|B|C|D|E", "kimi_k3_route_finalize_probe.py:_run", "baseline probe entered", {"gpu": properties.name, "sm_count": properties.multi_processor_count, "samples": samples, "cases": [{"mode": case.name, "tokens": case.tokens, "distinct_experts": case.distinct_experts} for case in cases]})
-            # endregion
         rows: list[dict[str, Any]] = []
         for case in cases:
-            if rank == 0:
-                # region agent log
-                _agent_log("A|C|D", "kimi_k3_route_finalize_probe.py:_run:case", "case capture begins", {"mode": case.name, "tokens": case.tokens, "distinct_experts": case.distinct_experts})
-                # endregion
             graph = _capture(workspace, case)
             graph.replay()
             torch.cuda.synchronize(device)
@@ -218,10 +195,6 @@ def _run(output: Path, samples: int) -> None:
                 workspace.output_mailbox.view(128, 7168)[: case.tokens]
             )
             timing = _measure(graph, device, samples)
-            if rank == 0:
-                # region agent log
-                _agent_log("A|B", "kimi_k3_route_finalize_probe.py:_run:timing", "timing mapping returned", {"mode": case.name, "tokens": case.tokens, "keys": sorted(timing), "summary": {key: value for key, value in timing.items() if key != "rank_max_samples_ms"}, "rank_max_sample_count": len(timing.get("rank_max_samples_ms", []))})
-                # endregion
             cycles = _profile(workspace, case, device)
             minimum_ms, maximum_ms = timing_extrema_ms(timing)
             row = {
@@ -236,10 +209,6 @@ def _run(output: Path, samples: int) -> None:
                 "cycles": cycles,
             }
             rows.append(row)
-            if rank == 0:
-                # region agent log
-                _agent_log("A|B|C|D|E", "kimi_k3_route_finalize_probe.py:_run:result", "baseline case measured", row)
-                # endregion
             del graph, expected
             _barrier(device)
         if rank == 0:
@@ -256,9 +225,6 @@ def _run(output: Path, samples: int) -> None:
                 ),
                 encoding="utf-8",
             )
-            # region agent log
-            _agent_log("A|B|C|D|E", "kimi_k3_route_finalize_probe.py:_run:exit", "baseline probe completed", {"row_count": len(rows), "output": str(output)})
-            # endregion
         _barrier(device)
     finally:
         if previous_guard is None:
