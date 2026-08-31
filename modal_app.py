@@ -748,6 +748,54 @@ def bench_kimi_k3_decode_persisted(git_sha: str) -> bytes:
     return archive
 
 
+@app.function(image=B300_IMAGE, gpu="B300:8", timeout=14_400)
+def diagnose_kimi_k3_route_finalize_baseline(
+    samples: int = 1000,
+) -> tuple[bytes, bytes]:
+    """Collect routed-down baseline clocks and latency on TP8 B300."""
+    debug_log = Path("/opt/cursor/logs/debug.log")
+    output = Path("/tmp/kimi_k3_route_finalize_baseline.json")
+    command = [
+        "python",
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc-per-node=8",
+        "-m",
+        "benchmarks.kimi_k3_route_finalize_probe",
+        "--output",
+        str(output),
+        "--samples",
+        str(samples),
+    ]
+    print(f"Launching: {' '.join(command)} on 8 x B300")
+    subprocess.run(
+        command,
+        cwd=REMOTE_ROOT,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        check=True,
+        timeout=14_100,
+    )
+    return debug_log.read_bytes(), output.read_bytes()
+
+
+@app.local_entrypoint()
+def route_finalize_baseline(
+    output_dir: str = "kimi_k3_route_finalize_baseline",
+    samples: int = 1000,
+) -> None:
+    """Run the pre-candidate B300 probe and retrieve its debug evidence."""
+    debug_log, report = diagnose_kimi_k3_route_finalize_baseline.remote(
+        samples=samples,
+    )
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / "baseline.json").write_bytes(report)
+    Path("/opt/cursor/logs/debug.log").write_bytes(debug_log)
+    print(f"baseline report: {destination / 'baseline.json'}")
+    print("debug log: /opt/cursor/logs/debug.log")
+
+
 K3_GATES = ("tests", "sass", "benchmark", "memcheck", "racecheck")
 
 
