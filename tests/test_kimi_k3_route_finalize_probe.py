@@ -52,7 +52,7 @@ def test_route_finalize_records_assignments_and_orders_producers_first() -> None
     assert "publish_route_group" in grouped
     assert "finalize_route_group" in grouped
     assert "const int finalize_begin = shared_units + routed_producer_units" in kernel
-    assert "kErrorPersistentRouteFinalizeReadiness" in kernel
+    assert "kErrorPersistentRouteFinalizeReadiness" in grouped
     assert "finalize_route_group" in kernel
 
 
