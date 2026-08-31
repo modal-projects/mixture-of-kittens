@@ -6,9 +6,7 @@ import importlib
 
 
 def test_timing_extrema_use_the_rank_max_sample_series() -> None:
-    probe = importlib.import_module(
-        "benchmarks.kimi_k3_route_finalize_probe"
-    )
+    timing_utils = importlib.import_module("benchmarks.kimi_k3_timing")
     samples = [float(sample) for sample in range(1000)]
     timing = {
         "geomean_ms": 367.6954247709637,
@@ -19,4 +17,4 @@ def test_timing_extrema_use_the_rank_max_sample_series() -> None:
         "sample_count": 1000,
     }
 
-    assert probe.timing_extrema_ms(timing) == (0.0, 999.0)
+    assert timing_utils.timing_extrema_ms(timing) == (0.0, 999.0)
