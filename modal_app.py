@@ -817,16 +817,19 @@ def bench_kimi_k3_route_finalize_candidate(
         str(repeats),
     ]
     print(f"Launching: {' '.join(command)} on 8 x B300")
-    subprocess.run(
+    completed = subprocess.run(
         command,
         cwd=REMOTE_ROOT,
         env={**os.environ, "PYTHONUNBUFFERED": "1"},
-        check=True,
+        check=False,
         timeout=14_100,
     )
     return {
-        "report": output.read_bytes(),
-        "debug_log": debug_log.read_bytes(),
+        "report": output.read_bytes() if output.exists() else b"",
+        "debug_log": (
+            debug_log.read_bytes() if debug_log.exists() else b""
+        ),
+        "exit_code": completed.returncode,
     }
 
 
@@ -868,6 +871,11 @@ def route_finalize_candidate(
     local_debug.parent.mkdir(parents=True, exist_ok=True)
     local_debug.write_bytes(result["debug_log"])
     print(f"candidate report: {report}")
+    if result["exit_code"] != 0:
+        raise SystemExit(
+            "route-finalize candidate failed with exit code "
+            f"{result['exit_code']}; debug log: {destination / 'debug.log'}"
+        )
 
 
 @app.local_entrypoint()

@@ -229,11 +229,37 @@ def _validate_variant(
     expected: torch.Tensor,
     device: torch.device,
 ) -> tuple[torch.cuda.CUDAGraph, dict[str, Any]]:
+    # region agent log
+    _debug_log(
+        "A,B,C,D",
+        "benchmarks/kimi_k3_route_finalize_probe.py:_validate_variant:entry",
+        "route-finalize variant entry",
+        {
+            "label": label,
+            "mode": case.name,
+            "tokens": case.tokens,
+            "distinct_experts": case.distinct_experts,
+        },
+    )
+    # endregion
     eager = step(workspace, case.weights, case.hidden).clone()
     torch.cuda.synchronize(device)
     runtime.check_decode_error(workspace)
     accuracy = _accuracy(eager, expected)
     runtime.assert_identical_across_ranks(eager)
+    # region agent log
+    _debug_log(
+        "B,C,D",
+        "benchmarks/kimi_k3_route_finalize_probe.py:_validate_variant:eager",
+        "route-finalize eager launch complete",
+        {
+            "label": label,
+            "mode": case.name,
+            "tokens": case.tokens,
+            "accuracy": accuracy,
+        },
+    )
+    # endregion
 
     kernel_names = runtime.profiled_kernel_names(
         lambda: step(workspace, case.weights, case.hidden)
@@ -272,6 +298,21 @@ def _validate_variant(
         raise AssertionError(f"{label} did not return the mailbox view")
     runtime.check_decode_error(workspace)
 
+    # region agent log
+    _debug_log(
+        "A,B,C,D",
+        "benchmarks/kimi_k3_route_finalize_probe.py:_validate_variant:exit",
+        "route-finalize variant validation complete",
+        {
+            "label": label,
+            "mode": case.name,
+            "tokens": case.tokens,
+            "launch_count": len(kernel_names),
+            "graph_replay_bit_identical": True,
+            "allocator_event_count": len(allocator_events),
+        },
+    )
+    # endregion
     return graph, {
         "accuracy": accuracy,
         "graph_replay_bit_identical": True,
