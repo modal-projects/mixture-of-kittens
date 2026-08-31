@@ -69,6 +69,7 @@ static __device__ __forceinline__ float router_sigmoid(const float logit) {
 ///
 /// Only one CTA runs this, so every count, offset, and assignment entry is
 /// written by a single CTA and the workspace never needs a host reset.
+template<bool RECORD_SLOT_ASSIGNMENT = false>
 static __device__ void build_assignments(
     std::uint8_t *__restrict__ shared,
     const Scratch &scratch,
@@ -133,6 +134,9 @@ static __device__ void build_assignments(
                 const int position = offsets[expert]++;
                 scratch.assignment_tokens[position] = token;
                 scratch.assignment_slots[position] = lane;
+                if constexpr (RECORD_SLOT_ASSIGNMENT) {
+                    scratch.token_slot_assignments[token * kTopK + lane] = position;
+                }
             }
             __syncwarp();
         }

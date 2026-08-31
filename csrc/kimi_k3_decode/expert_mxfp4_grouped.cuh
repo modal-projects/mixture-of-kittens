@@ -10,7 +10,9 @@
 // tcgen05 while the remaining warps fill the next buffer.
 
 #include "expert_mxfp4.cuh"
+#include "persistent_sync.cuh"
 
+#include <cmath>
 #include <cstdint>
 
 namespace kimi_k3_decode {
@@ -233,6 +235,96 @@ __device__ __forceinline__ void accumulate_grouped_down_fixed(
     }
 }
 
+__device__ __forceinline__ void store_grouped_route_down(
+    const grouped_result_tile (&result)[kGroupedDownWidth],
+    const Scratch &scratch,
+    const int assignment_begin,
+    const int batch_rows,
+    const int tile_start,
+    const int tile_count
+) {
+    const int thread = static_cast<int>(threadIdx.x);
+    const int columns = tile_count * kMmaN;
+    for (int index = thread; index < batch_rows * columns;
+         index += kDecodeCtaThreads) {
+        const int row = index / columns;
+        const int within_row = index % columns;
+        const int tile = within_row / kMmaN;
+        const int column = within_row % kMmaN;
+        const int assignment = assignment_begin + row;
+        const int output_column =
+            (tile_start + tile) * kMmaN + column;
+        scratch.route_down[
+            static_cast<long long>(assignment) * kLatentSize
+            + output_column] = result[tile][{column, row}];
+    }
+}
+
+__device__ __forceinline__ void publish_route_group(
+    const Scratch &scratch,
+    const int assignment_begin,
+    const int batch_rows,
+    const int output_group
+) {
+    // Every writer releases its columns before any thread publishes a route.
+    // The CTA rendezvous orders all of those releases before the counters.
+    __threadfence();
+    __syncthreads();
+    for (int row = static_cast<int>(threadIdx.x); row < batch_rows;
+         row += kDecodeCtaThreads) {
+        const int assignment = assignment_begin + row;
+        const int token = scratch.assignment_tokens[assignment];
+        atomicAdd(
+            reinterpret_cast<unsigned int *>(
+                &scratch.token_output_group_ready[
+                    token * kRouteFinalizeGroups + output_group]),
+            1u);
+    }
+    __syncthreads();
+}
+
+static __device__ void finalize_route_group(
+    const Scratch &scratch,
+    int *__restrict__ const error_flag,
+    __nv_bfloat16 *__restrict__ const collective_buffer,
+    const int token,
+    const int output_group,
+    const PhaseClocks clocks
+) {
+    const unsigned long long readiness_mark = clocks.now();
+    persistent::wait_for_count_at(
+        scratch, error_flag,
+        &scratch.token_output_group_ready[
+            token * kRouteFinalizeGroups + output_group],
+        kRouteFinalizeReadyDiagnostic, kTopK,
+        kErrorPersistentRouteFinalizeReadiness);
+    clocks.lap(kClockReadinessWait, readiness_mark);
+
+    const int output_begin = output_group * kRouteFinalizeColumns;
+    for (int offset = static_cast<int>(threadIdx.x);
+         offset < kRouteFinalizeColumns;
+         offset += kDecodeCtaThreads) {
+        const int output_column = output_begin + offset;
+        float total = 0.0f;
+        #pragma unroll
+        for (int slot = 0; slot < kTopK; ++slot) {
+            const int route = token * kTopK + slot;
+            const int assignment = scratch.token_slot_assignments[route];
+            total = fmaf(
+                scratch.route_down[
+                    static_cast<long long>(assignment) * kLatentSize
+                    + output_column],
+                scratch.expert_weights[route],
+                total);
+        }
+        collective_buffer[
+            static_cast<long long>(token) * (kLatentSize + kHiddenSize)
+            + output_column] = __float2bfloat16(total);
+    }
+    __syncthreads();
+}
+
+template<bool ROUTE_MAJOR = false>
 static __device__ void grouped_down_unit(
     int *__restrict__ shared_raw,
     kittens::tensor_allocator<1, 1> &tensor_pool,
@@ -356,9 +448,18 @@ static __device__ void grouped_down_unit(
             store_grouped_accumulator(accumulator(tile), result[tile]);
         }
         __syncthreads();
-        accumulate_grouped_down_fixed(
-            result, scratch, batch_begin, rows, tile_start, tile_count);
+        if constexpr (ROUTE_MAJOR) {
+            store_grouped_route_down(
+                result, scratch, batch_begin, rows, tile_start, tile_count);
+        } else {
+            accumulate_grouped_down_fixed(
+                result, scratch, batch_begin, rows, tile_start, tile_count);
+        }
         __syncthreads();
+        if constexpr (ROUTE_MAJOR) {
+            publish_route_group(
+                scratch, batch_begin, rows, output_group);
+        }
     }
 }
 

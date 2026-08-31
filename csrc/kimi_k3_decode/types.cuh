@@ -138,6 +138,68 @@ inline constexpr int kRouterScoreBytes =
 static constexpr int SCRATCH_BYTES =
     kRouterScoreBytes + scratch_region_bytes(kMaxTokens * kNumExperts);
 
+// Benchmark-only option A replaces the production Q24 accumulator band with
+// one FP32 row per route. The remaining regions retain their production order
+// but move above that max-sized band. Two compact int32 tables map
+// `(token, slot)` back to its expert-major assignment and count the sixteen
+// completed routes for each 512-column output group.
+inline constexpr int kRouteFinalizeColumns = 512;
+inline constexpr int kRouteFinalizeGroups =
+    kLatentSize / kRouteFinalizeColumns;
+inline constexpr int kRouteFinalizeRouteDownBytes =
+    kRoutedAccumulatorBytes;
+inline constexpr int kRouteFinalizeTokenSlotAssignmentBytes =
+    kRouteFinalizeRouteDownBytes
+    + scratch_byte_region_bytes(
+        kMaxRoutes * kLatentSize * sizeof(float));
+inline constexpr int kRouteFinalizeReadyBytes =
+    kRouteFinalizeTokenSlotAssignmentBytes
+    + scratch_region_bytes(kMaxRoutes);
+inline constexpr int kRouteFinalizeSharedGateBytes =
+    kRouteFinalizeReadyBytes
+    + scratch_region_bytes(kMaxTokens * kRouteFinalizeGroups);
+inline constexpr int kRouteFinalizeSharedUpBytes =
+    kRouteFinalizeSharedGateBytes
+    + scratch_byte_region_bytes(
+        kMaxTokens * (kSharedIntermediateSize / kTensorParallelSize)
+        * sizeof(__nv_bfloat16));
+inline constexpr int kRouteFinalizeSharedActivatedBytes =
+    kRouteFinalizeSharedUpBytes
+    + scratch_byte_region_bytes(
+        kMaxTokens * (kSharedIntermediateSize / kTensorParallelSize)
+        * sizeof(__nv_bfloat16));
+inline constexpr int kRouteFinalizeTailNormalizedBytes =
+    kRouteFinalizeSharedActivatedBytes
+    + scratch_byte_region_bytes(
+        kMaxTokens * (kSharedIntermediateSize / kTensorParallelSize)
+        * sizeof(__nv_bfloat16));
+inline constexpr int kRouteFinalizeTailSharedShardBytes =
+    kRouteFinalizeTailNormalizedBytes
+    + scratch_byte_region_bytes(
+        kMaxTokens * kLatentSize * sizeof(__nv_bfloat16));
+inline constexpr int kRouteFinalizeLatentXBytes =
+    kRouteFinalizeTailSharedShardBytes
+    + scratch_byte_region_bytes(
+        kMaxTokens * (kHiddenSize / kTensorParallelSize)
+        * sizeof(__nv_bfloat16));
+inline constexpr int kRouteFinalizeUnitExpertBytes =
+    kRouteFinalizeLatentXBytes
+    + scratch_byte_region_bytes(
+        kMaxTokens * kLatentSize * sizeof(__nv_bfloat16));
+inline constexpr int kRouteFinalizeRouterScoreBytes =
+    kRouteFinalizeUnitExpertBytes + scratch_region_bytes(kNumExperts);
+inline constexpr int kRouteFinalizeScratchBytesDerived =
+    kRouteFinalizeRouterScoreBytes
+    + scratch_region_bytes(kMaxTokens * kNumExperts);
+inline constexpr int kRouteFinalizeScratchBytes = 33813248;
+
+static_assert(kLatentSize % kRouteFinalizeColumns == 0);
+static_assert(kRouteFinalizeGroups == 7);
+static_assert(kRouteFinalizeTokenSlotAssignmentBytes == 30684928);
+static_assert(kRouteFinalizeReadyBytes == 30693120);
+static_assert(kRouteFinalizeSharedGateBytes == 30696704);
+static_assert(kRouteFinalizeScratchBytes == kRouteFinalizeScratchBytesDerived);
+
 static_assert(kLatentMxfp8Bytes == 40704);
 static_assert(kLatentScaleBytes == 499456);
 static_assert(kSituMxfp8Bytes == 513792);
@@ -209,8 +271,12 @@ inline constexpr int kPersistentTimeoutPhase = 34;
 // Shared gate/up units publish completion here before shared-down consumers
 // read their outputs.
 inline constexpr int kGateUpArrivals = 35;
+// A route-finalize timeout names its external per-token/group counter with this
+// otherwise-unused phase slot in the persisted diagnostic.
+inline constexpr int kRouteFinalizeReadyDiagnostic = 36;
 static_assert(kPersistentTimeoutPhase < NUM_PHASE_COUNTERS);
 static_assert(kGateUpArrivals < NUM_PHASE_COUNTERS);
+static_assert(kRouteFinalizeReadyDiagnostic < NUM_PHASE_COUNTERS);
 
 // ---------------------------------------------------------------------------
 // Phase clocks.
@@ -335,6 +401,7 @@ inline constexpr int kErrorTailDrainExit = 6;
 inline constexpr int kErrorPersistentGridBarrier = 7;
 inline constexpr int kErrorPersistentActivation = 8;
 inline constexpr int kErrorPersistentGateUpDownReadiness = 9;
+inline constexpr int kErrorPersistentRouteFinalizeReadiness = 10;
 
 /// One bounded wait, named by the code it reports and the slots it writes.
 struct TimeoutSite {
@@ -369,12 +436,15 @@ inline constexpr TimeoutSite kTimeoutSites[] = {
     {"persistent_gate_up_down_readiness",
      kErrorPersistentGateUpDownReadiness,
      kPersistentTimeoutPhase, kGateUpArrivals},
+    {"persistent_route_finalize_readiness",
+     kErrorPersistentRouteFinalizeReadiness,
+     kPersistentTimeoutPhase, kRouteFinalizeReadyDiagnostic},
 };
 
 inline constexpr int kTimeoutSiteCount =
     static_cast<int>(sizeof(kTimeoutSites) / sizeof(kTimeoutSites[0]));
 
-static_assert(kTimeoutSiteCount == 9);
+static_assert(kTimeoutSiteCount == 10);
 static_assert(kTimeoutSites[kTimeoutSiteCount - 1].code == kTimeoutSiteCount,
               "the timeout codes must be a dense nonzero range");
 
@@ -393,6 +463,9 @@ struct Scratch {
     std::uint8_t *situ_scale;
     float *routed_accumulator;
     long long *routed_accumulator_fixed;
+    float *route_down;
+    int *token_slot_assignments;
+    int *token_output_group_ready;
     __nv_bfloat16 *shared_gate;
     __nv_bfloat16 *shared_up;
     __nv_bfloat16 *shared_activated;
@@ -418,6 +491,9 @@ __host__ __device__ inline Scratch scratch_view(std::uint8_t *base) {
         base + kSituScaleBytes,
         reinterpret_cast<float *>(base + kRoutedAccumulatorBytes),
         reinterpret_cast<long long *>(base + kRoutedAccumulatorBytes),
+        nullptr,
+        nullptr,
+        nullptr,
         reinterpret_cast<__nv_bfloat16 *>(base + kSharedGateBytes),
         reinterpret_cast<__nv_bfloat16 *>(base + kSharedUpBytes),
         reinterpret_cast<__nv_bfloat16 *>(base + kSharedActivatedBytes),
@@ -427,6 +503,52 @@ __host__ __device__ inline Scratch scratch_view(std::uint8_t *base) {
         reinterpret_cast<int *>(base + kUnitExpertBytes),
         reinterpret_cast<float *>(base + kRouterScoreBytes),
     };
+}
+
+__host__ __device__ inline Scratch route_finalize_scratch_view(
+    std::uint8_t *base
+) {
+    return Scratch{
+        reinterpret_cast<int *>(base + kPhaseBytes),
+        reinterpret_cast<int *>(base + kExpertIdBytes),
+        reinterpret_cast<float *>(base + kExpertWeightBytes),
+        reinterpret_cast<int *>(base + kExpertCountBytes),
+        reinterpret_cast<int *>(base + kExpertOffsetBytes),
+        reinterpret_cast<int *>(base + kAssignmentTokenBytes),
+        reinterpret_cast<int *>(base + kAssignmentSlotBytes),
+        base + kLatentMxfp8Bytes,
+        base + kLatentScaleBytes,
+        base + kSituMxfp8Bytes,
+        base + kSituScaleBytes,
+        reinterpret_cast<float *>(base + kRouteFinalizeRouteDownBytes),
+        reinterpret_cast<long long *>(base + kRouteFinalizeRouteDownBytes),
+        reinterpret_cast<float *>(base + kRouteFinalizeRouteDownBytes),
+        reinterpret_cast<int *>(
+            base + kRouteFinalizeTokenSlotAssignmentBytes),
+        reinterpret_cast<int *>(base + kRouteFinalizeReadyBytes),
+        reinterpret_cast<__nv_bfloat16 *>(
+            base + kRouteFinalizeSharedGateBytes),
+        reinterpret_cast<__nv_bfloat16 *>(
+            base + kRouteFinalizeSharedUpBytes),
+        reinterpret_cast<__nv_bfloat16 *>(
+            base + kRouteFinalizeSharedActivatedBytes),
+        reinterpret_cast<__nv_bfloat16 *>(
+            base + kRouteFinalizeTailNormalizedBytes),
+        reinterpret_cast<__nv_bfloat16 *>(
+            base + kRouteFinalizeTailSharedShardBytes),
+        reinterpret_cast<__nv_bfloat16 *>(
+            base + kRouteFinalizeLatentXBytes),
+        reinterpret_cast<int *>(base + kRouteFinalizeUnitExpertBytes),
+        reinterpret_cast<float *>(base + kRouteFinalizeRouterScoreBytes),
+    };
+}
+
+template<bool ROUTE_MAJOR>
+__host__ __device__ inline Scratch scratch_view_for(std::uint8_t *base) {
+    if constexpr (ROUTE_MAJOR) {
+        return route_finalize_scratch_view(base);
+    }
+    return scratch_view(base);
 }
 
 /// A CTA's handle on the phase clocks, inert unless the launch enabled them.

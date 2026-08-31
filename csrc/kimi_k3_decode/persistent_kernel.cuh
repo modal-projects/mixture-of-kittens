@@ -206,6 +206,12 @@ inline constexpr TaskPlan task_plan(const int active_tokens) {
     };
 }
 
+inline constexpr TaskPlan route_finalize_task_plan(const int active_tokens) {
+    TaskPlan plan = task_plan(active_tokens);
+    plan.down += active_tokens * kRouteFinalizeGroups;
+    return plan;
+}
+
 /// The longest queue any phase of any accepted shape hands out.
 ///
 /// Folded over `task_plan` rather than written out, because which phase is
@@ -254,6 +260,16 @@ static_assert(static_cast<unsigned int>(kLongestQueueTicket)
 static_assert(kNumExperts * kGateUpUnitsPerExpert <= kLongestQueueUnits,
               "the gate/up queue must fit the bound every queue counter is "
               "sized against");
+
+inline constexpr int kRouteFinalizeLongestQueueUnits =
+    kLongestQueueUnits + kMaxTokens * kRouteFinalizeGroups;
+inline constexpr int kRouteFinalizeLongestQueueTicket =
+    ((kRouteFinalizeLongestQueueUnits + kRoutedClaimBatch - 1)
+         / kRoutedClaimBatch * kRoutedClaimBatch)
+    + kRoutedClaimBatch * kMaximumBenchmarkCtas;
+
+static_assert(kRouteFinalizeLongestQueueUnits == 7230);
+static_assert(kRouteFinalizeLongestQueueTicket == 7824);
 
 inline std::tuple<int, int, int, int, int> task_plan_for_testing(
     const std::int64_t active_tokens
@@ -407,7 +423,7 @@ using layouts_t = std::conditional_t<TENSOR_PATH, TensorLayouts,
 // The single production kernel.
 // ---------------------------------------------------------------------------
 
-template<bool TENSOR_PATH>
+template<bool TENSOR_PATH, bool ROUTE_MAJOR>
 __global__ __launch_bounds__(kDecodeCtaThreads, 1)
 void kimi_k3_decode_persistent_kernel(
     const __nv_bfloat16 *__restrict__ hidden_states,
@@ -447,7 +463,7 @@ void kimi_k3_decode_persistent_kernel(
     __shared__ int claim_slot;
     __shared__ int claim_end_slot;
 
-    const Scratch scratch = scratch_view(scratch_bytes);
+    const Scratch scratch = scratch_view_for<ROUTE_MAJOR>(scratch_bytes);
     const PhaseClocks clocks = phase_clocks(scratch, profile_phases != 0);
     const int block = static_cast<int>(blockIdx.x);
     const int thread = static_cast<int>(threadIdx.x);
@@ -487,12 +503,13 @@ void kimi_k3_decode_persistent_kernel(
     unsigned long long mark = clocks.now();
 
     // -----------------------------------------------------------------------
-    // Phase 0: clear this launch's queues and the routed accumulator.
+    // Phase 0: clear this launch's queues and routed publication state.
     //
     // One CTA owns the clearing so no other CTA can be mid-claim while it
     // happens; the barrier below is what makes it visible before the first
-    // claim. Every routed down unit accumulates into the same latent row, so
-    // that accumulator has to start this launch at zero too.
+    // claim. Production atomics share one latent row and therefore clear that
+    // accumulator. The route-major candidate overwrites every unique route
+    // row, so only its per-token/group readiness counters need clearing.
     // -----------------------------------------------------------------------
     if (block == 0 && thread < kPersistentClearedCounters) {
         atomicExch(
@@ -510,10 +527,20 @@ void kimi_k3_decode_persistent_kernel(
         scratch.expert_counts[thread] = 0;
     }
     const int routed_values = active_tokens * kLatentSize;
-    for (int index = block * kDecodeCtaThreads + thread;
-         index < routed_values;
-         index += grid_ctas * kDecodeCtaThreads) {
-        scratch.routed_accumulator_fixed[index] = 0;
+    if constexpr (ROUTE_MAJOR) {
+        const int readiness_values =
+            active_tokens * kRouteFinalizeGroups;
+        for (int index = block * kDecodeCtaThreads + thread;
+             index < readiness_values;
+             index += grid_ctas * kDecodeCtaThreads) {
+            scratch.token_output_group_ready[index] = 0;
+        }
+    } else {
+        for (int index = block * kDecodeCtaThreads + thread;
+             index < routed_values;
+             index += grid_ctas * kDecodeCtaThreads) {
+            scratch.routed_accumulator_fixed[index] = 0;
+        }
     }
     mark = clocks.now();
     grid_barrier(scratch, error_flag, grid, grid_ctas);
@@ -616,7 +643,8 @@ void kimi_k3_decode_persistent_kernel(
     // separate assignment phase.
     // -----------------------------------------------------------------------
     if (block == 0) {
-        router::build_assignments(shared, scratch, active_tokens);
+        router::build_assignments<ROUTE_MAJOR>(
+            shared, scratch, active_tokens);
         __syncthreads();
         router::build_expert_units(shared, scratch);
         __syncthreads();
@@ -695,7 +723,11 @@ void kimi_k3_decode_persistent_kernel(
             : shared_experts::kCoreGateCtas;
         constexpr int routed_units_per_expert =
             expert_mxfp4::grouped_pipeline::kGroupedDownUnits;
-        const int units = shared_units + expert_units * routed_units_per_expert;
+        const int routed_producer_units =
+            expert_units * routed_units_per_expert;
+        const int finalize_begin = shared_units + routed_producer_units;
+        const int units = finalize_begin
+            + (ROUTE_MAJOR ? active_tokens * kRouteFinalizeGroups : 0);
         while (true) {
             const unsigned long long queue_mark = clocks.now();
             const int batch_begin = claim_unit_batch(
@@ -735,6 +767,17 @@ void kimi_k3_decode_persistent_kernel(
                     mark = clocks.lap(kClockSharedExperts, mark);
                     continue;
                 }
+                if constexpr (ROUTE_MAJOR) {
+                    if (unit >= finalize_begin) {
+                        const int finalize = unit - finalize_begin;
+                        expert_mxfp4::grouped_pipeline::finalize_route_group(
+                            scratch, error_flag, collective_buffer,
+                            finalize / kRouteFinalizeGroups,
+                            finalize % kRouteFinalizeGroups, clocks);
+                        mark = clocks.lap(kClockRoutedDown, mark);
+                        continue;
+                    }
+                }
                 const int routed = unit - shared_units;
                 const int expert =
                     scratch.unit_expert[routed / routed_units_per_expert];
@@ -747,7 +790,8 @@ void kimi_k3_decode_persistent_kernel(
                     kErrorPersistentGateUpDownReadiness);
                 mark = clocks.lap(
                     kClockReadinessWait, readiness_mark);
-                expert_mxfp4::grouped_pipeline::grouped_down_unit(
+                expert_mxfp4::grouped_pipeline::
+                    grouped_down_unit<ROUTE_MAJOR>(
                     shared_raw, tensor_pool, expert_w2_packed,
                     expert_w2_scale, scratch, expert, begin,
                     scratch.expert_offsets[expert + 1] - begin,
@@ -766,16 +810,20 @@ void kimi_k3_decode_persistent_kernel(
     // The rows past the active block are never read: every tail role bounds its
     // own loop by the same active token count.
     // -----------------------------------------------------------------------
-    for (int index = block * kDecodeCtaThreads + thread;
-         index < routed_values;
-         index += grid_ctas * kDecodeCtaThreads) {
-        const int row = index / kLatentSize;
-        collective_buffer[
-            static_cast<long long>(row) * shared_experts::kCollectiveColumns
-            + index - row * kLatentSize] =
-                __float2bfloat16(
-                    __ll2float_rn(scratch.routed_accumulator_fixed[index])
-                    * kRoutedAccumulatorScaleInverse);
+    if constexpr (!ROUTE_MAJOR) {
+        for (int index = block * kDecodeCtaThreads + thread;
+             index < routed_values;
+             index += grid_ctas * kDecodeCtaThreads) {
+            const int row = index / kLatentSize;
+            collective_buffer[
+                static_cast<long long>(row)
+                    * shared_experts::kCollectiveColumns
+                + index - row * kLatentSize] =
+                    __float2bfloat16(
+                        __ll2float_rn(
+                            scratch.routed_accumulator_fixed[index])
+                        * kRoutedAccumulatorScaleInverse);
+        }
     }
     // The barrier releases at system scope, so this rank's whole collective
     // buffer is visible to its peers before its coordinator opens the entry
@@ -863,7 +911,7 @@ static __host__ std::int64_t shared_memory_reservations_for_testing(
 /// graph capture would have to record. The measured occupancy is then checked
 /// on every call, so a device that cannot host the grid is rejected every time
 /// rather than only on the first launch of a process.
-template<bool TENSOR_PATH>
+template<bool TENSOR_PATH, bool ROUTE_MAJOR>
 static __host__ int resident_blocks_per_sm() {
     static std::array<std::atomic<int>, kMaxCudaDevices> measured{};
     static std::array<std::once_flag, kMaxCudaDevices> reserved;
@@ -875,20 +923,22 @@ static __host__ int resident_blocks_per_sm() {
                 device);
     std::call_once(reserved[static_cast<std::size_t>(device)], [device] {
         C10_CUDA_CHECK(cudaFuncSetAttribute(
-            kimi_k3_decode_persistent_kernel<TENSOR_PATH>,
+            kimi_k3_decode_persistent_kernel<TENSOR_PATH, ROUTE_MAJOR>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             shared_bytes));
         int blocks = 0;
         C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &blocks,
-            kimi_k3_decode_persistent_kernel<TENSOR_PATH>,
+            kimi_k3_decode_persistent_kernel<TENSOR_PATH, ROUTE_MAJOR>,
             kDecodeCtaThreads, shared_bytes));
         measured[static_cast<std::size_t>(device)].store(
             blocks, std::memory_order_relaxed);
         // The count is the graph-capture contract: two per device, one per
         // capacity path, both paid before any capture.
-        shared_memory_reservations()[static_cast<std::size_t>(device)]
-            .fetch_add(1, std::memory_order_relaxed);
+        if constexpr (!ROUTE_MAJOR) {
+            shared_memory_reservations()[static_cast<std::size_t>(device)]
+                .fetch_add(1, std::memory_order_relaxed);
+        }
     });
     return measured[static_cast<std::size_t>(device)].load(
         std::memory_order_relaxed);
@@ -928,8 +978,8 @@ inline void validate_residency(
 inline std::int64_t resident_blocks_per_sm_for_testing(
     const bool tensor_path
 ) {
-    return tensor_path ? resident_blocks_per_sm<true>()
-                       : resident_blocks_per_sm<false>();
+    return tensor_path ? resident_blocks_per_sm<true, false>()
+                       : resident_blocks_per_sm<false, false>();
 }
 
 /// Every pointer, alias, and count one persistent launch needs.
@@ -966,14 +1016,14 @@ struct LaunchArguments {
     int profile_phases;
 };
 
-template<bool TENSOR_PATH>
+template<bool TENSOR_PATH, bool ROUTE_MAJOR>
 static __host__ void launch_persistent(
     const LaunchArguments &arguments,
     const layouts_t<TENSOR_PATH> &layouts
 ) {
     validate_grid_residency(
         arguments.available_sms,
-        resident_blocks_per_sm<TENSOR_PATH>(),
+        resident_blocks_per_sm<TENSOR_PATH, ROUTE_MAJOR>(),
         arguments.grid_ctas);
 
     const auto bf16 = [](const at::Tensor &tensor) {
@@ -983,7 +1033,7 @@ static __host__ void launch_persistent(
         return reinterpret_cast<const std::uint8_t *>(tensor.data_ptr());
     };
 
-    kimi_k3_decode_persistent_kernel<TENSOR_PATH>
+    kimi_k3_decode_persistent_kernel<TENSOR_PATH, ROUTE_MAJOR>
         <<<arguments.grid_ctas, kDecodeCtaThreads, kPersistentSharedBytes,
            at::cuda::getCurrentCUDAStream()>>>(
             bf16(arguments.hidden_states),
@@ -1023,6 +1073,7 @@ static __host__ void launch_persistent(
 }
 
 /// Build the eleven TMA descriptors the tcgen05 stages read through.
+template<bool ROUTE_MAJOR>
 static __host__ TensorLayouts tensor_layouts(
     const LaunchArguments &arguments
 ) {
@@ -1045,7 +1096,7 @@ static __host__ TensorLayouts tensor_layouts(
             static_cast<size_t>(columns)};
     };
 
-    const Scratch pointers = scratch_view(
+    const Scratch pointers = scratch_view_for<ROUTE_MAJOR>(
         reinterpret_cast<std::uint8_t *>(arguments.scratch.data_ptr()));
     const int active = arguments.active_tokens;
     constexpr int shared_intermediate = shared_experts::kIntermediate;
@@ -1078,10 +1129,23 @@ static __host__ TensorLayouts tensor_layouts(
 /// Run one whole TP8 Kimi K3 decode step in one persistent launch.
 static __host__ void launch_decode(const LaunchArguments &arguments) {
     if (capacity_bucket(arguments.active_tokens) <= kMaxCoreCapacity) {
-        launch_persistent<false>(arguments, NoTensorLayouts{});
+        launch_persistent<false, false>(arguments, NoTensorLayouts{});
         return;
     }
-    launch_persistent<true>(arguments, tensor_layouts(arguments));
+    launch_persistent<true, false>(
+        arguments, tensor_layouts<false>(arguments));
+}
+
+/// Run benchmark-only option A without changing the production dispatch.
+static __host__ void launch_route_finalize(
+    const LaunchArguments &arguments
+) {
+    if (capacity_bucket(arguments.active_tokens) <= kMaxCoreCapacity) {
+        launch_persistent<false, true>(arguments, NoTensorLayouts{});
+        return;
+    }
+    launch_persistent<true, true>(
+        arguments, tensor_layouts<true>(arguments));
 }
 
 }  // namespace persistent

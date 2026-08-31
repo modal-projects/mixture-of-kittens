@@ -16,6 +16,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <optional>
 #include <tuple>
@@ -25,6 +27,10 @@ namespace kimi_k3_decode {
 
 inline std::int64_t kimi_k3_decode_workspace_bytes() noexcept {
     return SCRATCH_BYTES;
+}
+
+inline std::int64_t kimi_k3_route_finalize_workspace_bytes() noexcept {
+    return kRouteFinalizeScratchBytes;
 }
 
 /// Return one device's immutable properties, querying the driver once.
@@ -1034,6 +1040,68 @@ static __host__ void kimi_k3_decode_entrypoint(
     // stream, whatever device happens to be current on entry.
     const c10::cuda::CUDAGuard device_guard(hidden_states.device());
     persistent::launch_decode(arguments);
+}
+
+/// Run option A through a private, explicitly guarded benchmark entrypoint.
+///
+/// The public `kimi_k3_decode` binding always calls `launch_decode`, whose two
+/// template specializations retain the production Q24 path.
+static __host__ void kimi_k3_route_finalize_entrypoint(
+    const at::Tensor &hidden_states,
+    const at::Tensor &router_weight,
+    const at::Tensor &router_correction_bias,
+    const at::Tensor &routed_expert_down_proj,
+    const at::Tensor &routed_expert_up_proj,
+    const at::Tensor &routed_latent_rmsnorm_weight,
+    const at::Tensor &expert_w13_packed,
+    const at::Tensor &expert_w13_scale,
+    const at::Tensor &expert_w2_packed,
+    const at::Tensor &expert_w2_scale,
+    const at::Tensor &shared_gate_proj,
+    const at::Tensor &shared_up_proj,
+    const at::Tensor &shared_down_proj,
+    const at::Tensor &scratch,
+    const at::Tensor &collective_buffer,
+    const std::vector<std::int64_t> &collective_buffer_ptrs,
+    std::int64_t collective_buffer_multicast_ptr,
+    const at::Tensor &output_mailbox,
+    const std::vector<std::int64_t> &output_mailbox_ptrs,
+    std::int64_t output_mailbox_multicast_ptr,
+    const at::Tensor &barrier_buffer,
+    const std::vector<std::int64_t> &barrier_buffer_ptrs,
+    std::int64_t barrier_buffer_multicast_ptr,
+    const at::Tensor &barrier_target,
+    const at::Tensor &error_flag,
+    std::int64_t tp_rank,
+    std::int64_t active_tokens,
+    std::int64_t workspace_signature_value
+) {
+    const char *const enabled =
+        std::getenv("MOK_KIMI_K3_ENABLE_ROUTE_FINALIZE");
+    TORCH_CHECK(
+        enabled != nullptr && std::strcmp(enabled, "1") == 0,
+        "MoK: FP32 route-major finalize is benchmark-only; set "
+        "MOK_KIMI_K3_ENABLE_ROUTE_FINALIZE=1 in a dedicated benchmark process");
+    TORCH_CHECK(
+        scratch.dim() == 1 && scratch.scalar_type() == at::kByte
+            && scratch.size(0) >= kRouteFinalizeScratchBytes,
+        "MoK: FP32 route-major finalize requires a uint8 scratch of at least ",
+        kRouteFinalizeScratchBytes, " bytes");
+
+    const persistent::LaunchArguments arguments = decode_launch_arguments(
+        hidden_states, router_weight, router_correction_bias,
+        routed_expert_down_proj, routed_expert_up_proj,
+        routed_latent_rmsnorm_weight, expert_w13_packed, expert_w13_scale,
+        expert_w2_packed, expert_w2_scale,
+        shared_gate_proj, shared_up_proj, shared_down_proj, scratch,
+        collective_buffer, collective_buffer_ptrs,
+        collective_buffer_multicast_ptr, output_mailbox, output_mailbox_ptrs,
+        output_mailbox_multicast_ptr, barrier_buffer, barrier_buffer_ptrs,
+        barrier_buffer_multicast_ptr, barrier_target, error_flag, tp_rank,
+        active_tokens, workspace_signature_value);
+
+    const c10::cuda::CUDAGuard device_guard(hidden_states.device());
+    persistent::launch_route_finalize(arguments);
 }
 
 }  // namespace kimi_k3_decode

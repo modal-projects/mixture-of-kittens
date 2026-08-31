@@ -793,6 +793,123 @@ def route_finalize_baseline(
     print(f"baseline report: {destination / 'baseline.json'}")
 
 
+@app.function(image=B300_IMAGE, gpu="B300:8", timeout=14_400)
+def bench_kimi_k3_route_finalize_candidate(
+    samples: int = 1000,
+    repeats: int = 5,
+) -> dict[str, bytes]:
+    """Measure private option A against unchanged production on TP8 B300."""
+    output = Path("/tmp/kimi_k3_route_finalize_candidate.json")
+    debug_log = Path("/opt/cursor/logs/debug.log")
+    command = [
+        "python",
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc-per-node=8",
+        "-m",
+        "benchmarks.kimi_k3_route_finalize_probe",
+        "--output",
+        str(output),
+        "--samples",
+        str(samples),
+        "--repeats",
+        str(repeats),
+    ]
+    print(f"Launching: {' '.join(command)} on 8 x B300")
+    subprocess.run(
+        command,
+        cwd=REMOTE_ROOT,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        check=True,
+        timeout=14_100,
+    )
+    return {
+        "report": output.read_bytes(),
+        "debug_log": debug_log.read_bytes(),
+    }
+
+
+@app.function(
+    image=B300_IMAGE,
+    gpu="B300:8",
+    timeout=14_400,
+    volumes={K3_ARTIFACTS: K3_VOLUME},
+)
+def sanitize_kimi_k3_route_finalize(
+    tool: str = "memcheck",
+) -> dict[str, int | str]:
+    """Sanitize disjoint and concentrated option-A publication paths."""
+    return sanitize_kimi_k3_decode.local(
+        tool=tool,
+        expression="candidate_sanitizer_paths",
+        files="tests/test_kimi_k3_route_finalize_candidate.py",
+        artifact=f"route_finalize_{tool}.log",
+    )
+
+
+@app.local_entrypoint()
+def route_finalize_candidate(
+    output_dir: str = "kimi_k3_route_finalize_candidate_b300",
+    samples: int = 1000,
+    repeats: int = 5,
+) -> None:
+    """Run and retrieve the complete option-A B300 report."""
+    result = bench_kimi_k3_route_finalize_candidate.remote(
+        samples=samples,
+        repeats=repeats,
+    )
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    report = destination / "candidate.json"
+    report.write_bytes(result["report"])
+    (destination / "debug.log").write_bytes(result["debug_log"])
+    local_debug = Path("/opt/cursor/logs/debug.log")
+    local_debug.parent.mkdir(parents=True, exist_ok=True)
+    local_debug.write_bytes(result["debug_log"])
+    print(f"candidate report: {report}")
+
+
+@app.local_entrypoint()
+def route_finalize_sanitizers(
+    output_dir: str = "kimi_k3_route_finalize_candidate_b300",
+) -> None:
+    """Run and retrieve option A under memcheck and racecheck."""
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    failures: list[str] = []
+    for tool in ("memcheck", "racecheck"):
+        try:
+            result = sanitize_kimi_k3_route_finalize.remote(tool=tool)
+        except Exception as error:  # noqa: BLE001 - preserve both tool results
+            failures.append(tool)
+            (destination / f"{tool}.error.txt").write_text(
+                str(error), encoding="utf-8"
+            )
+            continue
+        (destination / f"{tool}.log").write_text(
+            f"command: {result['command']}\n"
+            f"verdict: {'passed' if result['passed'] else 'FAILED'}\n"
+            f"exit_code: {result['exit_code']}\n"
+            f"reported_errors: {result['reported_errors']}\n"
+            f"host_allowed_errors: {result['host_allowed_errors']}\n"
+            f"device_errors: {result['device_errors']}\n"
+            f"hazards: {result['hazards']}\n"
+            f"rank_summaries: {result['rank_summaries']}\n"
+            + "".join(
+                f"failure: {reason}\n" for reason in result["failures"]
+            )
+            + result["output"],
+            encoding="utf-8",
+        )
+        if not result["passed"]:
+            failures.append(tool)
+    if failures:
+        raise SystemExit(
+            f"route-finalize sanitizers failed: {sorted(failures)}"
+        )
+
+
 K3_GATES = ("tests", "sass", "benchmark", "memcheck", "racecheck")
 
 
