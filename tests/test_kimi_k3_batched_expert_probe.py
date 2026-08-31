@@ -12,6 +12,7 @@ def test_temporary_agent_instrumentation_has_been_removed() -> None:
     root = Path(__file__).parents[1]
     sources = (
         root / "benchmarks" / "kimi_k3_batched_expert_probe.py",
+        root / "benchmarks" / "kimi_k3_route_finalize_probe.py",
         root / "benchmarks" / "kimi_k3_decode_runtime.py",
         root / "benchmarks" / "compare_kimi_k3_frameworks.py",
         root / "modal_app.py",
