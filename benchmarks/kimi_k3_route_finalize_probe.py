@@ -214,6 +214,10 @@ def _run(output: Path, samples: int) -> None:
                 workspace.output_mailbox.view(128, 7168)[: case.tokens]
             )
             timing = _measure(graph, device, samples)
+            if rank == 0:
+                # region agent log
+                _agent_log("A|B", "kimi_k3_route_finalize_probe.py:_run:timing", "timing mapping returned", {"mode": case.name, "tokens": case.tokens, "keys": sorted(timing), "summary": {key: value for key, value in timing.items() if key != "rank_max_samples_ms"}, "rank_max_sample_count": len(timing.get("rank_max_samples_ms", []))})
+                # endregion
             cycles = _profile(workspace, case, device)
             row = {
                 "mode": case.name,
