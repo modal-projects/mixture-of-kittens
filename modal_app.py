@@ -44,7 +44,12 @@ from benchmarks.compare_kimi_k3_frameworks import (
     pinned_image_reference,
 )
 from benchmarks.kimi_k3_artifacts import reproducible_tar_bytes
-from benchmarks.kimi_k3_sanitizer import sanitizer_verdict
+from benchmarks.kimi_k3_sanitizer import (
+    K3_SANITIZER_CLAIMS,
+    K3_SANITIZER_GATES,
+    K3_SANITIZER_SELECTION,
+    sanitizer_verdict,
+)
 
 
 @dataclass(frozen=True)
@@ -437,10 +442,100 @@ def _persist_k3_artifact(name: str, payload: bytes | str) -> None:
     print(f"persisted {name}: {path.stat().st_size} bytes")
 
 
+#: The suite that must not run beside a live process group.
+#:
+#: Its tests inject a missed publication and let the candidate's bounded wait
+#: run out, and the `trap` that ends the wait is not contained by the context
+#: that executed it: the other members of an initialized NCCL group see
+#: `cudaErrorLaunchFailure` on their own devices, sometimes. Run as its own
+#: single-process gate on one GPU instead, where the trap has nothing to take
+#: down but the process that asked for it.
+K3_TRAP_FILE = "tests/test_kimi_k3_dependency_schedule_trap.py"
+
+#: The suite that verifies every launch instead of the last one.
+#:
+#: It synchronizes and checks the device after each of 160 rotating launches,
+#: and runs 80 more as 40 interleaved pairs, which is what makes one bad replay
+#: fatal rather than overwritten -- and which also makes it far slower per launch
+#: than anything else here. The counts live in the gate itself, which asserts its
+#: own plan length; `kimi_k3_report_evidence` reads them from there. Kept out of the
+#: main suite so that its cost is a gate the reader can see rather than a tax on
+#: every correctness run.
+K3_STRESS_FILE = "tests/test_kimi_k3_dependency_schedule_stress.py"
+
+#: Suites the TP8 correctness gate does not run, and why, in one place.
+K3_SEPARATE_FILES = (K3_TRAP_FILE, K3_STRESS_FILE)
+
+
 def _k3_test_files() -> tuple[str, ...]:
-    """Every Kimi K3 suite, in the order pytest would collect them."""
+    """Every Kimi K3 suite the TP8 session runs, in collection order."""
     return tuple(
-        sorted(str(path) for path in Path("tests").glob("test_kimi_k3*.py"))
+        sorted(
+            str(path)
+            for path in Path("tests").glob("test_kimi_k3*.py")
+            if str(path) not in K3_SEPARATE_FILES
+        )
+    )
+
+
+@app.function(
+    image=B300_IMAGE,
+    gpu="B300:1",
+    timeout=3_600,
+    volumes={K3_ARTIFACTS: K3_VOLUME},
+)
+def trap_kimi_k3_schedule() -> None:
+    """Let a missed publication on a readiness edge actually trap, on device.
+
+    One GPU and no ranks, which is the whole reason this is a gate of its own
+    rather than a file in the TP8 suite.
+    """
+    # Unbuffered and uncaptured: the injections print what the trapped launch
+    # recorded, and that is the artifact. Captured output would only appear on
+    # failure, which is the one case where the numbers are least interesting.
+    completed = subprocess.run(
+        ["python", "-m", "pytest", "-v", "-s", K3_TRAP_FILE],
+        cwd=REMOTE_ROOT,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        errors="replace",
+        timeout=3_300,
+    )
+    print(completed.stdout, end="")
+    _persist_k3_artifact("trap.log", completed.stdout)
+    if completed.returncode != 0:
+        raise subprocess.CalledProcessError(
+            completed.returncode, K3_TRAP_FILE, output=completed.stdout
+        )
+
+
+@app.function(
+    image=B300_IMAGE,
+    gpu="B300:8",
+    timeout=14_400,
+    volumes={K3_ARTIFACTS: K3_VOLUME},
+)
+def stress_kimi_k3_schedule() -> None:
+    """Verify every launch of a long rotating candidate run, not just the last.
+
+    Untimed on purpose: it synchronizes the device and compares against the
+    oracle after each launch, which is the only way a readiness edge that is
+    usually satisfied gets caught. The graph replay test stays where it is and
+    keeps doing what it is good at -- a thousand crossings of every counter --
+    which is a different claim and a much cheaper one.
+    """
+    output = _run_kimi_k3_torchrun(
+        ["-m", "pytest", "-v", "-x", K3_STRESS_FILE],
+        timeout=14_100,
+        attribute_ranks=True,
+        capture=True,
+    )
+    _persist_k3_artifact(
+        "stress.log",
+        f"command: pytest -v -x {K3_STRESS_FILE}\n\n{output}",
     )
 
 
@@ -454,15 +549,23 @@ def verify_kimi_k3(
     expression: str = "",
     verbose: bool = True,
     files: str = "",
+    exit_first: bool = True,
 ) -> None:
-    """Run the whole Kimi K3 suite on all eight ranks and keep pytest's own log."""
+    """Run the whole Kimi K3 suite on all eight ranks and keep pytest's own log.
+
+    ``exit_first`` stops at the first failure, which is what a gate wants: the
+    suite takes eight B300s and a run that keeps going after a real failure
+    spends them on output nobody reads. Turning it off is for the other case --
+    a change that could plausibly have broken several tests at once, where one
+    failure per round trip is the slow way to find out.
+    """
     selection = ["-k", expression] if expression else []
     chosen = tuple(files.split(",")) if files else _k3_test_files()
     command = [
         "-m",
         "pytest",
         "-v" if verbose else "-q",
-        "-x",
+        *(["-x"] if exit_first else []),
         *chosen,
         *selection,
     ]
@@ -511,22 +614,6 @@ def verify_kimi_k3(
         persist(error.output or "", collected)
         raise
     persist(output, collected)
-
-
-#: What each sanitizer tool selects when it is not told otherwise.
-#:
-#: memcheck runs the three pinned route distributions, which it does in a couple
-#: of minutes. racecheck instruments every shared-memory access in a step whose
-#: shared traffic is the point, so it runs the same three: `concentrated` puts
-#: all 512 assignments on sixteen experts, which is the only shape whose batch
-#: exceeds the gate/up contraction's eight N columns and therefore the one that
-#: drives a second pass over the same weights, and `disjoint` gives 512 experts
-#: one row apiece, so seven of eight N columns are inactive and a CTA runs many
-#: units in a row over the ring's carried parity.
-K3_SANITIZER_SELECTION = {
-    "memcheck": "pinned_route_distributions",
-    "racecheck": "pinned_route_distributions",
-}
 
 
 @app.function(
@@ -602,17 +689,20 @@ def sanitize_kimi_k3_decode(
     print(completed.stdout, end="")
     for line in verdict.summary_lines():
         print(f"{tool} {line}")
+    claim = K3_SANITIZER_CLAIMS[tool]
     # Persisted before the raise below, so a refused run is still recoverable
     # from the volume rather than only from this container's console.
     _persist_k3_artifact(
         artifact or f"{tool}.log",
         f"command: {' '.join(command)}\n"
+        f"establishes: {claim}\n"
         + "\n".join(verdict.summary_lines())
         + f"\n{completed.stdout}",
     )
     result = {
         "command": " ".join(command),
         "tool": tool,
+        "establishes": claim,
         "exit_code": verdict.exit_code,
         "passed": verdict.passed,
         "reported_errors": verdict.reported_errors,
@@ -640,11 +730,18 @@ def sanitize_kimi_k3_decode(
 def sass_kimi_k3_decode() -> str:
     """Report the SM103 SASS evidence for the decode kernel, per instantiation.
 
-    Resource usage and instruction-family counts for both persistent
-    instantiations, plus the routed gate/up ring's geometry and the residency
-    the driver measures for it. What the ring's arrival has to show is copy
-    engine transfers where the old unit had scalar staging -- `UTMALDG` up,
-    `LDG`/`STS` down -- with nothing spilled to local memory in either.
+    Resource usage and instruction-family counts for all four instantiations --
+    both capacity paths of both schedules -- plus the routed gate/up ring's
+    geometry and the residency the driver measures for each. What the ring's
+    arrival has to show is copy engine transfers where the old unit had scalar
+    staging -- `UTMALDG` up, `LDG`/`STS` down -- with nothing spilled to local
+    memory in any of them.
+
+    The candidate is covered because promoting it rests on exactly these two
+    claims: that it spills nothing and that all 148 of its CTAs are co-resident.
+    It is a second kernel rather than a branch inside the first, so its
+    registers and its occupancy are its own and production's numbers say nothing
+    about them.
     """
     import re
 
@@ -659,15 +756,24 @@ def sass_kimi_k3_decode() -> str:
         text=True,
         check=True,
     ).stdout
+    # Both schedules, because the no-spill and one-block-per-SM claims are what
+    # make the candidate promotable and a filter on production's symbol alone
+    # cannot show them. The candidate is a second kernel rather than a branch, so
+    # its registers and its residency are its own.
+    kernels = {
+        "kimi_k3_decode_persistent_kernel": "production",
+        "kimi_k3_decode_dependency_local_kernel": "candidate",
+    }
     table = {
         name: line
         for name, line in re.findall(r"Function (\S+):\s*\n\s*(REG:.*)", usage)
-        if "kimi_k3_decode_persistent_kernel" in name
+        if any(kernel in name for kernel in kernels)
     }
-    labels = {
-        "ILb0EE": "production_core",
-        "ILb1EE": "production_tensor",
-    }
+    # `ILb0E`/`ILb1E` is the mangled capacity flag: the core path and the tcgen05
+    # path are separate instantiations of one template. Matched without the
+    # trailing `E` of production's mangling, because the candidate carries a
+    # second template argument and so does not have one there.
+    paths = {"ILb0E": "core", "ILb1E": "tensor"}
     families = ("UTMALDG", "UTCQMMA", "UTCHMMA", "LDG", "STS", "LDL", "STL", "LDTM")
     report: dict[str, object] = {
         "gpu": torch.cuda.get_device_name(0),
@@ -690,13 +796,23 @@ def sass_kimi_k3_decode() -> str:
         "resident_blocks_per_sm": {
             "production_core": _C._kimi_k3_decode_resident_blocks_per_sm(False),
             "production_tensor": _C._kimi_k3_decode_resident_blocks_per_sm(True),
+            "candidate_core": (
+                _C._kimi_k3_decode_schedule_resident_blocks_per_sm(False)
+            ),
+            "candidate_tensor": (
+                _C._kimi_k3_decode_schedule_resident_blocks_per_sm(True)
+            ),
         },
         "instantiations": {},
     }
     for mangled, line in sorted(table.items()):
-        label = next(
-            (name for key, name in labels.items() if key in mangled), mangled
+        schedule = next(
+            (name for key, name in kernels.items() if key in mangled), "unknown"
         )
+        path = next(
+            (name for key, name in paths.items() if key in mangled), "unknown"
+        )
+        label = f"{schedule}_{path}"
         dump = subprocess.run(
             ["cuobjdump", "-sass", "-fun", mangled, extension],
             capture_output=True,
@@ -748,7 +864,32 @@ def bench_kimi_k3_decode_persisted(git_sha: str) -> bytes:
     return archive
 
 
-K3_GATES = ("tests", "sass", "benchmark", "memcheck", "racecheck")
+#: The gates a default verification run takes.
+#:
+#: `racecheck` is defined but not here, and that is a finding rather than an
+#: omission. It completed cleanly against the barrier schedule -- 3 passed in
+#: 1241s, 0 hazards -- and against the dependency-local schedule the target
+#: traps: `cudaErrorLaunchFailure` on four of eight ranks, which is what a
+#: bounded wait giving up looks like from the host. The tool slows the step by
+#: some four hundred times and the wait budget is a fixed fifteen seconds of
+#: device clocks, and this schedule's longest single wait spans a third of the
+#: step where a barrier's spans a sixth. So the gate fails closed, which is
+#: correct, and it would fail on every run, which trains a reader to skip it.
+#: `verify --gates racecheck` still runs it, and `task-11c-report.md` §4.4 says
+#: what carries the claim instead.
+K3_GATES = (
+    "tests",
+    "stress",
+    "trap",
+    "sass",
+    "benchmark",
+    # Two tools against the schedule that ships, which since promotion is the
+    # one the decode suite takes by default. The three `schedule-*` gates that
+    # pointed the same tools at the guarded candidate are gone: they would now be
+    # the same runs under another name.
+    "memcheck",
+    "synccheck",
+)
 
 
 @app.local_entrypoint()
@@ -760,11 +901,16 @@ def verify(
 ) -> None:
     """Run the named Kimi K3 B300 gates and persist each one's artifact.
 
-    Correctness, both sanitizer tools, the SASS evidence, and the saturated
-    benchmark. Run one after another rather than all at once: four of the five
-    want all eight B300s, and a run that asked for thirty-two would be queued
-    behind itself rather than finishing sooner. A gate that fails is recorded
-    and the rest still run, so one failure does not cost the other evidence.
+    Correctness, the per-launch replay stress, the trap injection, the
+    sanitizer tools that can finish against the schedule that ships, the SASS
+    evidence for both schedules' instantiations, and the saturated benchmark.
+    ``gates`` also accepts a tool that is defined but outside the default set,
+    which is how racecheck is still run on demand. Run one after
+    another rather than all at once:
+    four of them want all eight B300s, and a run that asked for thirty-two
+    would be queued behind itself rather than finishing sooner. A gate that
+    fails is recorded and the rest still run, so one failure does not cost the
+    other evidence.
 
     ``gates`` selects a subset, which is what makes the evidence recoverable:
     the client connection that carries a gate's result is the one thing here
@@ -781,15 +927,34 @@ def verify(
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
     requested = tuple(name.strip() for name in gates.split(",") if name.strip())
-    unknown = sorted(set(requested) - set(K3_GATES))
+    # Every defined gate, not only the default ones: a tool left out of the
+    # default set because it cannot finish is still a gate somebody re-runs to
+    # check whether that is still true.
+    definable = set(K3_GATES) | set(K3_SANITIZER_GATES)
+    unknown = sorted(set(requested) - definable)
     if unknown:
         raise SystemExit(f"unknown Kimi K3 gates: {unknown}")
     functions = {
         "tests": (verify_kimi_k3, (), {}),
+        "stress": (stress_kimi_k3_schedule, (), {}),
+        "trap": (trap_kimi_k3_schedule, (), {}),
         "sass": (sass_kimi_k3_decode, (), {}),
         "benchmark": (bench_kimi_k3_decode_persisted, (git_sha,), {}),
-        "memcheck": (sanitize_kimi_k3_decode, (), {"tool": "memcheck"}),
-        "racecheck": (sanitize_kimi_k3_decode, (), {"tool": "racecheck"}),
+        **{
+            name: (
+                sanitize_kimi_k3_decode,
+                (),
+                {
+                    "tool": tool,
+                    "files": files,
+                    "expression": expression,
+                    # One artifact per gate, so the candidate's racecheck does
+                    # not overwrite production's on the volume.
+                    "artifact": f"{name}.log",
+                },
+            )
+            for name, (tool, files, expression) in K3_SANITIZER_GATES.items()
+        },
     }
     if spawn:
         for name in requested:
@@ -818,9 +983,10 @@ def verify(
             print(f"{name}: FAILED ({type(error).__name__})")
             continue
         (root / f"{name}.error.txt").unlink(missing_ok=True)
-        if name in ("memcheck", "racecheck"):
+        if name in K3_SANITIZER_GATES:
             (root / f"{name}.log").write_text(
                 f"command: {result['command']}\n"
+                f"establishes: {result['establishes']}\n"
                 f"verdict: {'passed' if result['passed'] else 'FAILED'}\n"
                 f"exit_code: {result['exit_code']}\n"
                 f"reported_errors: {result['reported_errors']}\n"
@@ -852,7 +1018,7 @@ def verify(
         elif name == "benchmark":
             (root / "decode_benchmark.tar").write_bytes(result)
         else:
-            (root / "tests.log").write_text("passed\n", encoding="utf-8")
+            (root / f"{name}.log").write_text("passed\n", encoding="utf-8")
         print(f"{name}: done")
     print(f"artifacts: {sorted(path.name for path in root.iterdir())}")
     if failures:
@@ -996,6 +1162,96 @@ def batched_expert_probe(
         "batched expert probe artifacts: "
         f"{sorted(path.name for path in destination.iterdir())}"
     )
+
+
+@app.function(
+    image=B300_IMAGE,
+    gpu="B300:8",
+    timeout=28_800,
+    volumes={K3_ARTIFACTS: K3_VOLUME},
+)
+def bench_kimi_k3_schedule_probe(
+    git_sha: str,
+    warmup_count: int = 500,
+    sample_count: int = 1000,
+    repeats: int = 5,
+) -> bytes:
+    """A/B the dependency-local decode schedule against production on 8x B300.
+
+    The candidate keeps one of the production kernel's five full-grid barriers
+    and replaces the rest with dependency-local queues, so the verdict is a
+    latency verdict and has to be measured on the eight devices the step is a
+    collective over. Both schedules are captured into their own graph pools and
+    replayed interleaved, so the comparison is between two orders of arrival on
+    one workspace rather than between two runs.
+    """
+    if len(git_sha) != 40:
+        raise ValueError("git_sha must be the full 40-character commit SHA")
+    with tempfile.TemporaryDirectory(prefix="kimi-k3-schedule-") as directory:
+        output_dir = Path(directory) / "artifacts"
+        _run_kimi_k3_torchrun(
+            [
+                "-m",
+                "benchmarks.kimi_k3_schedule_probe",
+                "--output-dir",
+                str(output_dir),
+                "--warmup-count",
+                str(warmup_count),
+                "--sample-count",
+                str(sample_count),
+                "--repeats",
+                str(repeats),
+            ],
+            timeout=28_500,
+            environment={"MOK_GIT_SHA": git_sha},
+        )
+        expected = {"manifest.json", "results.json", "raw_samples.json"}
+        actual = {path.name for path in output_dir.iterdir()}
+        if actual != expected:
+            raise RuntimeError(
+                "schedule probe artifacts differ: "
+                f"missing={sorted(expected - actual)}, "
+                f"unexpected={sorted(actual - expected)}"
+            )
+        archive = reproducible_tar_bytes(output_dir)
+        if archive != reproducible_tar_bytes(output_dir):
+            raise RuntimeError("normalized probe archive is not reproducible")
+        # Persisted before the return, so a dropped client connection does not
+        # take a measurement that already finished with it.
+        _persist_k3_artifact("schedule_probe.tar", archive)
+        return archive
+
+
+@app.local_entrypoint()
+def schedule_probe(
+    git_sha: str,
+    output_dir: str = "kimi_k3_schedule_probe",
+    warmup_count: int = 500,
+    sample_count: int = 1000,
+    repeats: int = 5,
+) -> None:
+    """Run and unpack the dependency-local schedule A/B."""
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    archive = bench_kimi_k3_schedule_probe.remote(
+        git_sha,
+        warmup_count=warmup_count,
+        sample_count=sample_count,
+        repeats=repeats,
+    )
+    (destination / "artifacts.tar").write_bytes(archive)
+    with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
+        bundle.extractall(destination, filter="data")
+    results = json.loads((destination / "results.json").read_text())
+    print(json.dumps(results["decision"], indent=2, sort_keys=True))
+    for point in results["points"]:
+        print(
+            f"M{point['tokens']}: "
+            f"production {point['production_median_ms']:.4f} ms, "
+            f"candidate {point['candidate_median_ms']:.4f} ms, "
+            f"{point['improvement_fraction']:+.2%}, "
+            f"{'PASS' if point['passed'] else 'FAIL'}"
+        )
 
 
 @app.local_entrypoint()

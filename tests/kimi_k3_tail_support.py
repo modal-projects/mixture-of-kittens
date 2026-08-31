@@ -43,6 +43,7 @@ SHARD = HIDDEN // KIMI_K3_TP_SIZE
 MAX_TOKENS = KIMI_K3_MAX_TOKENS
 ALIGNMENT = 256
 NUM_PHASE_COUNTERS = 128
+NUM_SCHEDULE_COUNTERS = 128
 UINT32 = 1 << 32
 UINT32_MAX = UINT32 - 1
 UINT64_MAX = (1 << 64) - 1
@@ -132,6 +133,7 @@ def _scratch_layout() -> dict[str, tuple[int, int]]:
         ("latent_x", MAX_TOKENS * LATENT * 2),
         ("unit_expert", 896 * 4),
         ("router_scores", MAX_TOKENS * 896 * 4),
+        ("schedule", NUM_SCHEDULE_COUNTERS * 4),
     )
     layout: dict[str, tuple[int, int]] = {}
     cursor = 0

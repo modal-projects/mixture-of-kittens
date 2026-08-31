@@ -778,10 +778,22 @@ def test_phase_cycle_derivation_separates_routed_epilogues_and_queue() -> None:
     assert cycles["routed_down_epilogue"] == 10
     assert cycles["routed_queue"] == 20
     summary = compare.summarize_phase_cycles(cycles)
+    # 600 + 300 + 20: the three top-level regions, and none of the six children
+    # that measure the inside of two of them.
     assert summary["accounted_cycles"] == 920
     assert summary["share_of_accounted"]["routed_down_epilogue"] == pytest.approx(
         1 / 92
     )
+    # A child's share of its own parent is the actionable number, and the two
+    # are reported separately rather than one standing in for the other.
+    assert summary["share_of_parent"]["routed_gate_up_stage"] == pytest.approx(
+        500 / 600
+    )
+    assert summary["share_of_parent"]["routed_down_mma"] == pytest.approx(
+        40 / 300
+    )
+    assert "routed_queue" not in summary["share_of_parent"]
+    assert summary["top_level"] == list(compare.PHASE_CLOCK_TOP_LEVEL)
 
 
 def test_phase_cycle_summary_tolerates_an_unprofiled_launch() -> None:
@@ -813,19 +825,38 @@ def test_phase_clock_names_match_the_kernel_scratch_band() -> None:
     assert "assignments" not in names
     assert "routed_gate_up_stage" in names
     assert "routed_gate_up_mma" in names
-    # The fused unit's own partition of the gate/up band. Each one has to be a
-    # breakdown suffix as well, or the comparison would add it to the launch
+
+    # And the tree. The parent of every region is declared next to the clocks,
+    # so the reader's total is the header's notion of which regions are
+    # disjoint rather than a guess made from the names.
+    parents = __import__("re").findall(
+        r"^\s{4}(kPhaseClockTopLevel|kClock\w+),\s*//\s*(\w+)$",
+        source.split("kPhaseClockParents[] = {", 1)[1].split("};", 1)[0],
+        __import__("re").MULTILINE,
+    )
+    assert [name for _, name in parents] == names
+    for parent, name in parents:
+        expected = compare.PHASE_CLOCK_PARENTS[name]
+        if expected is None:
+            assert parent == "kPhaseClockTopLevel", name
+        else:
+            camel = "".join(part.capitalize() for part in expected.split("_"))
+            assert parent == f"kClock{camel}", (name, parent)
+
+    # The fused unit's own partition of the gate/up band. Each one is a child of
+    # the region it partitions, or the comparison would add it to the launch
     # total it is a fraction of.
-    for subphase in (
-        "routed_gate_up_tma_issue",
-        "routed_gate_up_tma_wait",
-        "routed_gate_up_ring_full",
-        "routed_gate_up_mma_issue",
-        "routed_gate_up_activation",
-        "routed_gate_up_epilogue",
+    for subphase, parent in (
+        ("routed_gate_up_tma_issue", "routed_gate_up_stage"),
+        ("routed_gate_up_tma_wait", "routed_gate_up_stage"),
+        ("routed_gate_up_ring_full", "routed_gate_up_stage"),
+        ("routed_gate_up_mma_issue", "routed_gate_up_mma"),
+        ("routed_gate_up_activation", "routed_gate_up"),
+        ("routed_gate_up_epilogue", "routed_gate_up"),
     ):
         assert subphase in names, subphase
-        assert subphase.endswith(compare.PHASE_CLOCK_BREAKDOWN_SUFFIXES), subphase
+        assert compare.PHASE_CLOCK_PARENTS[subphase] == parent, subphase
+        assert subphase not in compare.PHASE_CLOCK_TOP_LEVEL, subphase
 
 
 def test_a_measured_gate_up_epilogue_is_not_overwritten_by_the_residual() -> None:

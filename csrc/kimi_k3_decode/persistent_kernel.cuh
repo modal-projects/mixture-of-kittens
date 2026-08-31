@@ -6,6 +6,7 @@
 #include "persistent_sync.cuh"
 #include "expert_mxfp4_fused_w13.cuh"
 #include "expert_mxfp4_grouped.cuh"
+#include "persistent_schedule.cuh"
 #include "router.cuh"
 #include "shared.cuh"
 #include "skinny_gemm.cuh"
@@ -265,12 +266,13 @@ inline std::tuple<int, int, int, int, int> task_plan_for_testing(
     return {plan.route_latent, plan.gate_up, plan.down, plan.tail, plan.grid};
 }
 
-inline std::tuple<int, int, int, int> timeout_metadata_for_testing() {
+inline std::tuple<int, int, int, int, int> timeout_metadata_for_testing() {
     return {
         kPersistentTimeoutPhase,
         kGridGeneration,
         kActivationArrivals,
-        kActiveExpertUnits};
+        kActiveExpertUnits,
+        kTimeoutClaim};
 }
 
 inline std::tuple<int, int> queue_bound_for_testing() {
@@ -328,12 +330,71 @@ inline bool benchmark_phase_profile_for_testing() {
     return benchmark_phase_profile_enabled();
 }
 
-/// The accumulators' scratch band and their names, for the reader.
-inline std::tuple<std::int64_t, std::vector<std::string>>
+/// Whether this process runs the dependency-local schedule. It does by default.
+///
+/// This is what promotion means here. The dependency-local schedule keeps one of
+/// the five full-grid barriers and replaces the rest with per-edge readiness. On
+/// 8x B300, over five interleaved repeats of 1000 samples repeated as four
+/// independent runs, it was 3.4-3.8% faster at the M = 16 median with a 2.9%
+/// better p99, and 0.7-0.9% slower at M = 128. That last one is small but it is
+/// real, it is reproduced in every run, and its margin against the 1% promotion
+/// bar is under two tenths of a percent. It is what a decode step runs unless a
+/// caller asks for the other one, because the shape it is slower at is the one
+/// where the step is already bandwidth-bound and the shape it is faster at is
+/// the one decode runs in.
+///
+/// It did not clear the 8% median gain the experiment was set up to require.
+/// Promotion is against a separate and lower bar, and `task-11c-report.md`
+/// records both verdicts rather than only the one that passed.
+///
+/// The barrier schedule is retained rather than deleted, and this switch is how
+/// it is reached. It is not dead code: it is the other half of the A/B, and it
+/// is what the bit-for-bit equality tests compare against -- two schedules that
+/// must agree exactly are a much stronger statement than one schedule that
+/// agrees with a tolerance-bounded oracle.
+///
+/// No environment guard. Selecting a schedule used to require the benchmark
+/// guard because the candidate was a measurement rather than a shipped path.
+/// Now the default *is* the shipped path, so gating it behind a benchmark
+/// variable would only mean production could not reach the schedule it was
+/// promoted to. The grid override and the phase clocks keep their guard, which
+/// is a separate thing and still benchmark-only.
+static __host__ std::atomic<int> &dependency_schedule_storage() {
+    static std::atomic<int> schedule{1};
+    return schedule;
+}
+
+inline bool dependency_schedule_enabled() {
+    return dependency_schedule_storage().load(std::memory_order_relaxed) != 0;
+}
+
+inline void set_dependency_schedule_for_testing(const bool enabled) {
+    dependency_schedule_storage().store(
+        enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+inline bool dependency_schedule_for_testing() {
+    return dependency_schedule_enabled();
+}
+
+/// The accumulators' scratch band, their names, and their containing regions.
+///
+/// The parents are part of the metadata rather than the reader's convention
+/// because the band is not flat: nine of the twenty-two regions refine another
+/// region and measure the same cycles again at a finer grain. A reader that
+/// summed all of them would overstate the launch by more than a third, so the
+/// structure that says which may be added has to come from the same header
+/// that defines the clocks.
+inline std::tuple<std::int64_t, std::vector<std::string>,
+                  std::vector<std::int64_t>>
 phase_clock_metadata_for_testing() {
     std::vector<std::string> names;
     for (const char *const name : kPhaseClockNames) names.emplace_back(name);
-    return {static_cast<std::int64_t>(kPhaseClockBegin), names};
+    std::vector<std::int64_t> parents;
+    for (const int parent : kPhaseClockParents) {
+        parents.push_back(static_cast<std::int64_t>(parent));
+    }
+    return {static_cast<std::int64_t>(kPhaseClockBegin), names, parents};
 }
 
 inline void set_benchmark_grid_ctas_for_testing(const std::int64_t grid_ctas) {
@@ -457,6 +518,10 @@ void kimi_k3_decode_persistent_kernel(
     // tensor memory only once, so the pool is provisioned here, before any
     // divergence, and handed to every stage this block later runs.
     kittens::tensor_allocator<1, 1> tensor_pool{};
+
+    // Cleared before anything can wait, so a timeout diagnostic this launch
+    // publishes is claimed by one of this launch's waiters.
+    timeout::clear_claim(scratch);
 
     // Latched before the first barrier, which is the only point at which no
     // CTA of this launch can have advanced the counter yet.
@@ -620,7 +685,7 @@ void kimi_k3_decode_persistent_kernel(
         __syncthreads();
         router::build_expert_units(shared, scratch);
         __syncthreads();
-        mark = clocks.now();
+        mark = clocks.lap(kClockAssignment, mark);
     }
     expert_mxfp4::quantize_latent_rows(
         scratch.latent_x, scratch, active_tokens, block, grid_ctas);
@@ -777,6 +842,7 @@ void kimi_k3_decode_persistent_kernel(
                     __ll2float_rn(scratch.routed_accumulator_fixed[index])
                     * kRoutedAccumulatorScaleInverse);
     }
+    mark = clocks.lap(kClockPublish, mark);
     // The barrier releases at system scope, so this rank's whole collective
     // buffer is visible to its peers before its coordinator opens the entry
     // rendezvous that tells them it is.
@@ -932,6 +998,19 @@ inline std::int64_t resident_blocks_per_sm_for_testing(
                        : resident_blocks_per_sm<false>();
 }
 
+/// The same residency proof, for the guarded dependency-local candidate.
+///
+/// Its whole deadlock argument rests on every CTA of the launch being
+/// co-resident, so the candidate has to be measured in its own right rather
+/// than assumed to inherit the production kernel's occupancy.
+inline std::int64_t schedule_resident_blocks_per_sm_for_testing(
+    const bool tensor_path
+) {
+    return tensor_path
+        ? schedule::resident_blocks_per_sm<true, TensorLayouts>()
+        : schedule::resident_blocks_per_sm<false, NoTensorLayouts>();
+}
+
 /// Every pointer, alias, and count one persistent launch needs.
 ///
 /// The kernel takes twenty-odd arguments and the two capacity paths pass the
@@ -1076,8 +1155,34 @@ static __host__ TensorLayouts tensor_layouts(
 }
 
 /// Run one whole TP8 Kimi K3 decode step in one persistent launch.
+///
+/// One launch either way. Each schedule is its own kernel rather than a runtime
+/// branch inside one, so neither pays the other's register pressure: all four
+/// instantiations compile with nothing spilled and one CTA resident per SM.
+///
+/// Deliberately not the register counts. They move with the toolchain and with
+/// any edit to either schedule, so a comment naming them is stale from some
+/// later commit on -- this one said 194 and 248 against a build that produced
+/// 196 and 255. The residency argument does not rest on a count anyway, it
+/// rests on the invariant, and `test_neither_schedule_instantiation_spills` and
+/// `test_neither_instantiation_spills` assert that against the built binary:
+/// `STACK:0`, `LOCAL:0`, shared within the opt-in maximum, and one resident
+/// block per SM. Those tests pin no count either, for the same reason. What a
+/// given build produced is in `task-11c-sass.json`.
 static __host__ void launch_decode(const LaunchArguments &arguments) {
-    if (capacity_bucket(arguments.active_tokens) <= kMaxCoreCapacity) {
+    const bool core = capacity_bucket(arguments.active_tokens)
+        <= kMaxCoreCapacity;
+    if (dependency_schedule_enabled()) {
+        if (core) {
+            schedule::launch_dependency_local<false>(
+                arguments, NoTensorLayouts{});
+            return;
+        }
+        schedule::launch_dependency_local<true>(
+            arguments, tensor_layouts(arguments));
+        return;
+    }
+    if (core) {
         launch_persistent<false>(arguments, NoTensorLayouts{});
         return;
     }

@@ -57,6 +57,10 @@ void kimi_k3_tail_core_kernel(
     const Scratch scratch = scratch_view(scratch_bytes);
     const int block = static_cast<int>(blockIdx.x);
 
+    // The private path's tail is its own launch, so it clears the claim word
+    // the way the one-launch kernels clear theirs.
+    timeout::clear_claim(scratch);
+
     if (block < kReduceBegin) {
         coordinate_ranks(scratch, error_flag, barrier_multicast, barrier_local,
                          barrier_target);
@@ -109,6 +113,10 @@ void kimi_k3_tail_tensor_kernel(
     __shared__ std::uint32_t baseline_slot;
     const Scratch scratch = scratch_view(scratch_bytes);
     const int block = static_cast<int>(blockIdx.x);
+
+    // The private path's tail is its own launch, so it clears the claim word
+    // the way the one-launch kernels clear theirs.
+    timeout::clear_claim(scratch);
 
     // The managed allocator barriers the whole CTA, so every block provisions
     // its tensor memory before the roles diverge.

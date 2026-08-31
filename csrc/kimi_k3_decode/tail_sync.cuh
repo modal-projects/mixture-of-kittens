@@ -4,6 +4,7 @@
 
 #include "../serial_sync.cuh"
 #include "skinny_gemm.cuh"
+#include "timeout_publication.cuh"
 #include "types.cuh"
 
 #include <cuda_bf16.h>
@@ -222,22 +223,23 @@ static __device__ __forceinline__ std::uint32_t load_relaxed_system(
 ///
 /// The scratch slot names the generation counter the wait was on and
 /// `error_flag` names the site, because the tail has six bounded waits and only
-/// four counters between them. Both writes are released at system scope before
-/// the trap, so a host that reads either one after the launch aborts sees the
-/// value this thread wrote rather than whatever was there before.
+/// four counters between them.
+///
+/// The publication is `timeout::publish_and_trap`, the same protocol the
+/// one-launch kernels' waits use: one claim word decides which waiter's pair
+/// gets published, the slot is released at system scope before the code that
+/// sends a reader to it, and a waiter that lost the claim does not trap while
+/// the pair is half written. The tail needs it as much as the schedule does --
+/// three roles across two shapes, six waits, and a coordinator that can give up
+/// on a peer rank at the same moment its own consumers give up on it.
 static __device__ __forceinline__ void record_timeout_and_trap(
     const Scratch &scratch,
     int *__restrict__ const error_flag,
     const int generation_index,
     const int error_code
 ) {
-    atomicExch(
-        reinterpret_cast<unsigned int *>(&scratch.phase[kTailTimeoutPhase]),
-        static_cast<unsigned int>(generation_index));
-    atomicExch(reinterpret_cast<unsigned int *>(error_flag),
-               static_cast<unsigned int>(error_code));
-    __threadfence_system();
-    asm volatile("trap;");
+    timeout::publish_and_trap(
+        scratch, error_flag, kTailTimeoutPhase, generation_index, error_code);
 }
 
 /// Latch this CTA's baseline for one generation before any producer can move it.

@@ -1,0 +1,28 @@
+{
+  "benchmark": "kimi_k3_schedule_probe",
+  "dry_run": false,
+  "gate": {
+    "gate_point_tokens": 16,
+    "guard_point_tokens": 128,
+    "maximum_regression": 0.01,
+    "minimum_median_gain": 0.08,
+    "p99": "the gate point's median repeat p99 must improve"
+  },
+  "git_sha": "a62b1bb290dee42b63bed024112ade19cce567a6",
+  "graph_pool_size": 4,
+  "interleaving": "the variant order rotates once per repeat, so temporal drift is shared rather than charged to one variant",
+  "latency_statistic": "per-iteration maximum over the eight ranks",
+  "repeats": 5,
+  "sample_count": 1000,
+  "token_counts": [
+    16,
+    32,
+    128
+  ],
+  "tp_size": 8,
+  "variants": [
+    "production",
+    "candidate"
+  ],
+  "warmup_count": 500
+}

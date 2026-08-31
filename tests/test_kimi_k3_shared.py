@@ -66,6 +66,7 @@ def _scratch_layout() -> dict[str, tuple[int, int]]:
         ("latent_x", MAX_TOKENS * LATENT * 2),
         ("unit_expert", 896 * 4),
         ("router_scores", MAX_TOKENS * 896 * 4),
+        ("schedule", 128 * 4),
     )
     layout: dict[str, tuple[int, int]] = {}
     cursor = 0
@@ -293,7 +294,7 @@ def _assert_active_intermediates(
 def test_workspace_bytes_matches_shared_scratch_source_of_truth(
     device: torch.device,
 ) -> None:
-    assert SCRATCH_BYTES == 8_111_360
+    assert SCRATCH_BYTES == 8_111_872
     assert _C.kimi_k3_decode_workspace_bytes() == SCRATCH_BYTES
     assert SCRATCH_LAYOUT["shared_gate"] == (4_994_816, 196_608)
     assert SCRATCH_LAYOUT["shared_up"] == (5_191_424, 196_608)

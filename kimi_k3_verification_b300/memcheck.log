@@ -1,0 +1,1355 @@
+command: compute-sanitizer --tool memcheck --error-exitcode 99 --target-processes all python -m torch.distributed.run --standalone --nproc-per-node=8 -m pytest -q -x tests/test_kimi_k3_decode.py -k pinned_route_distributions
+establishes: memory safety only: out-of-bounds and misaligned accesses, leaks, and invalid API use. Says nothing about ordering or about races.
+verdict: passed
+exit_code: 99
+reported_errors: 16
+host_allowed_errors: 16
+device_errors: 0
+hazards: 0
+rank_summaries: 8
+========= COMPUTE-SANITIZER
+========= CUDA API Error: Failed to allocate physical memory
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: c10::cuda::(anonymous namespace)::isFabricSupported() [0x5a0fd] in libc10_cuda.so
+=========         Host Frame: c10::cuda::get_fabric_access(signed char) [0x5b48a] in libc10_cuda.so
+=========         Host Frame: c10d::symmetric_memory::CUDASymmetricMemoryAllocator::alloc(unsigned long, int, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&) [0x1267cbe] in libtorch_cuda.so
+=========         Host Frame: c10d::symmetric_memory::empty_strided_p2p(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>) [0x6753be0] in libtorch_cpu.so
+=========         Host Frame: pybind11::cpp_function::initialize<at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor, c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>, pybind11::name, pybind11::scope, pybind11::sibling, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg_v, pybind11::arg_v>(at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor (*)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), pybind11::name const&, pybind11::scope const&, pybind11::sibling const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg_v const&, pybind11::arg_v const&)::{lambda(pybind11::detail::function_call&)#3}::operator()(pybind11::detail::function_call&) const [0xfc2ac4] in libtorch_python.so
+=========         Host Frame: pybind11::cpp_function::dispatcher(_object*, _object* const*, unsigned long, _object*) [0x3f2bb1] in libtorch_python.so
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: gen_iternext in genobject.c:603 [0x36f899] in libpython3.12.so.1.0
+=========         Host Frame: builtin_next in bltinmodule.c.h:730 [0x3def06] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2929 [0x3f48c9] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: PyObject_Call in call.c:379 [0x367f62] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:3254 [0x3eb6f5] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: PyEval_EvalCode in ceval.c:578 [0x4ec30a] in libpython3.12.so.1.0
+=========         Host Frame: builtin_exec in bltinmodule.c.h:586 [0x4e9c42] in libpython3.12.so.1.0
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: pymain_run_module in main.c:300 [0x29aa53] in libpython3.12.so.1.0
+=========         Host Frame: Py_RunMain in main.c:709 [0x53f94d] in libpython3.12.so.1.0
+=========         Host Frame: Py_BytesMain in main.c:763 [0x29a7d6] in libpython3.12.so.1.0
+=========         Host Frame:  [0x2a1c9] in libc.so.6
+=========         Host Frame: __libc_start_main [0x2a28a] in libc.so.6
+=========         Host Frame: _start [0x2010a8] in python
+=========         Host Frame: empty in __init__.py:1974
+=========         Host Frame: allocate_symmetric in kimi_k3.py:205
+=========         Host Frame: create_kimi_k3_decode_workspace in kimi_k3.py:224
+=========         Host Frame: get_kimi_k3_decode_workspace in kimi_k3.py:314
+=========         Host Frame: workspace in kimi_k3_tail_support.py:167
+=========         Host Frame: call_fixture_func in fixtures.py:998
+=========         Host Frame: pytest_fixture_setup in fixtures.py:1328
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: execute in fixtures.py:1232
+=========         Host Frame: _get_active_fixturedef in fixtures.py:726
+=========         Host Frame: getfixturevalue in fixtures.py:630
+=========         Host Frame: _fillfixtures in fixtures.py:806
+=========         Host Frame: setup in python.py:1710
+=========         Host Frame: setup in runner.py:536
+=========         Host Frame: pytest_runtest_setup in runner.py:170
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: <lambda> in runner.py:250
+=========         Host Frame: from_call in runner.py:361
+=========         Host Frame: call_and_report in runner.py:249
+=========         Host Frame: runtestprotocol in runner.py:132
+=========         Host Frame: pytest_runtest_protocol in runner.py:118
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: pytest_runtestloop in main.py:408
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in main.py:384
+=========         Host Frame: wrap_session in main.py:330
+=========         Host Frame: pytest_cmdline_main in main.py:377
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in __init__.py:229
+=========         Host Frame: _console_main in __init__.py:253
+=========         Host Frame: <module> in __main__.py:9
+=========         Host Frame: _run_code in <frozen runpy>:88
+=========         Host Frame: _run_module_as_main in <frozen runpy>:198
+========= 
+========= CUDA API Error: Failed to allocate physical memory
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: c10::cuda::(anonymous namespace)::isFabricSupported() [0x5a0fd] in libc10_cuda.so
+=========         Host Frame: c10::cuda::get_fabric_access(signed char) [0x5b48a] in libc10_cuda.so
+=========         Host Frame: c10d::symmetric_memory::CUDASymmetricMemoryAllocator::alloc(unsigned long, int, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&) [0x1267cbe] in libtorch_cuda.so
+=========         Host Frame: c10d::symmetric_memory::empty_strided_p2p(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>) [0x6753be0] in libtorch_cpu.so
+=========         Host Frame: pybind11::cpp_function::initialize<at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor, c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>, pybind11::name, pybind11::scope, pybind11::sibling, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg_v, pybind11::arg_v>(at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor (*)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), pybind11::name const&, pybind11::scope const&, pybind11::sibling const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg_v const&, pybind11::arg_v const&)::{lambda(pybind11::detail::function_call&)#3}::operator()(pybind11::detail::function_call&) const [0xfc2ac4] in libtorch_python.so
+=========         Host Frame: pybind11::cpp_function::dispatcher(_object*, _object* const*, unsigned long, _object*) [0x3f2bb1] in libtorch_python.so
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: gen_iternext in genobject.c:603 [0x36f899] in libpython3.12.so.1.0
+=========         Host Frame: builtin_next in bltinmodule.c.h:730 [0x3def06] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2929 [0x3f48c9] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: PyObject_Call in call.c:379 [0x367f62] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:3254 [0x3eb6f5] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: PyEval_EvalCode in ceval.c:578 [0x4ec30a] in libpython3.12.so.1.0
+=========         Host Frame: builtin_exec in bltinmodule.c.h:586 [0x4e9c42] in libpython3.12.so.1.0
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: pymain_run_module in main.c:300 [0x29aa53] in libpython3.12.so.1.0
+=========         Host Frame: Py_RunMain in main.c:709 [0x53f94d] in libpython3.12.so.1.0
+=========         Host Frame: Py_BytesMain in main.c:763 [0x29a7d6] in libpython3.12.so.1.0
+=========         Host Frame:  [0x2a1c9] in libc.so.6
+=========         Host Frame: __libc_start_main [0x2a28a] in libc.so.6
+=========         Host Frame: _start [0x2010a8] in python
+=========         Host Frame: empty in __init__.py:1974
+=========         Host Frame: allocate_symmetric in kimi_k3.py:205
+=========         Host Frame: create_kimi_k3_decode_workspace in kimi_k3.py:224
+=========         Host Frame: get_kimi_k3_decode_workspace in kimi_k3.py:314
+=========         Host Frame: workspace in kimi_k3_tail_support.py:167
+=========         Host Frame: call_fixture_func in fixtures.py:998
+=========         Host Frame: pytest_fixture_setup in fixtures.py:1328
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: execute in fixtures.py:1232
+=========         Host Frame: _get_active_fixturedef in fixtures.py:726
+=========         Host Frame: getfixturevalue in fixtures.py:630
+=========         Host Frame: _fillfixtures in fixtures.py:806
+=========         Host Frame: setup in python.py:1710
+=========         Host Frame: setup in runner.py:536
+=========         Host Frame: pytest_runtest_setup in runner.py:170
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: <lambda> in runner.py:250
+=========         Host Frame: from_call in runner.py:361
+=========         Host Frame: call_and_report in runner.py:249
+=========         Host Frame: runtestprotocol in runner.py:132
+=========         Host Frame: pytest_runtest_protocol in runner.py:118
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: pytest_runtestloop in main.py:408
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in main.py:384
+=========         Host Frame: wrap_session in main.py:330
+=========         Host Frame: pytest_cmdline_main in main.py:377
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in __init__.py:229
+=========         Host Frame: _console_main in __init__.py:253
+=========         Host Frame: <module> in __main__.py:9
+=========         Host Frame: _run_code in <frozen runpy>:88
+=========         Host Frame: _run_module_as_main in <frozen runpy>:198
+========= 
+========= CUDA API Error: Failed to allocate physical memory
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: c10::cuda::(anonymous namespace)::isFabricSupported() [0x5a0fd] in libc10_cuda.so
+=========         Host Frame: c10::cuda::get_fabric_access(signed char) [0x5b48a] in libc10_cuda.so
+=========         Host Frame: c10d::symmetric_memory::CUDASymmetricMemoryAllocator::alloc(unsigned long, int, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&) [0x1267cbe] in libtorch_cuda.so
+=========         Host Frame: c10d::symmetric_memory::empty_strided_p2p(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>) [0x6753be0] in libtorch_cpu.so
+=========         Host Frame: pybind11::cpp_function::initialize<at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor, c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>, pybind11::name, pybind11::scope, pybind11::sibling, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg_v, pybind11::arg_v>(at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor (*)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), pybind11::name const&, pybind11::scope const&, pybind11::sibling const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg_v const&, pybind11::arg_v const&)::{lambda(pybind11::detail::function_call&)#3}::operator()(pybind11::detail::function_call&) const [0xfc2ac4] in libtorch_python.so
+=========         Host Frame: pybind11::cpp_function::dispatcher(_object*, _object* const*, unsigned long, _object*) [0x3f2bb1] in libtorch_python.so
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: gen_iternext in genobject.c:603 [0x36f899] in libpython3.12.so.1.0
+=========         Host Frame: builtin_next in bltinmodule.c.h:730 [0x3def06] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2929 [0x3f48c9] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: PyObject_Call in call.c:379 [0x367f62] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:3254 [0x3eb6f5] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: PyEval_EvalCode in ceval.c:578 [0x4ec30a] in libpython3.12.so.1.0
+=========         Host Frame: builtin_exec in bltinmodule.c.h:586 [0x4e9c42] in libpython3.12.so.1.0
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: pymain_run_module in main.c:300 [0x29aa53] in libpython3.12.so.1.0
+=========         Host Frame: Py_RunMain in main.c:709 [0x53f94d] in libpython3.12.so.1.0
+=========         Host Frame: Py_BytesMain in main.c:763 [0x29a7d6] in libpython3.12.so.1.0
+=========         Host Frame:  [0x2a1c9] in libc.so.6
+=========         Host Frame: __libc_start_main [0x2a28a] in libc.so.6
+=========         Host Frame: _start [0x2010a8] in python
+=========         Host Frame: empty in __init__.py:1974
+=========         Host Frame: allocate_symmetric in kimi_k3.py:205
+=========         Host Frame: create_kimi_k3_decode_workspace in kimi_k3.py:224
+=========         Host Frame: get_kimi_k3_decode_workspace in kimi_k3.py:314
+=========         Host Frame: workspace in kimi_k3_tail_support.py:167
+=========         Host Frame: call_fixture_func in fixtures.py:998
+=========         Host Frame: pytest_fixture_setup in fixtures.py:1328
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: execute in fixtures.py:1232
+=========         Host Frame: _get_active_fixturedef in fixtures.py:726
+=========         Host Frame: getfixturevalue in fixtures.py:630
+=========         Host Frame: _fillfixtures in fixtures.py:806
+=========         Host Frame: setup in python.py:1710
+=========         Host Frame: setup in runner.py:536
+=========         Host Frame: pytest_runtest_setup in runner.py:170
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: <lambda> in runner.py:250
+=========         Host Frame: from_call in runner.py:361
+=========         Host Frame: call_and_report in runner.py:249
+=========         Host Frame: runtestprotocol in runner.py:132
+=========         Host Frame: pytest_runtest_protocol in runner.py:118
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: pytest_runtestloop in main.py:408
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in main.py:384
+=========         Host Frame: wrap_session in main.py:330
+=========         Host Frame: pytest_cmdline_main in main.py:377
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in __init__.py:229
+=========         Host Frame: _console_main in __init__.py:253
+=========         Host Frame: <module> in __main__.py:9
+=========         Host Frame: _run_code in <frozen runpy>:88
+=========         Host Frame: _run_module_as_main in <frozen runpy>:198
+========= 
+========= CUDA API Error: Failed to allocate physical memory
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: c10::cuda::(anonymous namespace)::isFabricSupported() [0x5a0fd] in libc10_cuda.so
+=========         Host Frame: c10::cuda::get_fabric_access(signed char) [0x5b48a] in libc10_cuda.so
+=========         Host Frame: c10d::symmetric_memory::CUDASymmetricMemoryAllocator::alloc(unsigned long, int, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&) [0x1267cbe] in libtorch_cuda.so
+=========         Host Frame: c10d::symmetric_memory::empty_strided_p2p(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>) [0x6753be0] in libtorch_cpu.so
+=========         Host Frame: pybind11::cpp_function::initialize<at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor, c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>, pybind11::name, pybind11::scope, pybind11::sibling, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg_v, pybind11::arg_v>(at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor (*)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), pybind11::name const&, pybind11::scope const&, pybind11::sibling const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg_v const&, pybind11::arg_v const&)::{lambda(pybind11::detail::function_call&)#3}::operator()(pybind11::detail::function_call&) const [0xfc2ac4] in libtorch_python.so
+=========         Host Frame: pybind11::cpp_function::dispatcher(_object*, _object* const*, unsigned long, _object*) [0x3f2bb1] in libtorch_python.so
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: gen_iternext in genobject.c:603 [0x36f899] in libpython3.12.so.1.0
+=========         Host Frame: builtin_next in bltinmodule.c.h:730 [0x3def06] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2929 [0x3f48c9] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: PyObject_Call in call.c:379 [0x367f62] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:3254 [0x3eb6f5] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: PyEval_EvalCode in ceval.c:578 [0x4ec30a] in libpython3.12.so.1.0
+=========         Host Frame: builtin_exec in bltinmodule.c.h:586 [0x4e9c42] in libpython3.12.so.1.0
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: pymain_run_module in main.c:300 [0x29aa53] in libpython3.12.so.1.0
+=========         Host Frame: Py_RunMain in main.c:709 [0x53f94d] in libpython3.12.so.1.0
+=========         Host Frame: Py_BytesMain in main.c:763 [0x29a7d6] in libpython3.12.so.1.0
+=========         Host Frame:  [0x2a1c9] in libc.so.6
+=========         Host Frame: __libc_start_main [0x2a28a] in libc.so.6
+=========         Host Frame: _start [0x2010a8] in python
+=========         Host Frame: empty in __init__.py:1974
+=========         Host Frame: allocate_symmetric in kimi_k3.py:205
+=========         Host Frame: create_kimi_k3_decode_workspace in kimi_k3.py:224
+=========         Host Frame: get_kimi_k3_decode_workspace in kimi_k3.py:314
+=========         Host Frame: workspace in kimi_k3_tail_support.py:167
+=========         Host Frame: call_fixture_func in fixtures.py:998
+=========         Host Frame: pytest_fixture_setup in fixtures.py:1328
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: execute in fixtures.py:1232
+=========         Host Frame: _get_active_fixturedef in fixtures.py:726
+=========         Host Frame: getfixturevalue in fixtures.py:630
+=========         Host Frame: _fillfixtures in fixtures.py:806
+=========         Host Frame: setup in python.py:1710
+=========         Host Frame: setup in runner.py:536
+=========         Host Frame: pytest_runtest_setup in runner.py:170
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: <lambda> in runner.py:250
+=========         Host Frame: from_call in runner.py:361
+=========         Host Frame: call_and_report in runner.py:249
+=========         Host Frame: runtestprotocol in runner.py:132
+=========         Host Frame: pytest_runtest_protocol in runner.py:118
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: pytest_runtestloop in main.py:408
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in main.py:384
+=========         Host Frame: wrap_session in main.py:330
+=========         Host Frame: pytest_cmdline_main in main.py:377
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in __init__.py:229
+=========         Host Frame: _console_main in __init__.py:253
+=========         Host Frame: <module> in __main__.py:9
+=========         Host Frame: _run_code in <frozen runpy>:88
+=========         Host Frame: _run_module_as_main in <frozen runpy>:198
+========= 
+========= CUDA API Error: Failed to allocate physical memory
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: c10::cuda::(anonymous namespace)::isFabricSupported() [0x5a0fd] in libc10_cuda.so
+=========         Host Frame: c10::cuda::get_fabric_access(signed char) [0x5b48a] in libc10_cuda.so
+=========         Host Frame: c10d::symmetric_memory::CUDASymmetricMemoryAllocator::alloc(unsigned long, int, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&) [0x1267cbe] in libtorch_cuda.so
+=========         Host Frame: c10d::symmetric_memory::empty_strided_p2p(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>) [0x6753be0] in libtorch_cpu.so
+=========         Host Frame: pybind11::cpp_function::initialize<at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor, c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>, pybind11::name, pybind11::scope, pybind11::sibling, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg_v, pybind11::arg_v>(at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor (*)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), pybind11::name const&, pybind11::scope const&, pybind11::sibling const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg_v const&, pybind11::arg_v const&)::{lambda(pybind11::detail::function_call&)#3}::operator()(pybind11::detail::function_call&) const [0xfc2ac4] in libtorch_python.so
+=========         Host Frame: pybind11::cpp_function::dispatcher(_object*, _object* const*, unsigned long, _object*) [0x3f2bb1] in libtorch_python.so
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: gen_iternext in genobject.c:603 [0x36f899] in libpython3.12.so.1.0
+=========         Host Frame: builtin_next in bltinmodule.c.h:730 [0x3def06] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2929 [0x3f48c9] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: PyObject_Call in call.c:379 [0x367f62] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:3254 [0x3eb6f5] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: PyEval_EvalCode in ceval.c:578 [0x4ec30a] in libpython3.12.so.1.0
+=========         Host Frame: builtin_exec in bltinmodule.c.h:586 [0x4e9c42] in libpython3.12.so.1.0
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: pymain_run_module in main.c:300 [0x29aa53] in libpython3.12.so.1.0
+=========         Host Frame: Py_RunMain in main.c:709 [0x53f94d] in libpython3.12.so.1.0
+=========         Host Frame: Py_BytesMain in main.c:763 [0x29a7d6] in libpython3.12.so.1.0
+=========         Host Frame:  [0x2a1c9] in libc.so.6
+=========         Host Frame: __libc_start_main [0x2a28a] in libc.so.6
+=========         Host Frame: _start [0x2010a8] in python
+=========         Host Frame: empty in __init__.py:1974
+=========         Host Frame: allocate_symmetric in kimi_k3.py:205
+=========         Host Frame: create_kimi_k3_decode_workspace in kimi_k3.py:224
+=========         Host Frame: get_kimi_k3_decode_workspace in kimi_k3.py:314
+=========         Host Frame: workspace in kimi_k3_tail_support.py:167
+=========         Host Frame: call_fixture_func in fixtures.py:998
+=========         Host Frame: pytest_fixture_setup in fixtures.py:1328
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: execute in fixtures.py:1232
+=========         Host Frame: _get_active_fixturedef in fixtures.py:726
+=========         Host Frame: getfixturevalue in fixtures.py:630
+=========         Host Frame: _fillfixtures in fixtures.py:806
+=========         Host Frame: setup in python.py:1710
+=========         Host Frame: setup in runner.py:536
+=========         Host Frame: pytest_runtest_setup in runner.py:170
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: <lambda> in runner.py:250
+=========         Host Frame: from_call in runner.py:361
+=========         Host Frame: call_and_report in runner.py:249
+=========         Host Frame: runtestprotocol in runner.py:132
+=========         Host Frame: pytest_runtest_protocol in runner.py:118
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: pytest_runtestloop in main.py:408
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in main.py:384
+=========         Host Frame: wrap_session in main.py:330
+=========         Host Frame: pytest_cmdline_main in main.py:377
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in __init__.py:229
+=========         Host Frame: _console_main in __init__.py:253
+=========         Host Frame: <module> in __main__.py:9
+=========         Host Frame: _run_code in <frozen runpy>:88
+=========         Host Frame: _run_module_as_main in <frozen runpy>:198
+========= 
+========= CUDA API Error: Failed to allocate physical memory
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: c10::cuda::(anonymous namespace)::isFabricSupported() [0x5a0fd] in libc10_cuda.so
+=========         Host Frame: c10::cuda::get_fabric_access(signed char) [0x5b48a] in libc10_cuda.so
+=========         Host Frame: c10d::symmetric_memory::CUDASymmetricMemoryAllocator::alloc(unsigned long, int, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&) [0x1267cbe] in libtorch_cuda.so
+=========         Host Frame: c10d::symmetric_memory::empty_strided_p2p(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>) [0x6753be0] in libtorch_cpu.so
+=========         Host Frame: pybind11::cpp_function::initialize<at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor, c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>, pybind11::name, pybind11::scope, pybind11::sibling, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg_v, pybind11::arg_v>(at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor (*)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), pybind11::name const&, pybind11::scope const&, pybind11::sibling const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg_v const&, pybind11::arg_v const&)::{lambda(pybind11::detail::function_call&)#3}::operator()(pybind11::detail::function_call&) const [0xfc2ac4] in libtorch_python.so
+=========         Host Frame: pybind11::cpp_function::dispatcher(_object*, _object* const*, unsigned long, _object*) [0x3f2bb1] in libtorch_python.so
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: gen_iternext in genobject.c:603 [0x36f899] in libpython3.12.so.1.0
+=========         Host Frame: builtin_next in bltinmodule.c.h:730 [0x3def06] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2929 [0x3f48c9] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: PyObject_Call in call.c:379 [0x367f62] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:3254 [0x3eb6f5] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: PyEval_EvalCode in ceval.c:578 [0x4ec30a] in libpython3.12.so.1.0
+=========         Host Frame: builtin_exec in bltinmodule.c.h:586 [0x4e9c42] in libpython3.12.so.1.0
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: pymain_run_module in main.c:300 [0x29aa53] in libpython3.12.so.1.0
+=========         Host Frame: Py_RunMain in main.c:709 [0x53f94d] in libpython3.12.so.1.0
+=========         Host Frame: Py_BytesMain in main.c:763 [0x29a7d6] in libpython3.12.so.1.0
+=========         Host Frame:  [0x2a1c9] in libc.so.6
+=========         Host Frame: __libc_start_main [0x2a28a] in libc.so.6
+=========         Host Frame: _start [0x2010a8] in python
+=========         Host Frame: empty in __init__.py:1974
+=========         Host Frame: allocate_symmetric in kimi_k3.py:205
+=========         Host Frame: create_kimi_k3_decode_workspace in kimi_k3.py:224
+=========         Host Frame: get_kimi_k3_decode_workspace in kimi_k3.py:314
+=========         Host Frame: workspace in kimi_k3_tail_support.py:167
+=========         Host Frame: call_fixture_func in fixtures.py:998
+=========         Host Frame: pytest_fixture_setup in fixtures.py:1328
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: execute in fixtures.py:1232
+=========         Host Frame: _get_active_fixturedef in fixtures.py:726
+=========         Host Frame: getfixturevalue in fixtures.py:630
+=========         Host Frame: _fillfixtures in fixtures.py:806
+=========         Host Frame: setup in python.py:1710
+=========         Host Frame: setup in runner.py:536
+=========         Host Frame: pytest_runtest_setup in runner.py:170
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: <lambda> in runner.py:250
+=========         Host Frame: from_call in runner.py:361
+=========         Host Frame: call_and_report in runner.py:249
+=========         Host Frame: runtestprotocol in runner.py:132
+=========         Host Frame: pytest_runtest_protocol in runner.py:118
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: pytest_runtestloop in main.py:408
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in main.py:384
+=========         Host Frame: wrap_session in main.py:330
+=========         Host Frame: pytest_cmdline_main in main.py:377
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in __init__.py:229
+=========         Host Frame: _console_main in __init__.py:253
+=========         Host Frame: <module> in __main__.py:9
+=========         Host Frame: _run_code in <frozen runpy>:88
+=========         Host Frame: _run_module_as_main in <frozen runpy>:198
+========= 
+========= CUDA API Error: Failed to allocate physical memory
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: c10::cuda::(anonymous namespace)::isFabricSupported() [0x5a0fd] in libc10_cuda.so
+=========         Host Frame: c10::cuda::get_fabric_access(signed char) [0x5b48a] in libc10_cuda.so
+=========         Host Frame: c10d::symmetric_memory::CUDASymmetricMemoryAllocator::alloc(unsigned long, int, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&) [0x1267cbe] in libtorch_cuda.so
+=========         Host Frame: c10d::symmetric_memory::empty_strided_p2p(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>) [0x6753be0] in libtorch_cpu.so
+=========         Host Frame: pybind11::cpp_function::initialize<at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor, c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>, pybind11::name, pybind11::scope, pybind11::sibling, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg_v, pybind11::arg_v>(at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor (*)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), pybind11::name const&, pybind11::scope const&, pybind11::sibling const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg_v const&, pybind11::arg_v const&)::{lambda(pybind11::detail::function_call&)#3}::operator()(pybind11::detail::function_call&) const [0xfc2ac4] in libtorch_python.so
+=========         Host Frame: pybind11::cpp_function::dispatcher(_object*, _object* const*, unsigned long, _object*) [0x3f2bb1] in libtorch_python.so
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: gen_iternext in genobject.c:603 [0x36f899] in libpython3.12.so.1.0
+=========         Host Frame: builtin_next in bltinmodule.c.h:730 [0x3def06] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2929 [0x3f48c9] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: PyObject_Call in call.c:379 [0x367f62] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:3254 [0x3eb6f5] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: PyEval_EvalCode in ceval.c:578 [0x4ec30a] in libpython3.12.so.1.0
+=========         Host Frame: builtin_exec in bltinmodule.c.h:586 [0x4e9c42] in libpython3.12.so.1.0
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: pymain_run_module in main.c:300 [0x29aa53] in libpython3.12.so.1.0
+=========         Host Frame: Py_RunMain in main.c:709 [0x53f94d] in libpython3.12.so.1.0
+=========         Host Frame: Py_BytesMain in main.c:763 [0x29a7d6] in libpython3.12.so.1.0
+=========         Host Frame:  [0x2a1c9] in libc.so.6
+=========         Host Frame: __libc_start_main [0x2a28a] in libc.so.6
+=========         Host Frame: _start [0x2010a8] in python
+=========         Host Frame: empty in __init__.py:1974
+=========         Host Frame: allocate_symmetric in kimi_k3.py:205
+=========         Host Frame: create_kimi_k3_decode_workspace in kimi_k3.py:224
+=========         Host Frame: get_kimi_k3_decode_workspace in kimi_k3.py:314
+=========         Host Frame: workspace in kimi_k3_tail_support.py:167
+=========         Host Frame: call_fixture_func in fixtures.py:998
+=========         Host Frame: pytest_fixture_setup in fixtures.py:1328
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: execute in fixtures.py:1232
+=========         Host Frame: _get_active_fixturedef in fixtures.py:726
+=========         Host Frame: getfixturevalue in fixtures.py:630
+=========         Host Frame: _fillfixtures in fixtures.py:806
+=========         Host Frame: setup in python.py:1710
+=========         Host Frame: setup in runner.py:536
+=========         Host Frame: pytest_runtest_setup in runner.py:170
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: <lambda> in runner.py:250
+=========         Host Frame: from_call in runner.py:361
+=========         Host Frame: call_and_report in runner.py:249
+=========         Host Frame: runtestprotocol in runner.py:132
+=========         Host Frame: pytest_runtest_protocol in runner.py:118
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: pytest_runtestloop in main.py:408
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in main.py:384
+=========         Host Frame: wrap_session in main.py:330
+=========         Host Frame: pytest_cmdline_main in main.py:377
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in __init__.py:229
+=========         Host Frame: _console_main in __init__.py:253
+=========         Host Frame: <module> in __main__.py:9
+=========         Host Frame: _run_code in <frozen runpy>:88
+=========         Host Frame: _run_module_as_main in <frozen runpy>:198
+========= 
+========= CUDA API Error: Failed to allocate physical memory
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: c10::cuda::(anonymous namespace)::isFabricSupported() [0x5a0fd] in libc10_cuda.so
+=========         Host Frame: c10::cuda::get_fabric_access(signed char) [0x5b48a] in libc10_cuda.so
+=========         Host Frame: c10d::symmetric_memory::CUDASymmetricMemoryAllocator::alloc(unsigned long, int, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&) [0x1267cbe] in libtorch_cuda.so
+=========         Host Frame: c10d::symmetric_memory::empty_strided_p2p(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>) [0x6753be0] in libtorch_cpu.so
+=========         Host Frame: pybind11::cpp_function::initialize<at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor, c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>, pybind11::name, pybind11::scope, pybind11::sibling, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg_v, pybind11::arg_v>(at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor (*)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), pybind11::name const&, pybind11::scope const&, pybind11::sibling const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg_v const&, pybind11::arg_v const&)::{lambda(pybind11::detail::function_call&)#3}::operator()(pybind11::detail::function_call&) const [0xfc2ac4] in libtorch_python.so
+=========         Host Frame: pybind11::cpp_function::dispatcher(_object*, _object* const*, unsigned long, _object*) [0x3f2bb1] in libtorch_python.so
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: gen_iternext in genobject.c:603 [0x36f899] in libpython3.12.so.1.0
+=========         Host Frame: builtin_next in bltinmodule.c.h:730 [0x3def06] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2929 [0x3f48c9] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: PyObject_Call in call.c:379 [0x367f62] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:3254 [0x3eb6f5] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: PyEval_EvalCode in ceval.c:578 [0x4ec30a] in libpython3.12.so.1.0
+=========         Host Frame: builtin_exec in bltinmodule.c.h:586 [0x4e9c42] in libpython3.12.so.1.0
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: pymain_run_module in main.c:300 [0x29aa53] in libpython3.12.so.1.0
+=========         Host Frame: Py_RunMain in main.c:709 [0x53f94d] in libpython3.12.so.1.0
+=========         Host Frame: Py_BytesMain in main.c:763 [0x29a7d6] in libpython3.12.so.1.0
+=========         Host Frame:  [0x2a1c9] in libc.so.6
+=========         Host Frame: __libc_start_main [0x2a28a] in libc.so.6
+=========         Host Frame: _start [0x2010a8] in python
+=========         Host Frame: empty in __init__.py:1974
+=========         Host Frame: allocate_symmetric in kimi_k3.py:205
+=========         Host Frame: create_kimi_k3_decode_workspace in kimi_k3.py:224
+=========         Host Frame: get_kimi_k3_decode_workspace in kimi_k3.py:314
+=========         Host Frame: workspace in kimi_k3_tail_support.py:167
+=========         Host Frame: call_fixture_func in fixtures.py:998
+=========         Host Frame: pytest_fixture_setup in fixtures.py:1328
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: execute in fixtures.py:1232
+=========         Host Frame: _get_active_fixturedef in fixtures.py:726
+=========         Host Frame: getfixturevalue in fixtures.py:630
+=========         Host Frame: _fillfixtures in fixtures.py:806
+=========         Host Frame: setup in python.py:1710
+=========         Host Frame: setup in runner.py:536
+=========         Host Frame: pytest_runtest_setup in runner.py:170
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: <lambda> in runner.py:250
+=========         Host Frame: from_call in runner.py:361
+=========         Host Frame: call_and_report in runner.py:249
+=========         Host Frame: runtestprotocol in runner.py:132
+=========         Host Frame: pytest_runtest_protocol in runner.py:118
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: pytest_runtestloop in main.py:408
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in main.py:384
+=========         Host Frame: wrap_session in main.py:330
+=========         Host Frame: pytest_cmdline_main in main.py:377
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in __init__.py:229
+=========         Host Frame: _console_main in __init__.py:253
+=========         Host Frame: <module> in __main__.py:9
+=========         Host Frame: _run_code in <frozen runpy>:88
+=========         Host Frame: _run_module_as_main in <frozen runpy>:198
+========= 
+========= Program hit CUDA_ERROR_NOT_PERMITTED (error 800) due to "operation not permitted" on CUDA API call to cuMemCreate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: c10::cuda::(anonymous namespace)::isFabricSupported() [0x5a0fd] in libc10_cuda.so
+=========         Host Frame: c10::cuda::get_fabric_access(signed char) [0x5b48a] in libc10_cuda.so
+=========         Host Frame: c10d::symmetric_memory::CUDASymmetricMemoryAllocator::alloc(unsigned long, int, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&) [0x1267cbe] in libtorch_cuda.so
+=========         Host Frame: c10d::symmetric_memory::empty_strided_p2p(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>) [0x6753be0] in libtorch_cpu.so
+=========         Host Frame: pybind11::cpp_function::initialize<at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor, c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>, pybind11::name, pybind11::scope, pybind11::sibling, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg_v, pybind11::arg_v>(at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor (*)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), pybind11::name const&, pybind11::scope const&, pybind11::sibling const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg_v const&, pybind11::arg_v const&)::{lambda(pybind11::detail::function_call&)#3}::operator()(pybind11::detail::function_call&) const [0xfc2ac4] in libtorch_python.so
+=========         Host Frame: pybind11::cpp_function::dispatcher(_object*, _object* const*, unsigned long, _object*) [0x3f2bb1] in libtorch_python.so
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: gen_iternext in genobject.c:603 [0x36f899] in libpython3.12.so.1.0
+=========         Host Frame: builtin_next in bltinmodule.c.h:730 [0x3def06] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2929 [0x3f48c9] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: PyObject_Call in call.c:379 [0x367f62] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:3254 [0x3eb6f5] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: PyEval_EvalCode in ceval.c:578 [0x4ec30a] in libpython3.12.so.1.0
+=========         Host Frame: builtin_exec in bltinmodule.c.h:586 [0x4e9c42] in libpython3.12.so.1.0
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: pymain_run_module in main.c:300 [0x29aa53] in libpython3.12.so.1.0
+=========         Host Frame: Py_RunMain in main.c:709 [0x53f94d] in libpython3.12.so.1.0
+=========         Host Frame: Py_BytesMain in main.c:763 [0x29a7d6] in libpython3.12.so.1.0
+=========         Host Frame:  [0x2a1c9] in libc.so.6
+=========         Host Frame: __libc_start_main [0x2a28a] in libc.so.6
+=========         Host Frame: _start [0x2010a8] in python
+=========         Host Frame: empty in __init__.py:1974
+=========         Host Frame: allocate_symmetric in kimi_k3.py:205
+=========         Host Frame: create_kimi_k3_decode_workspace in kimi_k3.py:224
+=========         Host Frame: get_kimi_k3_decode_workspace in kimi_k3.py:314
+=========         Host Frame: workspace in kimi_k3_tail_support.py:167
+=========         Host Frame: call_fixture_func in fixtures.py:998
+=========         Host Frame: pytest_fixture_setup in fixtures.py:1328
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: execute in fixtures.py:1232
+=========         Host Frame: _get_active_fixturedef in fixtures.py:726
+=========         Host Frame: getfixturevalue in fixtures.py:630
+=========         Host Frame: _fillfixtures in fixtures.py:806
+=========         Host Frame: setup in python.py:1710
+=========         Host Frame: setup in runner.py:536
+=========         Host Frame: pytest_runtest_setup in runner.py:170
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: <lambda> in runner.py:250
+=========         Host Frame: from_call in runner.py:361
+=========         Host Frame: call_and_report in runner.py:249
+=========         Host Frame: runtestprotocol in runner.py:132
+=========         Host Frame: pytest_runtest_protocol in runner.py:118
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: pytest_runtestloop in main.py:408
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in main.py:384
+=========         Host Frame: wrap_session in main.py:330
+=========         Host Frame: pytest_cmdline_main in main.py:377
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in __init__.py:229
+=========         Host Frame: _console_main in __init__.py:253
+=========         Host Frame: <module> in __main__.py:9
+=========         Host Frame: _run_code in <frozen runpy>:88
+=========         Host Frame: _run_module_as_main in <frozen runpy>:198
+========= 
+========= Program hit CUDA_ERROR_NOT_PERMITTED (error 800) due to "operation not permitted" on CUDA API call to cuMemCreate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: c10::cuda::(anonymous namespace)::isFabricSupported() [0x5a0fd] in libc10_cuda.so
+=========         Host Frame: c10::cuda::get_fabric_access(signed char) [0x5b48a] in libc10_cuda.so
+=========         Host Frame: c10d::symmetric_memory::CUDASymmetricMemoryAllocator::alloc(unsigned long, int, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&) [0x1267cbe] in libtorch_cuda.so
+=========         Host Frame: c10d::symmetric_memory::empty_strided_p2p(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>) [0x6753be0] in libtorch_cpu.so
+=========         Host Frame: pybind11::cpp_function::initialize<at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor, c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>, pybind11::name, pybind11::scope, pybind11::sibling, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg_v, pybind11::arg_v>(at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor (*)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), pybind11::name const&, pybind11::scope const&, pybind11::sibling const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg_v const&, pybind11::arg_v const&)::{lambda(pybind11::detail::function_call&)#3}::operator()(pybind11::detail::function_call&) const [0xfc2ac4] in libtorch_python.so
+=========         Host Frame: pybind11::cpp_function::dispatcher(_object*, _object* const*, unsigned long, _object*) [0x3f2bb1] in libtorch_python.so
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: gen_iternext in genobject.c:603 [0x36f899] in libpython3.12.so.1.0
+=========         Host Frame: builtin_next in bltinmodule.c.h:730 [0x3def06] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2929 [0x3f48c9] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: PyObject_Call in call.c:379 [0x367f62] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:3254 [0x3eb6f5] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: PyEval_EvalCode in ceval.c:578 [0x4ec30a] in libpython3.12.so.1.0
+=========         Host Frame: builtin_exec in bltinmodule.c.h:586 [0x4e9c42] in libpython3.12.so.1.0
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: pymain_run_module in main.c:300 [0x29aa53] in libpython3.12.so.1.0
+=========         Host Frame: Py_RunMain in main.c:709 [0x53f94d] in libpython3.12.so.1.0
+=========         Host Frame: Py_BytesMain in main.c:763 [0x29a7d6] in libpython3.12.so.1.0
+=========         Host Frame:  [0x2a1c9] in libc.so.6
+=========         Host Frame: __libc_start_main [0x2a28a] in libc.so.6
+=========         Host Frame: _start [0x2010a8] in python
+=========         Host Frame: empty in __init__.py:1974
+=========         Host Frame: allocate_symmetric in kimi_k3.py:205
+=========         Host Frame: create_kimi_k3_decode_workspace in kimi_k3.py:224
+=========         Host Frame: get_kimi_k3_decode_workspace in kimi_k3.py:314
+=========         Host Frame: workspace in kimi_k3_tail_support.py:167
+=========         Host Frame: call_fixture_func in fixtures.py:998
+=========         Host Frame: pytest_fixture_setup in fixtures.py:1328
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: execute in fixtures.py:1232
+=========         Host Frame: _get_active_fixturedef in fixtures.py:726
+=========         Host Frame: getfixturevalue in fixtures.py:630
+=========         Host Frame: _fillfixtures in fixtures.py:806
+=========         Host Frame: setup in python.py:1710
+=========         Host Frame: setup in runner.py:536
+=========         Host Frame: pytest_runtest_setup in runner.py:170
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: <lambda> in runner.py:250
+=========         Host Frame: from_call in runner.py:361
+=========         Host Frame: call_and_report in runner.py:249
+=========         Host Frame: runtestprotocol in runner.py:132
+=========         Host Frame: pytest_runtest_protocol in runner.py:118
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: pytest_runtestloop in main.py:408
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in main.py:384
+=========         Host Frame: wrap_session in main.py:330
+=========         Host Frame: pytest_cmdline_main in main.py:377
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in __init__.py:229
+=========         Host Frame: _console_main in __init__.py:253
+=========         Host Frame: <module> in __main__.py:9
+=========         Host Frame: _run_code in <frozen runpy>:88
+=========         Host Frame: _run_module_as_main in <frozen runpy>:198
+========= 
+========= Program hit CUDA_ERROR_NOT_PERMITTED (error 800) due to "operation not permitted" on CUDA API call to cuMemCreate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: c10::cuda::(anonymous namespace)::isFabricSupported() [0x5a0fd] in libc10_cuda.so
+=========         Host Frame: c10::cuda::get_fabric_access(signed char) [0x5b48a] in libc10_cuda.so
+=========         Host Frame: c10d::symmetric_memory::CUDASymmetricMemoryAllocator::alloc(unsigned long, int, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&) [0x1267cbe] in libtorch_cuda.so
+=========         Host Frame: c10d::symmetric_memory::empty_strided_p2p(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>) [0x6753be0] in libtorch_cpu.so
+=========         Host Frame: pybind11::cpp_function::initialize<at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor, c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>, pybind11::name, pybind11::scope, pybind11::sibling, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg_v, pybind11::arg_v>(at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor (*)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), pybind11::name const&, pybind11::scope const&, pybind11::sibling const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg_v const&, pybind11::arg_v const&)::{lambda(pybind11::detail::function_call&)#3}::operator()(pybind11::detail::function_call&) const [0xfc2ac4] in libtorch_python.so
+=========         Host Frame: pybind11::cpp_function::dispatcher(_object*, _object* const*, unsigned long, _object*) [0x3f2bb1] in libtorch_python.so
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: gen_iternext in genobject.c:603 [0x36f899] in libpython3.12.so.1.0
+=========         Host Frame: builtin_next in bltinmodule.c.h:730 [0x3def06] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2929 [0x3f48c9] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: PyObject_Call in call.c:379 [0x367f62] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:3254 [0x3eb6f5] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: PyEval_EvalCode in ceval.c:578 [0x4ec30a] in libpython3.12.so.1.0
+=========         Host Frame: builtin_exec in bltinmodule.c.h:586 [0x4e9c42] in libpython3.12.so.1.0
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: pymain_run_module in main.c:300 [0x29aa53] in libpython3.12.so.1.0
+=========         Host Frame: Py_RunMain in main.c:709 [0x53f94d] in libpython3.12.so.1.0
+=========         Host Frame: Py_BytesMain in main.c:763 [0x29a7d6] in libpython3.12.so.1.0
+=========         Host Frame:  [0x2a1c9] in libc.so.6
+=========         Host Frame: __libc_start_main [0x2a28a] in libc.so.6
+=========         Host Frame: _start [0x2010a8] in python
+=========         Host Frame: empty in __init__.py:1974
+=========         Host Frame: allocate_symmetric in kimi_k3.py:205
+=========         Host Frame: create_kimi_k3_decode_workspace in kimi_k3.py:224
+=========         Host Frame: get_kimi_k3_decode_workspace in kimi_k3.py:314
+=========         Host Frame: workspace in kimi_k3_tail_support.py:167
+=========         Host Frame: call_fixture_func in fixtures.py:998
+=========         Host Frame: pytest_fixture_setup in fixtures.py:1328
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: execute in fixtures.py:1232
+=========         Host Frame: _get_active_fixturedef in fixtures.py:726
+=========         Host Frame: getfixturevalue in fixtures.py:630
+=========         Host Frame: _fillfixtures in fixtures.py:806
+=========         Host Frame: setup in python.py:1710
+=========         Host Frame: setup in runner.py:536
+=========         Host Frame: pytest_runtest_setup in runner.py:170
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: <lambda> in runner.py:250
+=========         Host Frame: from_call in runner.py:361
+=========         Host Frame: call_and_report in runner.py:249
+=========         Host Frame: runtestprotocol in runner.py:132
+=========         Host Frame: pytest_runtest_protocol in runner.py:118
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: pytest_runtestloop in main.py:408
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in main.py:384
+=========         Host Frame: wrap_session in main.py:330
+=========         Host Frame: pytest_cmdline_main in main.py:377
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in __init__.py:229
+=========         Host Frame: _console_main in __init__.py:253
+=========         Host Frame: <module> in __main__.py:9
+=========         Host Frame: _run_code in <frozen runpy>:88
+=========         Host Frame: _run_module_as_main in <frozen runpy>:198
+========= 
+========= Program hit CUDA_ERROR_NOT_PERMITTED (error 800) due to "operation not permitted" on CUDA API call to cuMemCreate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: c10::cuda::(anonymous namespace)::isFabricSupported() [0x5a0fd] in libc10_cuda.so
+=========         Host Frame: c10::cuda::get_fabric_access(signed char) [0x5b48a] in libc10_cuda.so
+=========         Host Frame: c10d::symmetric_memory::CUDASymmetricMemoryAllocator::alloc(unsigned long, int, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&) [0x1267cbe] in libtorch_cuda.so
+=========         Host Frame: c10d::symmetric_memory::empty_strided_p2p(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>) [0x6753be0] in libtorch_cpu.so
+=========         Host Frame: pybind11::cpp_function::initialize<at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor, c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>, pybind11::name, pybind11::scope, pybind11::sibling, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg_v, pybind11::arg_v>(at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor (*)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), pybind11::name const&, pybind11::scope const&, pybind11::sibling const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg_v const&, pybind11::arg_v const&)::{lambda(pybind11::detail::function_call&)#3}::operator()(pybind11::detail::function_call&) const [0xfc2ac4] in libtorch_python.so
+=========         Host Frame: pybind11::cpp_function::dispatcher(_object*, _object* const*, unsigned long, _object*) [0x3f2bb1] in libtorch_python.so
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: gen_iternext in genobject.c:603 [0x36f899] in libpython3.12.so.1.0
+=========         Host Frame: builtin_next in bltinmodule.c.h:730 [0x3def06] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2929 [0x3f48c9] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: PyObject_Call in call.c:379 [0x367f62] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:3254 [0x3eb6f5] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: PyEval_EvalCode in ceval.c:578 [0x4ec30a] in libpython3.12.so.1.0
+=========         Host Frame: builtin_exec in bltinmodule.c.h:586 [0x4e9c42] in libpython3.12.so.1.0
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: pymain_run_module in main.c:300 [0x29aa53] in libpython3.12.so.1.0
+=========         Host Frame: Py_RunMain in main.c:709 [0x53f94d] in libpython3.12.so.1.0
+=========         Host Frame: Py_BytesMain in main.c:763 [0x29a7d6] in libpython3.12.so.1.0
+=========         Host Frame:  [0x2a1c9] in libc.so.6
+=========         Host Frame: __libc_start_main [0x2a28a] in libc.so.6
+=========         Host Frame: _start [0x2010a8] in python
+=========         Host Frame: empty in __init__.py:1974
+=========         Host Frame: allocate_symmetric in kimi_k3.py:205
+=========         Host Frame: create_kimi_k3_decode_workspace in kimi_k3.py:224
+=========         Host Frame: get_kimi_k3_decode_workspace in kimi_k3.py:314
+=========         Host Frame: workspace in kimi_k3_tail_support.py:167
+=========         Host Frame: call_fixture_func in fixtures.py:998
+=========         Host Frame: pytest_fixture_setup in fixtures.py:1328
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: execute in fixtures.py:1232
+=========         Host Frame: _get_active_fixturedef in fixtures.py:726
+=========         Host Frame: getfixturevalue in fixtures.py:630
+=========         Host Frame: _fillfixtures in fixtures.py:806
+=========         Host Frame: setup in python.py:1710
+=========         Host Frame: setup in runner.py:536
+=========         Host Frame: pytest_runtest_setup in runner.py:170
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: <lambda> in runner.py:250
+=========         Host Frame: from_call in runner.py:361
+=========         Host Frame: call_and_report in runner.py:249
+=========         Host Frame: runtestprotocol in runner.py:132
+=========         Host Frame: pytest_runtest_protocol in runner.py:118
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: pytest_runtestloop in main.py:408
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in main.py:384
+=========         Host Frame: wrap_session in main.py:330
+=========         Host Frame: pytest_cmdline_main in main.py:377
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in __init__.py:229
+=========         Host Frame: _console_main in __init__.py:253
+=========         Host Frame: <module> in __main__.py:9
+=========         Host Frame: _run_code in <frozen runpy>:88
+=========         Host Frame: _run_module_as_main in <frozen runpy>:198
+========= 
+========= Program hit CUDA_ERROR_NOT_PERMITTED (error 800) due to "operation not permitted" on CUDA API call to cuMemCreate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: c10::cuda::(anonymous namespace)::isFabricSupported() [0x5a0fd] in libc10_cuda.so
+=========         Host Frame: c10::cuda::get_fabric_access(signed char) [0x5b48a] in libc10_cuda.so
+=========         Host Frame: c10d::symmetric_memory::CUDASymmetricMemoryAllocator::alloc(unsigned long, int, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&) [0x1267cbe] in libtorch_cuda.so
+=========         Host Frame: c10d::symmetric_memory::empty_strided_p2p(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>) [0x6753be0] in libtorch_cpu.so
+=========         Host Frame: pybind11::cpp_function::initialize<at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor, c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>, pybind11::name, pybind11::scope, pybind11::sibling, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg_v, pybind11::arg_v>(at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor (*)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), pybind11::name const&, pybind11::scope const&, pybind11::sibling const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg_v const&, pybind11::arg_v const&)::{lambda(pybind11::detail::function_call&)#3}::operator()(pybind11::detail::function_call&) const [0xfc2ac4] in libtorch_python.so
+=========         Host Frame: pybind11::cpp_function::dispatcher(_object*, _object* const*, unsigned long, _object*) [0x3f2bb1] in libtorch_python.so
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: gen_iternext in genobject.c:603 [0x36f899] in libpython3.12.so.1.0
+=========         Host Frame: builtin_next in bltinmodule.c.h:730 [0x3def06] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2929 [0x3f48c9] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: PyObject_Call in call.c:379 [0x367f62] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:3254 [0x3eb6f5] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: PyEval_EvalCode in ceval.c:578 [0x4ec30a] in libpython3.12.so.1.0
+=========         Host Frame: builtin_exec in bltinmodule.c.h:586 [0x4e9c42] in libpython3.12.so.1.0
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: pymain_run_module in main.c:300 [0x29aa53] in libpython3.12.so.1.0
+=========         Host Frame: Py_RunMain in main.c:709 [0x53f94d] in libpython3.12.so.1.0
+=========         Host Frame: Py_BytesMain in main.c:763 [0x29a7d6] in libpython3.12.so.1.0
+=========         Host Frame:  [0x2a1c9] in libc.so.6
+=========         Host Frame: __libc_start_main [0x2a28a] in libc.so.6
+=========         Host Frame: _start [0x2010a8] in python
+=========         Host Frame: empty in __init__.py:1974
+=========         Host Frame: allocate_symmetric in kimi_k3.py:205
+=========         Host Frame: create_kimi_k3_decode_workspace in kimi_k3.py:224
+=========         Host Frame: get_kimi_k3_decode_workspace in kimi_k3.py:314
+=========         Host Frame: workspace in kimi_k3_tail_support.py:167
+=========         Host Frame: call_fixture_func in fixtures.py:998
+=========         Host Frame: pytest_fixture_setup in fixtures.py:1328
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: execute in fixtures.py:1232
+=========         Host Frame: _get_active_fixturedef in fixtures.py:726
+=========         Host Frame: getfixturevalue in fixtures.py:630
+=========         Host Frame: _fillfixtures in fixtures.py:806
+=========         Host Frame: setup in python.py:1710
+=========         Host Frame: setup in runner.py:536
+=========         Host Frame: pytest_runtest_setup in runner.py:170
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: <lambda> in runner.py:250
+=========         Host Frame: from_call in runner.py:361
+=========         Host Frame: call_and_report in runner.py:249
+=========         Host Frame: runtestprotocol in runner.py:132
+=========         Host Frame: pytest_runtest_protocol in runner.py:118
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: pytest_runtestloop in main.py:408
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in main.py:384
+=========         Host Frame: wrap_session in main.py:330
+=========         Host Frame: pytest_cmdline_main in main.py:377
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in __init__.py:229
+=========         Host Frame: _console_main in __init__.py:253
+=========         Host Frame: <module> in __main__.py:9
+=========         Host Frame: _run_code in <frozen runpy>:88
+=========         Host Frame: _run_module_as_main in <frozen runpy>:198
+========= 
+========= Program hit CUDA_ERROR_NOT_PERMITTED (error 800) due to "operation not permitted" on CUDA API call to cuMemCreate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: c10::cuda::(anonymous namespace)::isFabricSupported() [0x5a0fd] in libc10_cuda.so
+=========         Host Frame: c10::cuda::get_fabric_access(signed char) [0x5b48a] in libc10_cuda.so
+=========         Host Frame: c10d::symmetric_memory::CUDASymmetricMemoryAllocator::alloc(unsigned long, int, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&) [0x1267cbe] in libtorch_cuda.so
+=========         Host Frame: c10d::symmetric_memory::empty_strided_p2p(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>) [0x6753be0] in libtorch_cpu.so
+=========         Host Frame: pybind11::cpp_function::initialize<at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor, c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>, pybind11::name, pybind11::scope, pybind11::sibling, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg_v, pybind11::arg_v>(at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor (*)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), pybind11::name const&, pybind11::scope const&, pybind11::sibling const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg_v const&, pybind11::arg_v const&)::{lambda(pybind11::detail::function_call&)#3}::operator()(pybind11::detail::function_call&) const [0xfc2ac4] in libtorch_python.so
+=========         Host Frame: pybind11::cpp_function::dispatcher(_object*, _object* const*, unsigned long, _object*) [0x3f2bb1] in libtorch_python.so
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: gen_iternext in genobject.c:603 [0x36f899] in libpython3.12.so.1.0
+=========         Host Frame: builtin_next in bltinmodule.c.h:730 [0x3def06] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2929 [0x3f48c9] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: PyObject_Call in call.c:379 [0x367f62] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:3254 [0x3eb6f5] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: PyEval_EvalCode in ceval.c:578 [0x4ec30a] in libpython3.12.so.1.0
+=========         Host Frame: builtin_exec in bltinmodule.c.h:586 [0x4e9c42] in libpython3.12.so.1.0
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: pymain_run_module in main.c:300 [0x29aa53] in libpython3.12.so.1.0
+=========         Host Frame: Py_RunMain in main.c:709 [0x53f94d] in libpython3.12.so.1.0
+=========         Host Frame: Py_BytesMain in main.c:763 [0x29a7d6] in libpython3.12.so.1.0
+=========         Host Frame:  [0x2a1c9] in libc.so.6
+=========         Host Frame: __libc_start_main [0x2a28a] in libc.so.6
+=========         Host Frame: _start [0x2010a8] in python
+=========         Host Frame: empty in __init__.py:1974
+=========         Host Frame: allocate_symmetric in kimi_k3.py:205
+=========         Host Frame: create_kimi_k3_decode_workspace in kimi_k3.py:224
+=========         Host Frame: get_kimi_k3_decode_workspace in kimi_k3.py:314
+=========         Host Frame: workspace in kimi_k3_tail_support.py:167
+=========         Host Frame: call_fixture_func in fixtures.py:998
+=========         Host Frame: pytest_fixture_setup in fixtures.py:1328
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: execute in fixtures.py:1232
+=========         Host Frame: _get_active_fixturedef in fixtures.py:726
+=========         Host Frame: getfixturevalue in fixtures.py:630
+=========         Host Frame: _fillfixtures in fixtures.py:806
+=========         Host Frame: setup in python.py:1710
+=========         Host Frame: setup in runner.py:536
+=========         Host Frame: pytest_runtest_setup in runner.py:170
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: <lambda> in runner.py:250
+=========         Host Frame: from_call in runner.py:361
+=========         Host Frame: call_and_report in runner.py:249
+=========         Host Frame: runtestprotocol in runner.py:132
+=========         Host Frame: pytest_runtest_protocol in runner.py:118
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: pytest_runtestloop in main.py:408
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in main.py:384
+=========         Host Frame: wrap_session in main.py:330
+=========         Host Frame: pytest_cmdline_main in main.py:377
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in __init__.py:229
+=========         Host Frame: _console_main in __init__.py:253
+=========         Host Frame: <module> in __main__.py:9
+=========         Host Frame: _run_code in <frozen runpy>:88
+=========         Host Frame: _run_module_as_main in <frozen runpy>:198
+========= 
+========= Program hit CUDA_ERROR_NOT_PERMITTED (error 800) due to "operation not permitted" on CUDA API call to cuMemCreate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: c10::cuda::(anonymous namespace)::isFabricSupported() [0x5a0fd] in libc10_cuda.so
+=========         Host Frame: c10::cuda::get_fabric_access(signed char) [0x5b48a] in libc10_cuda.so
+=========         Host Frame: c10d::symmetric_memory::CUDASymmetricMemoryAllocator::alloc(unsigned long, int, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&) [0x1267cbe] in libtorch_cuda.so
+=========         Host Frame: c10d::symmetric_memory::empty_strided_p2p(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>) [0x6753be0] in libtorch_cpu.so
+=========         Host Frame: pybind11::cpp_function::initialize<at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor, c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>, pybind11::name, pybind11::scope, pybind11::sibling, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg_v, pybind11::arg_v>(at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor (*)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), pybind11::name const&, pybind11::scope const&, pybind11::sibling const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg_v const&, pybind11::arg_v const&)::{lambda(pybind11::detail::function_call&)#3}::operator()(pybind11::detail::function_call&) const [0xfc2ac4] in libtorch_python.so
+=========         Host Frame: pybind11::cpp_function::dispatcher(_object*, _object* const*, unsigned long, _object*) [0x3f2bb1] in libtorch_python.so
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: gen_iternext in genobject.c:603 [0x36f899] in libpython3.12.so.1.0
+=========         Host Frame: builtin_next in bltinmodule.c.h:730 [0x3def06] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2929 [0x3f48c9] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: PyObject_Call in call.c:379 [0x367f62] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:3254 [0x3eb6f5] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: PyEval_EvalCode in ceval.c:578 [0x4ec30a] in libpython3.12.so.1.0
+=========         Host Frame: builtin_exec in bltinmodule.c.h:586 [0x4e9c42] in libpython3.12.so.1.0
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: pymain_run_module in main.c:300 [0x29aa53] in libpython3.12.so.1.0
+=========         Host Frame: Py_RunMain in main.c:709 [0x53f94d] in libpython3.12.so.1.0
+=========         Host Frame: Py_BytesMain in main.c:763 [0x29a7d6] in libpython3.12.so.1.0
+=========         Host Frame:  [0x2a1c9] in libc.so.6
+=========         Host Frame: __libc_start_main [0x2a28a] in libc.so.6
+=========         Host Frame: _start [0x2010a8] in python
+=========         Host Frame: empty in __init__.py:1974
+=========         Host Frame: allocate_symmetric in kimi_k3.py:205
+=========         Host Frame: create_kimi_k3_decode_workspace in kimi_k3.py:224
+=========         Host Frame: get_kimi_k3_decode_workspace in kimi_k3.py:314
+=========         Host Frame: workspace in kimi_k3_tail_support.py:167
+=========         Host Frame: call_fixture_func in fixtures.py:998
+=========         Host Frame: pytest_fixture_setup in fixtures.py:1328
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: execute in fixtures.py:1232
+=========         Host Frame: _get_active_fixturedef in fixtures.py:726
+=========         Host Frame: getfixturevalue in fixtures.py:630
+=========         Host Frame: _fillfixtures in fixtures.py:806
+=========         Host Frame: setup in python.py:1710
+=========         Host Frame: setup in runner.py:536
+=========         Host Frame: pytest_runtest_setup in runner.py:170
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: <lambda> in runner.py:250
+=========         Host Frame: from_call in runner.py:361
+=========         Host Frame: call_and_report in runner.py:249
+=========         Host Frame: runtestprotocol in runner.py:132
+=========         Host Frame: pytest_runtest_protocol in runner.py:118
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: pytest_runtestloop in main.py:408
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in main.py:384
+=========         Host Frame: wrap_session in main.py:330
+=========         Host Frame: pytest_cmdline_main in main.py:377
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in __init__.py:229
+=========         Host Frame: _console_main in __init__.py:253
+=========         Host Frame: <module> in __main__.py:9
+=========         Host Frame: _run_code in <frozen runpy>:88
+=========         Host Frame: _run_module_as_main in <frozen runpy>:198
+========= 
+========= Program hit CUDA_ERROR_NOT_PERMITTED (error 800) due to "operation not permitted" on CUDA API call to cuMemCreate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: c10::cuda::(anonymous namespace)::isFabricSupported() [0x5a0fd] in libc10_cuda.so
+=========         Host Frame: c10::cuda::get_fabric_access(signed char) [0x5b48a] in libc10_cuda.so
+=========         Host Frame: c10d::symmetric_memory::CUDASymmetricMemoryAllocator::alloc(unsigned long, int, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&) [0x1267cbe] in libtorch_cuda.so
+=========         Host Frame: c10d::symmetric_memory::empty_strided_p2p(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>) [0x6753be0] in libtorch_cpu.so
+=========         Host Frame: pybind11::cpp_function::initialize<at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor, c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>, pybind11::name, pybind11::scope, pybind11::sibling, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg_v, pybind11::arg_v>(at::Tensor (*&)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), at::Tensor (*)(c10::ArrayRef<long>, c10::ArrayRef<long>, c10::ScalarType, c10::Device, std::optional<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::optional<unsigned long>), pybind11::name const&, pybind11::scope const&, pybind11::sibling const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg_v const&, pybind11::arg_v const&)::{lambda(pybind11::detail::function_call&)#3}::operator()(pybind11::detail::function_call&) const [0xfc2ac4] in libtorch_python.so
+=========         Host Frame: pybind11::cpp_function::dispatcher(_object*, _object* const*, unsigned long, _object*) [0x3f2bb1] in libtorch_python.so
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: gen_iternext in genobject.c:603 [0x36f899] in libpython3.12.so.1.0
+=========         Host Frame: builtin_next in bltinmodule.c.h:730 [0x3def06] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2929 [0x3f48c9] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: PyObject_Call in call.c:379 [0x367f62] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:3254 [0x3eb6f5] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: _PyObject_Call_Prepend in call.c:508 [0x3694bf] in libpython3.12.so.1.0
+=========         Host Frame: slot_tp_call in typeobject.c:8769 [0x4a70e4] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3f00ed] in libpython3.12.so.1.0
+=========         Host Frame: PyEval_EvalCode in ceval.c:578 [0x4ec30a] in libpython3.12.so.1.0
+=========         Host Frame: builtin_exec in bltinmodule.c.h:586 [0x4e9c42] in libpython3.12.so.1.0
+=========         Host Frame: cfunction_vectorcall_FASTCALL_KEYWORDS.llvm.4147701398511412712 in methodobject.c:438 [0x3968ce] in libpython3.12.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2706 [0x3efbb3] in libpython3.12.so.1.0
+=========         Host Frame: pymain_run_module in main.c:300 [0x29aa53] in libpython3.12.so.1.0
+=========         Host Frame: Py_RunMain in main.c:709 [0x53f94d] in libpython3.12.so.1.0
+=========         Host Frame: Py_BytesMain in main.c:763 [0x29a7d6] in libpython3.12.so.1.0
+=========         Host Frame:  [0x2a1c9] in libc.so.6
+=========         Host Frame: __libc_start_main [0x2a28a] in libc.so.6
+=========         Host Frame: _start [0x2010a8] in python
+=========         Host Frame: empty in __init__.py:1974
+=========         Host Frame: allocate_symmetric in kimi_k3.py:205
+=========         Host Frame: create_kimi_k3_decode_workspace in kimi_k3.py:224
+=========         Host Frame: get_kimi_k3_decode_workspace in kimi_k3.py:314
+=========         Host Frame: workspace in kimi_k3_tail_support.py:167
+=========         Host Frame: call_fixture_func in fixtures.py:998
+=========         Host Frame: pytest_fixture_setup in fixtures.py:1328
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: execute in fixtures.py:1232
+=========         Host Frame: _get_active_fixturedef in fixtures.py:726
+=========         Host Frame: getfixturevalue in fixtures.py:630
+=========         Host Frame: _fillfixtures in fixtures.py:806
+=========         Host Frame: setup in python.py:1710
+=========         Host Frame: setup in runner.py:536
+=========         Host Frame: pytest_runtest_setup in runner.py:170
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: <lambda> in runner.py:250
+=========         Host Frame: from_call in runner.py:361
+=========         Host Frame: call_and_report in runner.py:249
+=========         Host Frame: runtestprotocol in runner.py:132
+=========         Host Frame: pytest_runtest_protocol in runner.py:118
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: pytest_runtestloop in main.py:408
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in main.py:384
+=========         Host Frame: wrap_session in main.py:330
+=========         Host Frame: pytest_cmdline_main in main.py:377
+=========         Host Frame: _multicall in _callers.py:121
+=========         Host Frame: _hookexec in _manager.py:120
+=========         Host Frame: __call__ in _hooks.py:512
+=========         Host Frame: _main in __init__.py:229
+=========         Host Frame: _console_main in __init__.py:253
+=========         Host Frame: <module> in __main__.py:9
+=========         Host Frame: _run_code in <frozen runpy>:88
+=========         Host Frame: _run_module_as_main in <frozen runpy>:198
+========= 
+........................                                                                      [100%]                                                                      [100%]
+3 passed, 60 deselected in 242.19s (0:04:02)
+
+3 passed, 60 deselected in 242.19s (0:04:02)
+                                                                      [100%]
+3 passed, 60 deselected in 242.19s (0:04:02)
+                                                                      [100%]
+                                                                      [100%]3 passed, 60 deselected in 242.20s (0:04:02)
+
+3 passed, 60 deselected in 242.20s (0:04:02)
+                                                                      [100%]
+3 passed, 60 deselected in 242.20s (0:04:02)
+                                                                      [100%]
+3 passed, 60 deselected in 242.22s (0:04:02)
+                                                                      [100%]
+3 passed, 60 deselected in 242.22s (0:04:02)
+========= ERROR SUMMARY: 16 errors

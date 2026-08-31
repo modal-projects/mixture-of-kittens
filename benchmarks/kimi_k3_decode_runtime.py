@@ -88,12 +88,90 @@ def phase_clock_cycles(
     so the useful comparison is between regions of one launch rather than
     against wall time.
     """
-    begin, names = _C._kimi_k3_decode_phase_clock_metadata()
+    begin, names, _ = _C._kimi_k3_decode_phase_clock_metadata()
     # `.cpu()` rebases the slice on its own storage, which is what lets the
     # uint8 bytes be reinterpreted as the 64-bit counters they hold.
     words = workspace.scratch[begin * 4 : (begin + 2 * len(names)) * 4].cpu()
     counters = words.view(torch.int64).tolist()
     return dict(zip(names, counters, strict=True))
+
+
+def top_level_phase_clocks() -> tuple[str, ...]:
+    """The regions whose intervals do not nest, so their sum is a real total.
+
+    ``kPhaseClockParents`` makes the band a two-level tree: ``routed_gate_up``
+    and its eight refinements measure the same cycles at three depths, so a sum
+    over every counter double- and triple-counts the phase it is trying to
+    weigh. At M = 16 that inflates the denominator by 7%, which is enough to
+    move a barrier share from 14.4% to 9.8% and make removing the barriers look
+    like a smaller opportunity than it was.
+    """
+    _, names, parents = _C._kimi_k3_decode_phase_clock_metadata()
+    return tuple(
+        name
+        for name, parent in zip(names, parents, strict=True)
+        if parent < 0
+    )
+
+
+@contextlib.contextmanager
+def dependency_local_schedule(enabled: bool) -> Iterator[None]:
+    """Select one decode schedule for graph capture.
+
+    Restores whatever was selected before rather than forcing a value on the way
+    out. Clearing to ``False`` was right while the dependency-local schedule was
+    opt-in; now that it is the default, a harness that captured one graph under
+    this manager would hand the barrier schedule to everything after it.
+    """
+    previous = _C._kimi_k3_decode_dependency_schedule()
+    _C._kimi_k3_decode_set_dependency_schedule(enabled)
+    try:
+        yield
+    finally:
+        _C._kimi_k3_decode_set_dependency_schedule(previous)
+
+
+def schedule_edge_cycles(
+    workspace: KimiK3DecodeWorkspace,
+) -> dict[str, dict[str, int]]:
+    """Read the per-edge wait and makespan counters of the last profiled run.
+
+    Three bands: accumulated wait cycles per readiness edge, the longest single
+    wait any CTA paid on that edge, and the longest interval from the retained
+    barrier to a CTA draining each queue. The waits say where idle went; the
+    makespans say which edge set the step's length.
+    """
+    (
+        wait_begin,
+        edge_makespan_begin,
+        queue_makespan_begin,
+        edge_names,
+        queue_names,
+    ) = _C._kimi_k3_decode_schedule_clock_metadata()
+
+    def band(begin: int, count: int) -> list[int]:
+        words = workspace.scratch[begin * 4 : (begin + 2 * count) * 4].cpu()
+        return words.view(torch.int64).tolist()
+
+    return {
+        "edge_wait_cycles": dict(
+            zip(edge_names, band(wait_begin, len(edge_names)), strict=True)
+        ),
+        "edge_makespan_cycles": dict(
+            zip(
+                edge_names,
+                band(edge_makespan_begin, len(edge_names)),
+                strict=True,
+            )
+        ),
+        "queue_makespan_cycles": dict(
+            zip(
+                queue_names,
+                band(queue_makespan_begin, len(queue_names)),
+                strict=True,
+            )
+        ),
+    }
 
 
 def _e8m0_scale_bytes(absolute_max: torch.Tensor) -> torch.Tensor:
@@ -354,6 +432,8 @@ __all__ = [
     "decode_reference",
     "decode_device_step",
     "decode_step",
+    "dependency_local_schedule",
     "profiled_kernel_names",
     "recorded_allocator_events",
+    "schedule_edge_cycles",
 ]

@@ -103,7 +103,13 @@ PRIVATE_STAGE_KERNELS = (
     "kimi_k3_tail_core_kernel",
     "kimi_k3_tail_tensor_kernel",
 )
-PERSISTENT_KERNEL = "kimi_k3_decode_persistent_kernel"
+# The megakernel one decode step launches. Promotion moved this from the barrier
+# schedule to the dependency-local one; both are persistent megakernels on the
+# same 148-CTA grid, so every "one launch, and none of the private stages" test
+# reads the same either way. The barrier schedule is still reachable through the
+# schedule switch, and `BARRIER_SCHEDULE_KERNEL` is what it is called there.
+PERSISTENT_KERNEL = "kimi_k3_decode_dependency_local_kernel"
+BARRIER_SCHEDULE_KERNEL = "kimi_k3_decode_persistent_kernel"
 
 # Enough experts to keep the oracle's weight traffic bounded without making its
 # Python loop the cost of the suite.
@@ -114,19 +120,75 @@ CONFIG = KimiK3DecodeConfig()
 PERSISTENT_CTAS = 148
 PERSISTENT_THREADS = 256
 
-# The phase slots the persistent scheduler owns. Only the last four are bound
-# by the extension, and ``persistent_sync.cuh`` static-asserts that the three
-# queue counters sit directly below the activation counter, so deriving them
-# keeps this mirror honest without adding three more bindings.
+# The phase slots the persistent scheduler owns. Only these five are bound by
+# the extension, and ``persistent_sync.cuh`` static-asserts that the three queue
+# counters sit directly below the activation counter, so deriving them keeps
+# this mirror honest without adding three more bindings.
+#
+# ``TIMEOUT_CLAIM`` is the word that decides which waiter's ``(slot, code)`` pair
+# a trapped launch publishes; it holds the claiming CTA's index plus one.
 (
     TIMEOUT_PHASE,
     GRID_GENERATION,
     ACTIVATION_ARRIVALS,
     ACTIVE_EXPERT_UNITS,
+    TIMEOUT_CLAIM,
 ) = _C._kimi_k3_decode_timeout_metadata()
 ROUTE_LATENT_QUEUE = ACTIVATION_ARRIVALS - 3
 GATE_UP_QUEUE = ACTIVATION_ARRIVALS - 2
 DOWN_QUEUE = ACTIVATION_ARRIVALS - 1
+
+# The dependency-local schedule's seven queue tickets, which open its appended
+# region. Its counters are its own: the two schedules share no slot, so a ticket
+# counter of one reads zero after a launch of the other.
+SCHEDULE_QUEUE_BEGIN = 0
+SCHEDULE_QUEUES = 7
+
+
+@contextlib.contextmanager
+def dependency_local_schedule() -> Iterator[None]:
+    """Select the dependency-local schedule, restoring what was there before.
+
+    Restoring rather than clearing, because since promotion this schedule is the
+    default: a manager that cleared to the barrier schedule on the way out would
+    hand it to every launch downstream of the block it was scoping.
+    """
+    previous = _C._kimi_k3_decode_dependency_schedule()
+    _C._kimi_k3_decode_set_dependency_schedule(True)
+    try:
+        yield
+    finally:
+        _C._kimi_k3_decode_set_dependency_schedule(previous)
+
+
+@contextlib.contextmanager
+def barrier_schedule() -> Iterator[None]:
+    """Select the retained barrier schedule, restoring what was there before.
+
+    The schedule production ran before promotion. It is kept because it is the
+    other half of the A/B and because the equality tests compare against it: two
+    schedules that must agree bit for bit is a much stronger statement than one
+    schedule that agrees with the oracle inside a tolerance.
+
+    Both managers live here rather than in the suite that measures the schedules,
+    because since promotion every suite that wants one schedule in particular has
+    to say so, and a test that leaves it to the default is one-sided.
+    """
+    previous = _C._kimi_k3_decode_dependency_schedule()
+    _C._kimi_k3_decode_set_dependency_schedule(False)
+    try:
+        yield
+    finally:
+        _C._kimi_k3_decode_set_dependency_schedule(previous)
+
+
+def schedule_queue_tickets(workspace_scratch: torch.Tensor) -> list[int]:
+    """The seven ticket counters the dependency-local schedule left behind."""
+    offset, size = SCRATCH_LAYOUT["schedule"]
+    counters = workspace_scratch[offset:offset + size].view(torch.int32)
+    return counters[
+        SCHEDULE_QUEUE_BEGIN:SCHEDULE_QUEUE_BEGIN + SCHEDULE_QUEUES
+    ].tolist()
 
 
 def decode_step(
@@ -779,11 +841,13 @@ def poison_scratch(workspace_scratch: torch.Tensor) -> None:
     """Fill every region a launch is expected to re-establish with garbage.
 
     The phase counters are left alone: they carry the wrap-safe generation
-    state one launch hands the next, and a launch is entitled to trust it. What
-    a launch may *not* trust is any data region, so all of them are poisoned
-    with a value no correct output could survive.
+    state one launch hands the next, and a launch is entitled to trust it. The
+    dependency-local schedule's appended counters are left alone for the same
+    reason -- its profile band is only ever read by the launch that zeroed it.
+    What a launch may *not* trust is any data region, so all of them are
+    poisoned with a value no correct output could survive.
     """
     for name, (offset, size) in SCRATCH_LAYOUT.items():
-        if name in {"phase", "total_bytes"}:
+        if name in {"phase", "schedule", "total_bytes"}:
             continue
         workspace_scratch[offset:offset + size].fill_(0x5A)

@@ -23,6 +23,7 @@ KIMI_K3_MAX_ROUTES = KIMI_K3_MAX_TOKENS * KIMI_K3_TOPK
 KIMI_K3_CAPACITY_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128)
 SCRATCH_ALIGNMENT = 256
 NUM_PHASE_COUNTERS = 128
+NUM_SCHEDULE_COUNTERS = 128
 
 _ROUTE_AND_PROJECT_ARGUMENTS = (
     "hidden_states",
@@ -84,6 +85,7 @@ def _scratch_layout() -> dict[str, tuple[int, int]]:
         ("latent_x", KIMI_K3_MAX_TOKENS * KIMI_K3_LATENT_SIZE // 2),
         ("unit_expert", KIMI_K3_NUM_EXPERTS),
         ("router_scores", KIMI_K3_MAX_TOKENS * KIMI_K3_NUM_EXPERTS),
+        ("schedule", NUM_SCHEDULE_COUNTERS),
     )
     layout: dict[str, tuple[int, int]] = {}
     cursor = 0
@@ -313,7 +315,7 @@ def test_workspace_bytes_matches_the_documented_scratch_layout(
 ) -> None:
     from mok import _C
 
-    assert SCRATCH_BYTES == 8_111_360
+    assert SCRATCH_BYTES == 8_111_872
     assert _C.kimi_k3_decode_workspace_bytes() == SCRATCH_BYTES
     assert SCRATCH_LAYOUT["phase"][0] == 0
     assert SCRATCH_LAYOUT["expert_ids"][0] * 4 % SCRATCH_ALIGNMENT == 0

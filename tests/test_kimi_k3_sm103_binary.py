@@ -44,6 +44,14 @@ from mok import _C
 
 PERSISTENT_SYMBOL = "kimi_k3_decode_persistent_kernel"
 
+# The dependency-local schedule, which since promotion is the one a decode step
+# launches. It inlines the same stages at the same register ceiling on the same
+# 148-CTA grid, so the no-spill and residency claims that decide whether that
+# grid co-resides have to hold of it -- and it is a separate template, so the
+# other symbol's resource line says nothing about it. Both are asserted, because
+# both still ship.
+SCHEDULE_SYMBOL = "kimi_k3_decode_dependency_local_kernel"
+
 # The private per-stage entry point the MXFP4 unit tests drive. It compiles the
 # same routed gate/up and down units the persistent kernel inlines, at the same
 # register ceiling, so it is the first place register pressure shows up.
@@ -212,6 +220,89 @@ def persistent_symbols(extension_path: Path) -> dict[str, str]:
     }
     assert symbols["core"] != symbols["tensor"]
     return symbols
+
+
+@pytest.fixture(scope="module")
+def schedule_symbols(extension_path: Path) -> dict[str, str]:
+    """The candidate schedule's two instantiations, keyed by capacity path.
+
+    Matched on the mangled ``bool`` literal rather than on production's
+    ``ILb0EE``: the candidate carries a second template parameter for the
+    layouts type, so the argument list does not end after the capacity flag.
+    """
+    usage = _resource_usage(extension_path)
+    found = [name for name in usage if SCHEDULE_SYMBOL in name]
+    assert len(found) == 2, found
+    symbols = {}
+    for name in found:
+        flags = set(re.findall(r"ILb([01])E", name))
+        assert len(flags) == 1, (name, flags)
+        symbols["tensor" if flags == {"1"} else "core"] = name
+    assert sorted(symbols) == ["core", "tensor"], found
+    return symbols
+
+
+@pytest.mark.parametrize("path_name", ["core", "tensor"])
+def test_neither_schedule_instantiation_spills(
+    extension_path: Path,
+    schedule_symbols: dict[str, str],
+    path_name: str,
+) -> None:
+    """The candidate is only worth measuring if it co-resides like production.
+
+    Its whole premise is that all 148 CTAs are resident, because a consumer's
+    bounded wait is only guaranteed to be satisfiable by work that is already
+    running. A spill would cost the register budget that residency comes out
+    of, so the latency number the A/B produces would be measuring a different
+    grid than the one the design argues about.
+    """
+    usage = _resource_usage(extension_path)[schedule_symbols[path_name]]
+    assert usage["STACK"] == 0, usage
+    assert usage["LOCAL"] == 0, usage
+    dynamic_shared = _C._kimi_k3_decode_grid_shape()[2]
+    properties = torch.cuda.get_device_properties(0)
+    assert dynamic_shared + usage["SHARED"] <= (
+        properties.shared_memory_per_block_optin
+    ), usage
+    assert _C._kimi_k3_decode_schedule_resident_blocks_per_sm(
+        path_name == "tensor"
+    ) == 1
+
+
+@pytest.mark.parametrize("path_name", ["core", "tensor"])
+def test_neither_schedule_instantiation_touches_local_memory(
+    extension_path: Path,
+    schedule_symbols: dict[str, str],
+    path_name: str,
+) -> None:
+    """The same claim as ``STACK:0``, read off the instructions themselves."""
+    families = _mnemonics(extension_path, schedule_symbols[path_name])
+    assert families.isdisjoint(FORBIDDEN), sorted(families & FORBIDDEN)
+
+
+@pytest.mark.parametrize("path_name", ["core", "tensor"])
+def test_the_schedule_instantiations_run_the_stages_production_runs(
+    extension_path: Path,
+    schedule_symbols: dict[str, str],
+    persistent_symbols: dict[str, str],
+    path_name: str,
+) -> None:
+    """The candidate reorders the stages; it does not reimplement them.
+
+    Every instruction family production's instantiation needs is a family the
+    candidate needs too, because it inlines the same units from the same
+    headers. A family present in one and missing from the other would mean a
+    stage compiled differently for the candidate, which is the failure mode
+    that would make the A/B a comparison of two kernels rather than of two
+    orders of arrival.
+    """
+    required = REQUIRED_EVERYWHERE | (
+        REQUIRED_TENSOR_ONLY if path_name == "tensor" else frozenset()
+    )
+    candidate = _mnemonics(extension_path, schedule_symbols[path_name])
+    production = _mnemonics(extension_path, persistent_symbols[path_name])
+    assert required <= candidate, sorted(required - candidate)
+    assert required <= production, sorted(required - production)
 
 
 @pytest.mark.parametrize("path_name", ["core", "tensor"])

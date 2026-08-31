@@ -238,3 +238,110 @@ def sanitizer_verdict(
         rank_summaries=tuple(summaries),
         failures=tuple(failures),
     )
+
+
+#: What each sanitizer tool selects when it is not told otherwise.
+#:
+#: memcheck runs the three pinned route distributions, which it does in a couple
+#: of minutes. racecheck instruments every shared-memory access in a step whose
+#: shared traffic is the point, so it runs the same three: `concentrated` puts
+#: all 512 assignments on sixteen experts, which is the only shape whose batch
+#: exceeds the gate/up contraction's eight N columns and therefore the one that
+#: drives a second pass over the same weights, and `disjoint` gives 512 experts
+#: one row apiece, so seven of eight N columns are inactive and a CTA runs many
+#: units in a row over the ring's carried parity.
+#:
+#: synccheck reports illegal or divergent barrier use, which the candidate has
+#: more of a claim to check than production does: it takes `__syncthreads` inside
+#: every queue claim and inside every readiness wait, on CTAs that are no longer
+#: aligned to a phase.
+#:
+#: memcheck and synccheck also take the routes that make the routed queues
+#: degenerate -- one expert holding every token, all but sixteen experts empty,
+#: a full 128-row expert -- because those are the shapes the expert-local
+#: readiness edges are least exercised by. Those tests live in the schedule
+#: suite, which is why the two tools read two files. racecheck does not: it is
+#: the tool that already struggles to finish the narrow selection, and a run
+#: that times out is worth less than a narrower one that ends.
+K3_SANITIZER_SELECTION = {
+    "memcheck": (
+        "pinned_route_distributions or adversarial_routes or full_expert_batch"
+    ),
+    "racecheck": "pinned_route_distributions",
+    "synccheck": (
+        "pinned_route_distributions or adversarial_routes or full_expert_batch"
+    ),
+}
+
+#: What each tool's clean verdict does and does not establish.
+#:
+#: Carried into the artifact so a reader cannot take the wrong claim from it.
+#: The distinction matters most for memcheck, whose clean run says nothing
+#: whatever about ordering: it is a memory-safety result, and it was quoted as
+#: though it were a concurrency result once already.
+#:
+#: None of the three can reason about the candidate's global readiness edges.
+#: A readiness counter is a device-scope atomic in global memory read by a
+#: bounded spin in another CTA, which is exactly the shape racecheck's
+#: shared-memory instrumentation does not see and synccheck's barrier checks do
+#: not model. That claim is carried by the replay stress gate instead, which is
+#: why the two are run together and reported together.
+K3_SANITIZER_CLAIMS = {
+    "memcheck": (
+        "memory safety only: out-of-bounds and misaligned accesses, leaks, and "
+        "invalid API use. Says nothing about ordering or about races."
+    ),
+    "racecheck": (
+        "shared-memory race conditions. Does not cover global-memory readiness "
+        "between CTAs, which the replay stress gate covers instead."
+    ),
+    "synccheck": (
+        "illegal or divergent barrier and warp-level synchronization. Does not "
+        "model global-memory readiness between CTAs."
+    ),
+    "initcheck": "reads of uninitialized device global memory.",
+}
+
+#: The decode suite, whose pinned routes are the narrowed selection above.
+#:
+#: Since the dependency-local schedule was promoted, this suite runs it: it
+#: selects no schedule and therefore takes the default. That is what collapsed
+#: six sanitizer gates into three. While the schedule was opt-in a tool pointed
+#: here saw only the barrier schedule, so a second gate had to point at the
+#: candidate's own suite to see the new one. Now the first gate sees the
+#: shipping schedule and the second would be the same run under another name.
+K3_DECODE_FILE = "tests/test_kimi_k3_decode.py"
+
+#: The schedule suite, for the degenerate routes the decode suite does not pin.
+#:
+#: Collapsing the six gates to three kept the shipping schedule under all three
+#: tools and dropped the routes the deleted gates had selected. Those routes are
+#: the reason the deleted gates existed, so the two tools that can finish read
+#: this file too. Its tests name their schedule, so a tool pointed here sees
+#: both of them rather than only the default.
+K3_SCHEDULE_FILE = "tests/test_kimi_k3_dependency_schedule.py"
+
+#: Every sanitizer gate, as ``(tool, files, expression)``.
+#:
+#: Three tools against the schedule that ships. The barrier schedule keeps the
+#: memcheck and racecheck record it accumulated while it was the default, and
+#: what ties the two together now is the replay stress gate: it runs them
+#: alternately on one poisoned workspace and requires bit-for-bit agreement, so
+#: a fault peculiar to either one cannot hide behind the other's clean report.
+K3_SANITIZER_GATES = {
+    "memcheck": (
+        "memcheck",
+        f"{K3_DECODE_FILE},{K3_SCHEDULE_FILE}",
+        K3_SANITIZER_SELECTION["memcheck"],
+    ),
+    "racecheck": (
+        "racecheck",
+        K3_DECODE_FILE,
+        K3_SANITIZER_SELECTION["racecheck"],
+    ),
+    "synccheck": (
+        "synccheck",
+        f"{K3_DECODE_FILE},{K3_SCHEDULE_FILE}",
+        K3_SANITIZER_SELECTION["synccheck"],
+    ),
+}

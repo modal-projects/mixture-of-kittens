@@ -66,10 +66,13 @@ from .kimi_k3_decode_support import (
     assert_distinct,
     assert_identical_across_ranks,
     assert_replicated,
+    barrier_schedule,
     decode_reference,
     decode_step as _decode,
+    dependency_local_schedule,
     hidden_states,
     poison_scratch,
+    schedule_queue_tickets,
     profiled_kernel_names,
     published_routes,
     published_shared_partial,
@@ -603,53 +606,90 @@ def test_the_grid_claims_only_occupied_experts(
     mode: str,
     tokens: int,
 ) -> None:
-    """No production CTA sweeps all 896 experts looking for work.
+    """No CTA of either schedule sweeps all 896 experts looking for work.
 
-    Phase 2 compacts the occupied experts into a list and publishes its length,
-    and phases 3 and 4 size their queues from that length. The counters the
-    launch leaves behind report both facts: the published length is exactly the
-    number of experts the router actually chose, and each queue was drained by
-    many CTAs racing for tickets rather than by one CTA walking the table.
+    Both compact the occupied experts into a list and publish its length, and
+    both size their routed queues from that length. The published length is a
+    phase counter either way, so it is checked once; the ticket counters are
+    not, because the two schedules keep their queues in different places. The
+    barrier schedule's three sit in the phase region, and the dependency-local
+    schedule's seven sit in its own appended region, disjoint from them by
+    construction. Reading whichever belongs to the schedule that ran is what
+    keeps the claim -- that a queue was drained by many CTAs racing for tickets
+    rather than by one CTA walking the table -- true of the code that ships.
     """
     _, _, device = tp8_context
     plan = routing(mode, device, tokens, weights)
     routed = with_routing(weights, plan)
     distinct = _expected_distinct_experts(plan.hidden, routed)
 
-    _decode(workspace, routed, plan.hidden)
-    torch.cuda.synchronize(device)
-    counters = _phase(workspace.scratch)
-
-    assert int(counters[ACTIVE_EXPERT_UNITS].item()) == distinct
-    assert distinct < EXPERTS
-
     gate_up_units = distinct * GATE_UP_UNITS
+    source_units = (
+        tokens * SCORE_SHARDS
+        + TENSOR_PROJECTION_UNITS
+        + 2 * TENSOR_SHARED_GATE_UNITS
+    )
     down_units = (
         ACTIVATION_UNITS
         + TENSOR_SHARED_DOWN_UNITS
         + distinct * GROUPED_DOWN_UNITS
     )
-    # Batched routed queues stop one width-four claim past their last unit for
-    # every CTA that was refused; the route/latent queue still claims singly.
-    for counter, units, claim_width in (
-        (GATE_UP_QUEUE, gate_up_units, 4),
-        (DOWN_QUEUE, down_units, 4),
-        (
-            ROUTE_LATENT_QUEUE,
-            tokens * SCORE_SHARDS
-            + TENSOR_PROJECTION_UNITS
-            + 2 * TENSOR_SHARED_GATE_UNITS,
-            1,
-        ),
-    ):
-        drained = int(counters[counter].item())
+
+    def assert_drained(
+        label: object, drained: int, units: int, claim_width: int
+    ) -> None:
+        # A batched queue stops one claim past its last unit for every CTA that
+        # was refused; a singly-claimed one stops on its last unit.
         rounded = (units + claim_width - 1) // claim_width * claim_width
         assert units <= drained <= (
             rounded + claim_width * PERSISTENT_CTAS
-        ), (
-            counter,
-            drained,
-        )
+        ), (label, drained, units)
+
+    with barrier_schedule():
+        _decode(workspace, routed, plan.hidden)
+        torch.cuda.synchronize(device)
+        counters = _phase(workspace.scratch)
+
+        assert int(counters[ACTIVE_EXPERT_UNITS].item()) == distinct
+        assert distinct < EXPERTS
+        for counter, units, claim_width in (
+            (GATE_UP_QUEUE, gate_up_units, 4),
+            (DOWN_QUEUE, down_units, 4),
+            (ROUTE_LATENT_QUEUE, source_units, 1),
+        ):
+            assert_drained(
+                counter, int(counters[counter].item()), units, claim_width
+            )
+
+    with dependency_local_schedule():
+        _decode(workspace, routed, plan.hidden)
+        torch.cuda.synchronize(device)
+        counters = _phase(workspace.scratch)
+
+        assert int(counters[ACTIVE_EXPERT_UNITS].item()) == distinct
+        tickets = schedule_queue_tickets(workspace.scratch)
+        # types.cuh: ScheduleQueue, in the order every CTA scans them. Five of
+        # the seven have a length that depends only on the shape, so those come
+        # from the extension rather than from a second copy of the arithmetic.
+        # The two routed queues are sized from the compacted expert table at
+        # runtime, and the binding reports the worst case for the shape, so
+        # those two are the ones derived from `distinct` here -- which is the
+        # claim being made: the routed queues are as long as the experts the
+        # router chose and no longer.
+        declared = _C._kimi_k3_decode_schedule_queue_units(tokens)
+        assert len(tickets) == len(declared) == 7
+        for index, (label, units, claim_width) in enumerate((
+            ("source", declared[0], 1),
+            ("shared_activation", declared[1], 1),
+            ("assignment", declared[2], 1),
+            ("routed_gate_up", gate_up_units, 4),
+            ("shared_down", declared[4], 1),
+            ("routed_down", distinct * GROUPED_DOWN_UNITS, 4),
+            ("publish", declared[6], 1),
+        )):
+            assert_drained(label, tickets[index], units, claim_width)
+        assert gate_up_units <= declared[3]
+        assert distinct * GROUPED_DOWN_UNITS <= declared[5]
 
 
 # ---------------------------------------------------------------------------
@@ -714,21 +754,30 @@ def test_the_launch_is_correct_across_the_unsigned_serial_wrap(
     barrier serial once, and both are compared with unsigned difference rather
     than ordering. Starting them three short of the wrap makes this one launch
     cross it, which a naive ``>=`` comparison could not survive.
+
+    Five advances is the barrier schedule's count, so this asks for it by name.
+    The shipped schedule spends one, and
+    ``test_the_candidate_is_correct_across_the_unsigned_generation_wrap`` parks
+    its generation on the last representable value so that its single barrier
+    lands on zero -- the same property at the count this schedule does not have.
     """
     _, _, device = tp8_context
     tokens = 12
     hidden = hidden_states(device, tokens)
     expected = decode_reference(hidden, weights)
 
-    _prime_barrier_serial(workspace, UINT32_MAX - 2)
-    _phase(workspace.scratch)[GRID_GENERATION].fill_(_as_int32(UINT32_MAX - 2))
-    _synchronize_ranks(workspace)
+    with barrier_schedule():
+        _prime_barrier_serial(workspace, UINT32_MAX - 2)
+        _phase(workspace.scratch)[GRID_GENERATION].fill_(
+            _as_int32(UINT32_MAX - 2)
+        )
+        _synchronize_ranks(workspace)
 
-    actual = _decode(workspace, weights, hidden)
-    torch.cuda.synchronize(device)
-    assert_decode_close(actual, expected)
-    # Five barriers from three short of the wrap lands two past it.
-    assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 2
+        actual = _decode(workspace, weights, hidden)
+        torch.cuda.synchronize(device)
+        assert_decode_close(actual, expected)
+        # Five barriers from three short of the wrap lands two past it.
+        assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 2
     assert_identical_across_ranks(actual)
 
 
@@ -917,12 +966,12 @@ def _phase_profiling() -> Iterator[None]:
 
 
 def _phase_clock_band(workspace: KimiK3DecodeWorkspace) -> torch.Tensor:
-    begin, names = _C._kimi_k3_decode_phase_clock_metadata()
+    begin, names, _ = _C._kimi_k3_decode_phase_clock_metadata()
     return workspace.scratch[begin * 4 : (begin + 2 * len(names)) * 4]
 
 
 def _phase_clocks(workspace: KimiK3DecodeWorkspace) -> dict[str, int]:
-    _, names = _C._kimi_k3_decode_phase_clock_metadata()
+    _, names, _ = _C._kimi_k3_decode_phase_clock_metadata()
     counters = _phase_clock_band(workspace).cpu().view(torch.int64).tolist()
     return dict(zip(names, counters, strict=True))
 
@@ -943,64 +992,87 @@ def test_a_profiled_launch_reports_its_own_cycles_and_costs_one_barrier(
     profiled launch, so a counter that survives it is a counter the launch
     never cleared, and the extra rendezvous shows up directly as one more grid
     generation than an unprofiled launch spends.
+
+    Scoped to the barrier schedule, because two of the things asserted here are
+    only true of it: the five and six generations, and ``readiness_wait``, which
+    is the clock its gate/up-to-down readiness laps and which the shipped
+    schedule leaves at zero because its waits are timed per edge instead. The
+    shipped schedule's own profile is checked by
+    ``test_a_profiled_candidate_reports_where_its_readiness_waits_went``, which
+    reads that per-edge band.
     """
-    _, _, device = tp8_context
-    tokens = TENSOR_TOKENS
-    hidden = hidden_states(device, tokens)
-    expected = decode_reference(hidden, weights)
+    with barrier_schedule():
+        _, _, device = tp8_context
+        tokens = TENSOR_TOKENS
+        hidden = hidden_states(device, tokens)
+        expected = decode_reference(hidden, weights)
 
-    _decode(workspace, weights, hidden)
-    _synchronize_ranks(workspace)
+        _decode(workspace, weights, hidden)
+        _synchronize_ranks(workspace)
 
-    # An unprofiled launch takes neither the clearing nor its barrier, and
-    # writes no counter, so the band it is handed back is the one it was given.
-    _phase_clock_band(workspace).zero_()
-    _phase(workspace.scratch)[GRID_GENERATION].zero_()
-    _synchronize_ranks(workspace)
-    _decode(workspace, weights, hidden)
-    torch.cuda.synchronize(device)
-    assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 5
-    assert set(_phase_clocks(workspace).values()) == {0}
-
-    with _phase_profiling():
-        assert _C._kimi_k3_decode_phase_profile()
+        # An unprofiled launch takes neither the clearing nor its barrier, and
+        # writes no counter, so the band it is handed back is the one it was given.
+        _phase_clock_band(workspace).zero_()
         _phase(workspace.scratch)[GRID_GENERATION].zero_()
         _synchronize_ranks(workspace)
-        first_result = _decode(workspace, weights, hidden).clone()
+        _decode(workspace, weights, hidden)
         torch.cuda.synchronize(device)
-        first = _phase_clocks(workspace)
-        assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 6
+        assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 5
+        assert set(_phase_clocks(workspace).values()) == {0}
 
-        # Every byte of the band set to one is 0x0101010101010101 in each
-        # counter, 7.2e16 cycles: eight orders of magnitude above anything a
-        # decode step spends, and it survives being added to. A counter that
-        # comes back small is one this launch cleared.
-        poison_floor = 1 << 40
-        _phase_clock_band(workspace).fill_(1)
+        with _phase_profiling():
+            assert _C._kimi_k3_decode_phase_profile()
+            _phase(workspace.scratch)[GRID_GENERATION].zero_()
+            _synchronize_ranks(workspace)
+            first_result = _decode(workspace, weights, hidden).clone()
+            torch.cuda.synchronize(device)
+            first = _phase_clocks(workspace)
+            assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 6
+
+            # Every byte of the band set to one is 0x0101010101010101 in each
+            # counter, 7.2e16 cycles: eight orders of magnitude above anything a
+            # decode step spends, and it survives being added to. A counter that
+            # comes back small is one this launch cleared.
+            poison_floor = 1 << 40
+            _phase_clock_band(workspace).fill_(1)
+            _synchronize_ranks(workspace)
+            second_result = _decode(workspace, weights, hidden).clone()
+            torch.cuda.synchronize(device)
+            second = _phase_clocks(workspace)
+
+        assert_decode_close(first_result, expected)
+        assert_decode_close(second_result, expected)
+        assert int(workspace.error_flag.item()) == 0
+
+        # Every production region is timed, and the poison is gone from the whole
+        # band: the launch reported itself rather than itself plus whatever the
+        # band already held. Production readiness replaces the gate/up-to-down
+        # grid barrier, so its own wait clock must also report work.
+        _, names, parents = _C._kimi_k3_decode_phase_clock_metadata()
+        assert set(first) == set(names)
+        assert min(first.values()) > 0, first
+        for name, cycles in second.items():
+            assert 0 < cycles < poison_floor, (name, cycles)
+
+        # A child region's cycles lie inside its parent's, which is the property
+        # the report's totals depend on and the only one a run can check. The
+        # slack allows for the parent's lap landing a few hundred cycles after the
+        # child's on 148 CTAs; a child that were a *sibling* rather than a child
+        # would exceed its parent by whole multiples, as summing the band does.
+        for index, (name, parent) in enumerate(zip(names, parents, strict=True)):
+            del index
+            if parent < 0:
+                continue
+            assert first[name] <= 1.05 * first[names[parent]], (
+                name, names[parent], first[name], first[names[parent]]
+            )
+
+        # Profiling is off again, so the band stops moving and the launch is back
+        # to the six generations a measured replay spends.
+        assert not _C._kimi_k3_decode_phase_profile()
+        _phase(workspace.scratch)[GRID_GENERATION].zero_()
         _synchronize_ranks(workspace)
-        second_result = _decode(workspace, weights, hidden).clone()
+        _decode(workspace, weights, hidden)
         torch.cuda.synchronize(device)
-        second = _phase_clocks(workspace)
-
-    assert_decode_close(first_result, expected)
-    assert_decode_close(second_result, expected)
-    assert int(workspace.error_flag.item()) == 0
-
-    # Every production region is timed, and the poison is gone from the whole
-    # band: the launch reported itself rather than itself plus whatever the
-    # band already held. Production readiness replaces the gate/up-to-down
-    # grid barrier, so its own wait clock must also report work.
-    assert set(first) == set(_C._kimi_k3_decode_phase_clock_metadata()[1])
-    assert min(first.values()) > 0, first
-    for name, cycles in second.items():
-        assert 0 < cycles < poison_floor, (name, cycles)
-
-    # Profiling is off again, so the band stops moving and the launch is back
-    # to the six generations a measured replay spends.
-    assert not _C._kimi_k3_decode_phase_profile()
-    _phase(workspace.scratch)[GRID_GENERATION].zero_()
-    _synchronize_ranks(workspace)
-    _decode(workspace, weights, hidden)
-    torch.cuda.synchronize(device)
-    assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 5
-    assert _phase_clocks(workspace) == second
+        assert int(_phase(workspace.scratch)[GRID_GENERATION].item()) == 5
+        assert _phase_clocks(workspace) == second

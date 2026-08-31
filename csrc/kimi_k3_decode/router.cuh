@@ -180,9 +180,15 @@ static __device__ void build_expert_units(
         if (counts[expert] <= 0) continue;
         scratch.unit_expert[unit] = expert;
         // The persistent path no longer reads the global assignment counts
-        // after compaction. Reuse them as per-expert gate/up readiness slots;
-        // the phase barrier following this function publishes every zero
-        // before a producer can increment one.
+        // after compaction. Reuse them as per-expert gate/up readiness slots.
+        //
+        // Both persistent schedules order these zeros ahead of the first
+        // producer that increments one, by different means. One takes a
+        // full-grid barrier between this phase and its gate/up phase. The other
+        // has no barrier here at all: it counts this compaction's own arrival
+        // after this function returns, and every gate/up consumer acquires on
+        // that count before it claims a unit, so the zeroing is released by the
+        // same edge that releases the compacted table it belongs to.
         scratch.expert_counts[expert] = 0;
         unit++;
     }

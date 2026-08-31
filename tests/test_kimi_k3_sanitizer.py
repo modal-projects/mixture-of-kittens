@@ -18,12 +18,14 @@ No GPU, no compiled extension, no ``mok`` import.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
 
 from benchmarks.kimi_k3_sanitizer import (
     HOST_ALLOWANCE_PER_RANK,
+    K3_SANITIZER_GATES,
     PERMITTED_EXIT_CODES,
     SanitizerVerdict,
     sanitizer_verdict,
@@ -321,3 +323,84 @@ def test_the_clean_captures_trip_no_application_error_pattern() -> None:
     for name, tool in (("racecheck_pass", "racecheck"), ("memcheck_pass", "memcheck")):
         verdict = _verdict(name, tool)
         assert verdict.passed, (name, verdict.failures)
+
+
+# ---------------------------------------------------------------------------
+# The gate table itself.
+# ---------------------------------------------------------------------------
+
+
+def test_every_sanitizer_gate_selects_tests_that_exist_in_its_own_suite() -> None:
+    """A gate whose ``-k`` matches nothing proves nothing.
+
+    ``sanitizer_verdict`` does refuse a rank that passed no tests, so an empty
+    selection fails rather than passing -- but it fails for the wrong reason,
+    and the artifact it leaves says nothing about the code the gate was pointed
+    at. That is the worse failure of the two, because it looks like a finding.
+
+    The candidate's suite and production's share no test name, so this is not a
+    hypothetical: the candidate gates were first written reusing production's
+    expression, which deselected all fifteen of the candidate's tests.
+
+    Read from the source rather than by collecting, so it holds on a CPU with no
+    compiled extension -- the whole point of this file. The gate table lives
+    beside the verdict for the same reason: importing it from ``modal_app``
+    would pull in ``modal``, which the suite's own image has no reason to carry.
+    """
+    root = Path(__file__).resolve().parents[1]
+    # Only the shapes the expressions actually use. `-k` also accepts `not` and
+    # parentheses; if one shows up here it should be added deliberately rather
+    # than parsed by accident, so anything else fails the split below.
+    assert K3_SANITIZER_GATES, "no sanitizer gates are defined"
+    for gate, (tool, files, expression) in K3_SANITIZER_GATES.items():
+        terms = [term.strip() for term in expression.split(" or ")]
+        assert all(
+            re.fullmatch(r"[a-z0-9_]+", term) for term in terms
+        ), (gate, expression)
+        names = set()
+        for path in files.split(","):
+            source = (root / path).read_text()
+            assert source, (gate, path)
+            names.update(re.findall(r"^def (test_[a-z0-9_]+)", source, re.M))
+        assert names, (gate, files)
+        for term in terms:
+            matched = [name for name in names if term in name]
+            assert matched, (
+                f"{gate}: -k term {term!r} matches none of the "
+                f"{len(names)} tests in {files}"
+            )
+        assert tool in ("memcheck", "racecheck", "synccheck", "initcheck")
+
+
+def test_a_tool_left_out_of_the_default_gates_can_still_be_asked_for() -> None:
+    """The tool that cannot finish is the one somebody will want to re-run.
+
+    racecheck is defined and deliberately outside the default set: it completes
+    against the barrier schedule and traps against the dependency-local one, so
+    a default run that included it would be red on every run for a reason that
+    does not change. Which makes it exactly the gate a reader re-runs by name to
+    find out whether it still traps -- and a name check taken against the
+    default set alone would refuse that request as an unknown gate.
+
+    Read from ``modal_app``'s text rather than by importing it, because this
+    file's whole point is to hold without ``modal`` installed.
+    """
+    source = (Path(__file__).resolve().parents[1] / "modal_app.py").read_text()
+    body = source[source.index("def verify("):source.index("    functions = {")]
+
+    assert "definable = set(K3_GATES) | set(K3_SANITIZER_GATES)" in body
+    assert "unknown = sorted(set(requested) - definable)" in body
+    # The shape that was wrong: the default set as the only definition.
+    assert "set(requested) - set(K3_GATES)" not in body
+
+    opened = source.index("K3_GATES = (")
+    default = source[opened:source.index("\n)\n", opened)]
+    named = set(re.findall(r'^    "([a-z-]+)",$', default, re.M))
+    assert named, default
+    absent = sorted(set(K3_SANITIZER_GATES) - named)
+    assert absent == ["racecheck"], absent
+
+    # And the reason it is absent is written down where it is absent: the
+    # comment the definition carries, not somewhere a reader has to find.
+    reason = source[source.index("#: The gates a default"):opened]
+    assert "racecheck" in reason and "fifteen seconds" in reason, reason

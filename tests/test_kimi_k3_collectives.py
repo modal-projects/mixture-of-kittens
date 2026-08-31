@@ -68,7 +68,7 @@ from .kimi_k3_tail_support import (
 def test_tail_scratch_layout_matches_the_compiled_source_of_truth(
     workspace: KimiK3DecodeWorkspace,
 ) -> None:
-    assert SCRATCH_BYTES == 8_111_360
+    assert SCRATCH_BYTES == 8_111_872
     assert _C.kimi_k3_decode_workspace_bytes() == SCRATCH_BYTES
     assert workspace.scratch.numel() == SCRATCH_BYTES
     assert SCRATCH_LAYOUT["tail_normalized"] == (5_584_640, 917_504)

@@ -101,6 +101,50 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &kimi_k3_decode::persistent::benchmark_phase_profile_for_testing);
     m.def("_kimi_k3_decode_phase_clock_metadata",
           &kimi_k3_decode::persistent::phase_clock_metadata_for_testing);
+    m.def("_kimi_k3_decode_set_dependency_schedule",
+          &kimi_k3_decode::persistent::set_dependency_schedule_for_testing,
+          "", pybind11::arg("enabled"));
+    m.def("_kimi_k3_decode_dependency_schedule",
+          &kimi_k3_decode::persistent::dependency_schedule_for_testing);
+    m.def("_kimi_k3_decode_schedule_resident_blocks_per_sm",
+          &kimi_k3_decode::persistent::
+              schedule_resident_blocks_per_sm_for_testing,
+          "", pybind11::arg("tensor_path"));
+    m.def("_kimi_k3_decode_schedule_edges",
+          &kimi_k3_decode::persistent::schedule::schedule_edges_for_testing);
+    m.def("_kimi_k3_decode_schedule_edge_diagnostics",
+          &kimi_k3_decode::persistent::schedule::
+              schedule_edge_diagnostics_for_testing,
+          "", pybind11::arg("unit"));
+    m.def("_kimi_k3_decode_schedule_queues",
+          &kimi_k3_decode::persistent::schedule::
+              schedule_queue_names_for_testing);
+    m.def("_kimi_k3_decode_schedule_clock_metadata",
+          &kimi_k3_decode::persistent::schedule::
+              schedule_clock_metadata_for_testing);
+    m.def("_kimi_k3_decode_schedule_counter_bounds",
+          &kimi_k3_decode::persistent::schedule::
+              schedule_counter_bounds_for_testing);
+    m.def("_kimi_k3_decode_schedule_queue_units",
+          &kimi_k3_decode::persistent::schedule::
+              schedule_queue_units_for_testing,
+          "", pybind11::arg("active_tokens"));
+    m.def("_kimi_k3_decode_schedule_wait_probe",
+          &kimi_k3_decode::persistent::schedule::
+              schedule_wait_probe_for_testing,
+          "", pybind11::arg("scratch"), pybind11::arg("error_flag"),
+          pybind11::arg("edge"), pybind11::arg("unit"),
+          pybind11::arg("target"));
+    m.def("_kimi_k3_decode_schedule_wait_probe_concurrent",
+          &kimi_k3_decode::persistent::schedule::
+              schedule_wait_probe_concurrent_for_testing,
+          "", pybind11::arg("scratch"), pybind11::arg("error_flag"),
+          pybind11::arg("units_per_edge"), pybind11::arg("target"));
+    m.def("_kimi_k3_decode_timeout_claim", [](const std::int64_t claim) {
+        return static_cast<std::int64_t>(
+            kimi_k3_decode::timeout::claiming_block(
+                static_cast<unsigned int>(claim)));
+    }, "", pybind11::arg("claim"));
     m.def("_kimi_k3_decode_benchmark_grids", []() {
         const auto &grids =
             kimi_k3_decode::persistent::kBenchmarkGridCtas;

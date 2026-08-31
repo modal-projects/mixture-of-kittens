@@ -106,7 +106,10 @@ __all__ = [
     "NUMERICAL_TOLERANCES",
     "NUM_EXPERTS",
     "P99_LIMIT_RATIO",
+    "PHASE_CLOCKS",
     "PHASE_CLOCK_NAMES",
+    "PHASE_CLOCK_PARENTS",
+    "PHASE_CLOCK_TOP_LEVEL",
     "REQUIRED_FRAMEWORK_PINS",
     "ROUTED_INTERMEDIATE_SIZE",
     "ROUTER_WEIGHT_MAX_ABS",
@@ -140,44 +143,68 @@ __all__ = [
 ]
 
 
-# The kernel's clock64 accumulators, in `csrc/kimi_k3_decode/types.cuh` order.
-# The two `_stage`/`_mma` pairs measure the inside of the routed region above
-# them rather than a region of their own.
-PHASE_CLOCK_NAMES = (
-    "readiness_wait",
-    "router_score",
-    "latent_project",
-    "routed_queue",
-    "latent_quantize",
-    "routed_gate_up",
-    "routed_gate_up_stage",
-    "routed_gate_up_mma",
-    "routed_gate_up_tma_issue",
-    "routed_gate_up_tma_wait",
-    "routed_gate_up_ring_full",
-    "routed_gate_up_mma_issue",
-    "routed_gate_up_activation",
-    "routed_gate_up_epilogue",
-    "routed_down",
-    "routed_down_stage",
-    "routed_down_mma",
-    "shared_experts",
-    "grid_barrier",
-    "tail",
+# The kernel's clock64 accumulators, as `(region, containing region)` in
+# `csrc/kimi_k3_decode/types.cuh` order.
+#
+# The band is a tree, not a list. Nine of the twenty-two regions measure the
+# inside of another region at a finer grain and therefore the same cycles
+# again: `routed_gate_up_stage` contains the three copy clocks,
+# `routed_gate_up_mma` contains the issue clock, and `routed_gate_up` contains
+# both of those plus the activation gather and the epilogue. At M16 the leaves
+# of that one subtree came to 82.0M cycles against a parent of 46.5M, so a
+# total taken over the whole band is not a total of anything.
+#
+# The parent is therefore part of the table rather than inferred from the name.
+# It used to be inferred, from a list of suffixes, and that could express only
+# "not in the total" -- it could not say that `_tma_wait` is a fraction of
+# `_stage` rather than of the launch, and it silently depended on no top-level
+# region ever being named with a child's suffix.
+PHASE_CLOCKS = (
+    ("readiness_wait", None),
+    ("router_score", None),
+    ("latent_project", None),
+    ("routed_queue", None),
+    ("latent_quantize", None),
+    ("assignment", None),
+    ("publish", None),
+    ("routed_gate_up", None),
+    ("routed_gate_up_stage", "routed_gate_up"),
+    ("routed_gate_up_mma", "routed_gate_up"),
+    ("routed_gate_up_tma_issue", "routed_gate_up_stage"),
+    ("routed_gate_up_tma_wait", "routed_gate_up_stage"),
+    ("routed_gate_up_ring_full", "routed_gate_up_stage"),
+    ("routed_gate_up_mma_issue", "routed_gate_up_mma"),
+    ("routed_gate_up_activation", "routed_gate_up"),
+    ("routed_gate_up_epilogue", "routed_gate_up"),
+    ("routed_down", None),
+    ("routed_down_stage", "routed_down"),
+    ("routed_down_mma", "routed_down"),
+    ("shared_experts", None),
+    ("grid_barrier", None),
+    ("tail", None),
 )
-# Suffixes that name a breakdown *inside* one of the regions above rather than
-# a region of the launch. The fused gate/up unit reports six of its own on top
-# of the coarse `_stage`/`_mma` pair, and none of them may enter the total the
-# shares are taken against or the launch would be counted several times over.
-PHASE_CLOCK_BREAKDOWN_SUFFIXES = (
-    "_stage",
-    "_mma",
-    "_epilogue",
-    "_tma_issue",
-    "_tma_wait",
-    "_ring_full",
-    "_mma_issue",
-    "_activation",
+
+PHASE_CLOCK_NAMES = tuple(name for name, _ in PHASE_CLOCKS)
+# Regions the reader derives rather than reads. `routed_down` has no epilogue
+# counter of its own, so its epilogue is what is left of its band after staging
+# and MMA -- which makes it a child of that band exactly as a measured one
+# would be, and the total must not gain it.
+PHASE_CLOCK_DERIVED = {"routed_down_epilogue": "routed_down"}
+PHASE_CLOCK_PARENTS = {
+    **{name: parent for name, parent in PHASE_CLOCKS},
+    **PHASE_CLOCK_DERIVED,
+}
+# The regions whose intervals are disjoint, and therefore the only ones a total
+# may be taken over. Each begins where the previous one ended or at a mark
+# reset after a wait, and ends at its own lap.
+#
+# Membership is what admits a region to the total, rather than the absence of a
+# child's name shape. A region nobody declared contributes nothing instead of
+# being assumed disjoint, which is the direction that fails safely: the old
+# suffix rule counted `routed_down_epilogue` as a region of the launch the
+# moment it was derived under a name whose suffix nobody had listed.
+PHASE_CLOCK_TOP_LEVEL = tuple(
+    name for name, parent in PHASE_CLOCKS if parent is None
 )
 
 
@@ -203,30 +230,40 @@ def derive_phase_cycles(cycles: Mapping[str, int]) -> dict[str, int]:
 def summarize_phase_cycles(cycles: Mapping[str, int]) -> dict[str, Any]:
     """Rank the kernel's accumulated regions by their share of the total.
 
-    Only the regions that partition the launch are summed. A region's own
-    breakdown counters are reported alongside their share of the same total,
-    which is what makes "the staging inside routed gate/up is 83% of the whole
-    launch" a statement about the launch rather than about its parent region.
+    The total is over the top-level regions only, because those are the only
+    ones whose intervals are disjoint. A child is reported with its share of
+    the same total *and* its share of its own parent, which is what makes "TMA
+    wait is 71% of gate/up staging and 14% of the launch" two statements rather
+    than one ambiguous one -- the first is the actionable number and the second
+    is the one that says whether acting on it is worth anything.
     """
     accounted = sum(
-        value
-        for name, value in cycles.items()
-        if not name.endswith(PHASE_CLOCK_BREAKDOWN_SUFFIXES)
+        value for name, value in cycles.items()
+        if name in PHASE_CLOCK_TOP_LEVEL
     )
     ranked = sorted(
         (
             (name, value)
             for name, value in cycles.items()
-            if not name.endswith(PHASE_CLOCK_BREAKDOWN_SUFFIXES)
+            if name in PHASE_CLOCK_TOP_LEVEL
         ),
         key=lambda item: (-item[1], item[0]),
     )
+    share_of_parent = {}
+    for name, value in cycles.items():
+        parent = PHASE_CLOCK_PARENTS.get(name)
+        if parent is None:
+            continue
+        total = cycles.get(parent, 0)
+        share_of_parent[name] = value / total if total else 0.0
     return {
         "accounted_cycles": accounted,
         "share_of_accounted": {
             name: (value / accounted if accounted else 0.0)
             for name, value in cycles.items()
         },
+        "share_of_parent": share_of_parent,
+        "top_level": list(PHASE_CLOCK_TOP_LEVEL),
         "ranked": ranked,
         "dominant_region": ranked[0][0] if accounted else None,
         "dominant_share": (ranked[0][1] / accounted) if accounted else 0.0,

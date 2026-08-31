@@ -77,11 +77,12 @@ def test_durable_phase_profiler_keeps_aggregate_grid_barrier_clock() -> None:
 
     # Two 256-byte scratch grains rather than one. The accumulator band ends the
     # region and it grew: the routed gate/up phase reports six subphases of its
-    # own now, and twenty accumulated regions at two slots each do not fit above
-    # the thirty-six live counters in 64.
+    # own now, and the assignment build and the publish write have bands of
+    # their own, so twenty-two accumulated regions at two slots each do not fit
+    # above the thirty-six live counters in 64.
     assert "NUM_PHASE_COUNTERS = 128" in types
-    assert "kPhaseClockCount == 20" in types
-    assert "kPhaseClockBegin == 88" in types
+    assert "kPhaseClockCount == 22" in types
+    assert "kPhaseClockBegin == 84" in types
     assert '"grid_barrier"' in types
     assert "kClockGridBarrier" in kernel
     assert "route_latent_makespan" not in types

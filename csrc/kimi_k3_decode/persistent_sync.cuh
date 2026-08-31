@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../serial_sync.cuh"
+#include "timeout_publication.cuh"
 #include "types.cuh"
 
 #include <cstdint>
@@ -119,20 +120,21 @@ static __device__ __forceinline__ std::uint32_t load_relaxed_gpu(
 /// counter stalled, and the flag carries the site's own code, so a host that
 /// only reads the flag still learns which wait failed without having to know
 /// the scratch layout. Both are nonzero, so zero keeps meaning "no timeout".
+///
+/// The publication itself is `timeout::publish_and_trap` -- one claim word,
+/// one winner, slot before code, and losers held until the pair is complete.
+/// This wrapper only names the slot this family of waits records into, so that
+/// the schedule's ten readiness edges, the grid barrier, and the tail's six
+/// rendezvous cannot end up with three protocols between them.
 static __device__ __forceinline__ void record_timeout_and_trap(
     const Scratch &scratch,
     int *__restrict__ const error_flag,
     const int counter_index,
     const int error_code
 ) {
-    atomicExch(
-        reinterpret_cast<unsigned int *>(
-            &scratch.phase[kPersistentTimeoutPhase]),
-        static_cast<unsigned int>(counter_index));
-    atomicExch(reinterpret_cast<unsigned int *>(error_flag),
-               static_cast<unsigned int>(error_code));
-    __threadfence_system();
-    asm volatile("trap;");
+    timeout::publish_and_trap(
+        scratch, error_flag, kPersistentTimeoutPhase, counter_index,
+        error_code);
 }
 
 /// One CTA's view of the grid barrier's generation counter.

@@ -36,6 +36,7 @@ from .kimi_k3_decode_support import (
     MAX_TOKENS,
     PERSISTENT_CTAS,
     TENSOR_TOKENS,
+    TIMEOUT_CLAIM,
     TIMEOUT_PHASE,
     _phase,
     _synchronize_ranks,
@@ -72,6 +73,12 @@ _TIMEOUT_CALLERS = (
     "collectives.cuh",
     "expert_mxfp4_grouped.cuh",
     "persistent_kernel.cuh",
+    # The guarded dependency-local candidate accounts for ten codes, but it no
+    # longer spells any of them: each is read out of its `kScheduleEdges` row by
+    # `wait_edge`, so the row is the binding and `_schedule_edge_table` is where
+    # those ten are found. Kept here so a hand-written code added back to the
+    # candidate is still seen.
+    "persistent_schedule.cuh",
 )
 
 # The persistent kernel's whole include closure. Its headers include each other
@@ -235,6 +242,19 @@ def _declared_codes() -> dict[str, int]:
     }
 
 
+def _schedule_edge_table() -> str:
+    """Just the ``kScheduleEdges`` initializer, which is where a wait binds.
+
+    Sliced rather than scanned whole, because the surrounding file also carries
+    ``kTimeoutSites``, and a code found only there is bound to a name and not to
+    a wait.
+    """
+    text = _source("types.cuh")
+    opening = "inline constexpr ScheduleEdge kScheduleEdges[] = {"
+    begin = text.index(opening) + len(opening)
+    return text[begin:text.index("\n};", begin)]
+
+
 def test_every_declared_timeout_code_is_dense_nonzero_and_tabulated(
 ) -> None:
     """Zero has to keep meaning "no wait has ever timed out on this workspace".
@@ -262,10 +282,22 @@ def test_every_declared_timeout_code_is_reported_by_a_real_wait() -> None:
     The table is only worth having if it is the same set of sites the sources
     actually trap at, so the two are compared directly rather than kept in step
     by hand.
+
+    Ten of the codes are no longer spelled at their wait. The candidate's waits
+    derive counter, code, target and scope from one row of ``kScheduleEdges``,
+    which is the point of that table, so the row is where those ten are bound to
+    a wait -- and the row binds more than the old literal did.
+
+    Only that table is read out of ``types.cuh``, not the whole file. Every code
+    also appears in ``kTimeoutSites``, which pairs it with a name for the
+    binding, so scanning the file would make this test vacuous: a code bound to
+    no wait at all would still be found there. ``kTimeoutSites`` has its own
+    check against the declarations above.
     """
     used = set()
     for name in _TIMEOUT_DEFINITIONS + _TIMEOUT_CALLERS:
         used |= set(re.findall(r"\bkError\w+\b", _source(name)))
+    used |= set(re.findall(r"\bkError\w+\b", _schedule_edge_table()))
     assert used == set(_declared_codes())
 
 
@@ -333,6 +365,54 @@ def test_every_site_spins_on_the_same_bound() -> None:
     assert _C._kimi_k3_decode_wait_timeout_clocks() == budget
 
 
+def _enclosing_definition(lines: list[str], number: int) -> int:
+    """The line the function containing ``lines[number]`` starts on.
+
+    Everything in these headers is declared at file scope with its signature
+    unindented and its body indented, so the nearest unindented line above a
+    statement opens the function that statement is in -- except that these
+    signatures run to several lines and close on an unindented ``) {``, which is
+    the signature rather than the start of one, so a leading ``)`` keeps
+    scanning.
+
+    This replaces a fixed twenty-line lookback, which was not a property of
+    anything: making ``record_timeout_and_trap`` explain its compare-and-swap
+    pushed its own signature twenty-one lines above its trap and failed the
+    check on eight ranks, for a trap that had not moved. Scanning to the
+    enclosing definition asks the question the test means -- is this trap inside
+    a bounded wait -- and cannot be broken by a comment.
+    """
+    for candidate in range(number, -1, -1):
+        text = lines[candidate]
+        if text[:1].strip() and not text.startswith(("/", "#", "}", "*", ")")):
+            return candidate
+    return 0
+
+
+def test_an_unguarded_trap_is_still_caught_after_widening_the_window() -> None:
+    """The check above widened from twenty lines to the whole function.
+
+    Widening a window can only make a structural check weaker, so the thing it
+    is supposed to catch is shown being caught rather than assumed: a trap in a
+    function with no bounded wait in it must still fail, however short the
+    function is.
+    """
+    unguarded = [
+        "static __device__ void innocent_helper(",
+        "    const int value",
+        ") {",
+        "    // no bounded wait anywhere in here",
+        '    asm volatile("trap;");',
+        "}",
+    ]
+    guard = re.compile(
+        r"if\s*\(\s*wait_timed_out\(|void record_timeout_and_trap\("
+    )
+    begin = _enclosing_definition(unguarded, 4)
+    assert begin == 0
+    assert not guard.search("\n".join(unguarded[begin:5]))
+
+
 @pytest.mark.parametrize(
     "source", _DECODE_SOURCES, ids=[path.name for path in _DECODE_SOURCES]
 )
@@ -360,8 +440,10 @@ def test_a_burnt_clock_budget_is_the_only_way_this_launch_can_trap(
     for number, line in enumerate(lines):
         if "trap;" not in line:
             continue
-        above = "\n".join(lines[max(0, number - 20):number])
-        assert guard.search(above), (
+        enclosing = "\n".join(
+            lines[_enclosing_definition(lines, number):number + 1]
+        )
+        assert guard.search(enclosing), (
             f"{source.name}:{number + 1} traps with no bounded wait above it"
         )
 
@@ -379,12 +461,19 @@ def test_a_completed_launch_leaves_both_diagnostics_at_zero(
     diagnostics useless: every workspace would look like it had timed out. The
     slots are poisoned first so the check cannot pass by nothing having touched
     them.
+
+    The claim word is the opposite case, and it is checked here rather than in a
+    source contract because what it has to do is *not* survive: a launch that
+    inherited a set claim could never publish a diagnostic again, since every
+    waiter would lose a claim nobody holds. So a completed step must leave it at
+    zero however it found it.
     """
     _, _, device = tp8_context
     hidden = hidden_states(device, tokens)
     counters = _phase(workspace.scratch)
     counters[TAIL_TIMEOUT_PHASE].fill_(99)
     counters[TIMEOUT_PHASE].fill_(99)
+    counters[TIMEOUT_CLAIM].fill_(99)
     workspace.error_flag.fill_(0)
     _synchronize_ranks(workspace)
 
@@ -396,6 +485,8 @@ def test_a_completed_launch_leaves_both_diagnostics_at_zero(
     # is expected to survive; what must not happen is a code appearing.
     assert int(counters[TAIL_TIMEOUT_PHASE].item()) == 99
     assert int(counters[TIMEOUT_PHASE].item()) == 99
+    # The claim, on the other hand, is this launch's to clear.
+    assert int(counters[TIMEOUT_CLAIM].item()) == 0
 
     counters[TAIL_TIMEOUT_PHASE].fill_(0)
     counters[TIMEOUT_PHASE].fill_(0)
@@ -404,6 +495,7 @@ def test_a_completed_launch_leaves_both_diagnostics_at_zero(
     torch.cuda.synchronize(device)
     assert int(counters[TAIL_TIMEOUT_PHASE].item()) == 0
     assert int(counters[TIMEOUT_PHASE].item()) == 0
+    assert int(counters[TIMEOUT_CLAIM].item()) == 0
     assert int(workspace.error_flag.item()) == 0
 
 
