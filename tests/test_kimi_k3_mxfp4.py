@@ -634,10 +634,8 @@ def test_prepare_weights_returns_canonical_prepared_layouts(
         "routed_expert_down_proj",
         "routed_expert_up_proj",
         "routed_latent_rmsnorm_weight",
-        "expert_w1_packed",
-        "expert_w1_scale",
-        "expert_w3_packed",
-        "expert_w3_scale",
+        "expert_w13_packed",
+        "expert_w13_scale",
         "expert_w2_packed",
         "expert_w2_scale",
         "shared_gate_proj",
@@ -646,10 +644,8 @@ def test_prepare_weights_returns_canonical_prepared_layouts(
         "tp_rank",
     )
     assert weights.tp_rank == PREPARE_TP_RANK
-    assert weights.expert_w1_packed.shape == (896, 384, 1792)
-    assert weights.expert_w1_scale.shape == (896, 384, 112)
-    assert weights.expert_w3_packed.shape == (896, 384, 1792)
-    assert weights.expert_w3_scale.shape == (896, 384, 112)
+    assert weights.expert_w13_packed.shape == (896, 5376, 256)
+    assert weights.expert_w13_scale.shape == (896, 42, 2048)
     assert weights.expert_w2_packed.shape == (896, 3584, 192)
     assert weights.expert_w2_scale.shape == (896, 3584, 12)
     assert weights.router_weight.data_ptr() == replicated["router_weight"].data_ptr()
@@ -679,6 +675,7 @@ def test_prepare_weights_slices_routed_and_shared_tp_ranges(
     device: torch.device, prepared_weights: PreparedWeights
 ) -> None:
     from mok.kimi_k3 import dequant_kimi_k3_mxfp4
+    from mok.kimi_k3_w13 import unfuse_w13_half
 
     weights, replicated, _ = prepared_weights()
     routed_start = PREPARE_TP_RANK * 384
@@ -688,15 +685,13 @@ def test_prepare_weights_slices_routed_and_shared_tp_ranges(
     ]
 
     for expert in (0, 895):
+        packed = weights.expert_w13_packed[expert:expert + 1].contiguous()
+        scale = weights.expert_w13_scale[expert:expert + 1].contiguous()
         w1 = dequant_kimi_k3_mxfp4(
-            weights.expert_w1_packed[expert:expert + 1],
-            weights.expert_w1_scale[expert:expert + 1],
-            logical_k=3584,
+            *unfuse_w13_half(packed, scale, 0), logical_k=3584
         )
         w3 = dequant_kimi_k3_mxfp4(
-            weights.expert_w3_packed[expert:expert + 1],
-            weights.expert_w3_scale[expert:expert + 1],
-            logical_k=3584,
+            *unfuse_w13_half(packed, scale, 1), logical_k=3584
         )
         assert w1.shape == (1, 384, 3584)
         torch.testing.assert_close(w1[0, :, 0], expected_rows, rtol=0, atol=0)
@@ -755,10 +750,8 @@ def test_prepare_weights_are_not_repacked_by_decode_calls(
 
     weights, _, _ = prepared_weights()
     packed_fields = (
-        weights.expert_w1_packed,
-        weights.expert_w1_scale,
-        weights.expert_w3_packed,
-        weights.expert_w3_scale,
+        weights.expert_w13_packed,
+        weights.expert_w13_scale,
         weights.expert_w2_packed,
         weights.expert_w2_scale,
     )

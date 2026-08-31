@@ -17,8 +17,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("router_weight"), pybind11::arg("router_correction_bias"),
           pybind11::arg("routed_expert_down_proj"), pybind11::arg("routed_expert_up_proj"),
           pybind11::arg("routed_latent_rmsnorm_weight"),
-          pybind11::arg("expert_w1_packed"), pybind11::arg("expert_w1_scale"),
-          pybind11::arg("expert_w3_packed"), pybind11::arg("expert_w3_scale"),
+          pybind11::arg("expert_w13_packed"), pybind11::arg("expert_w13_scale"),
           pybind11::arg("expert_w2_packed"), pybind11::arg("expert_w2_scale"),
           pybind11::arg("shared_gate_proj"), pybind11::arg("shared_up_proj"),
           pybind11::arg("shared_down_proj"),
@@ -35,6 +34,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("workspace_signature"));
     m.def("kimi_k3_decode_workspace_bytes",
           &kimi_k3_decode::kimi_k3_decode_workspace_bytes);
+    m.def("_kimi_k3_fused_w13_tma_probe",
+          &kimi_k3_decode::expert_mxfp4::fused_w13::
+              kimi_k3_fused_w13_tma_probe_entrypoint,
+          "",
+          pybind11::arg("expert_w13_packed"),
+          pybind11::arg("expert"),
+          pybind11::arg("task_slab"),
+          pybind11::arg("transaction_bytes"));
+    m.def("_kimi_k3_fused_w13_geometry",
+          &kimi_k3_decode::expert_mxfp4::fused_w13::
+              fused_w13_geometry_for_testing);
+    m.def("_kimi_k3_fused_w13_shared_footprint",
+          &kimi_k3_decode::expert_mxfp4::fused_w13::
+              kimi_k3_fused_w13_shared_footprint_entrypoint);
+    m.def("_kimi_k3_fused_w13_packed_maps_encoded",
+          &kimi_k3_decode::expert_mxfp4::fused_w13::
+              fused_w13_packed_maps_encoded_for_testing);
     m.def("_kimi_k3_decode_task_plan",
           &kimi_k3_decode::persistent::task_plan_for_testing, "",
           pybind11::arg("active_tokens"));

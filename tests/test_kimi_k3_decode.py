@@ -88,7 +88,7 @@ from .kimi_k3_tail_support import _prime_barrier_serial, _rotating_skew
 CORE_PROJECTION_UNITS = 112       # skinny_gemm::kCoreCtas
 TENSOR_PROJECTION_UNITS = 28      # skinny_gemm::kTensorCtas
 SCORE_SHARDS = 8                  # router::kScoreShards
-GATE_UP_TILES = 3                 # expert_mxfp4::kGateUpTiles
+GATE_UP_UNITS = 1                 # persistent::kGateUpUnitsPerExpert
 GROUPED_DOWN_UNITS = 7            # grouped_pipeline::kGroupedDownUnits
 CORE_SHARED_GATE_UNITS = 24       # shared_experts::kCoreGateCtas
 TENSOR_SHARED_GATE_UNITS = 6      # shared_experts::kTensorGateCtas
@@ -135,8 +135,7 @@ def test_the_prepared_weights_are_replicated_and_sharded_as_tp8_requires(
     ):
         assert_replicated(name, getattr(weights, name))
     for name in (
-        "expert_w1_packed",
-        "expert_w3_packed",
+        "expert_w13_packed",
         "expert_w2_packed",
         "shared_gate_proj",
         "shared_up_proj",
@@ -583,7 +582,7 @@ def test_the_task_plan_covers_every_logical_task_of_the_step(
         if tensor_path
         else CORE_SHARED_GATE_UNITS
     )
-    assert gate_up == experts * GATE_UP_TILES
+    assert gate_up == experts * GATE_UP_UNITS
     assert down == (
         (ACTIVATION_UNITS + TENSOR_SHARED_DOWN_UNITS) if tensor_path
         else CORE_SHARED_DOWN_UNITS
@@ -624,7 +623,7 @@ def test_the_grid_claims_only_occupied_experts(
     assert int(counters[ACTIVE_EXPERT_UNITS].item()) == distinct
     assert distinct < EXPERTS
 
-    gate_up_units = distinct * GATE_UP_TILES
+    gate_up_units = distinct * GATE_UP_UNITS
     down_units = (
         ACTIVATION_UNITS
         + TENSOR_SHARED_DOWN_UNITS
@@ -798,6 +797,37 @@ def test_one_thousand_graph_replays_reproduce_the_eager_step(
     assert int(workspace.error_flag.item()) == 0
     assert_decode_close(actual, expected)
     assert_identical_across_ranks(actual)
+
+
+def test_the_gate_up_descriptor_is_encoded_once_per_payload_not_per_step(
+    workspace: KimiK3DecodeWorkspace,
+    weights: KimiK3DecodeWeights,
+    tp8_context: tuple[int, int, torch.device],
+) -> None:
+    """A driver call per decode step would be a driver call inside the step.
+
+    The routed gate/up unit reads its weight slabs through a tensor map, and a
+    kernel may only name one as a ``__grid_constant__`` parameter passed by
+    value. Building it is ``cuTensorMapEncodeTiled``, a host-side driver call --
+    capture-safe, but a decode step is tens of microseconds and the descriptor's
+    only input that is not a compile-time constant is the payload's base
+    address. So it is encoded on the first launch against a payload and read
+    from a cache on every launch after, and this is what says so rather than the
+    comment that claims it.
+    """
+    _, _, device = tp8_context
+    hidden = hidden_states(device, 16)
+    _decode(workspace, weights, hidden)
+    _synchronize_ranks(workspace)
+
+    encoded = _C._kimi_k3_fused_w13_packed_maps_encoded()
+    # One payload has been launched against, on both capacity paths, so at least
+    # one descriptor exists.
+    assert encoded >= 1
+    for tokens in (16, 32, 16, 64):
+        _decode(workspace, weights, hidden_states(device, tokens))
+    torch.cuda.synchronize(device)
+    assert _C._kimi_k3_fused_w13_packed_maps_encoded() == encoded
 
 
 def test_the_step_allocates_nothing_and_returns_a_mailbox_view(

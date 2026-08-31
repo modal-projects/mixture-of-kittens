@@ -48,6 +48,12 @@ from mok.kimi_k3 import (
     kimi_k3_situ_reference,
     pack_kimi_k3_mxfp4,
 )
+from mok.kimi_k3_w13 import (
+    KIMI_K3_W13_PACKED_SHAPE,
+    KIMI_K3_W13_SCALE_SHAPE,
+    fuse_w13_half,
+    unfuse_w13_half,
+)
 
 # Re-exported so the test module gets the tail suite's workspace and scratch
 # model rather than a second, independently drifting copy of either.
@@ -151,10 +157,8 @@ def low_level_arguments(
         "routed_expert_down_proj": weights.routed_expert_down_proj,
         "routed_expert_up_proj": weights.routed_expert_up_proj,
         "routed_latent_rmsnorm_weight": weights.routed_latent_rmsnorm_weight,
-        "expert_w1_packed": weights.expert_w1_packed,
-        "expert_w1_scale": weights.expert_w1_scale,
-        "expert_w3_packed": weights.expert_w3_packed,
-        "expert_w3_scale": weights.expert_w3_scale,
+        "expert_w13_packed": weights.expert_w13_packed,
+        "expert_w13_scale": weights.expert_w13_scale,
         "expert_w2_packed": weights.expert_w2_packed,
         "expert_w2_scale": weights.expert_w2_scale,
         "shared_gate_proj": weights.shared_gate_proj,
@@ -256,12 +260,18 @@ def _build_weights(
         pytest.skip("prepared Kimi K3 decode weights need 16 GiB free")
 
     shard = 1_000_000 * (tp_rank + 1)
-    w1_packed, w1_scale = _pack_expert_matrix(
-        device, shard + 11, ROUTED_PER_RANK, LATENT, KIMI_K3_W1W3_K
+    w13_packed = torch.empty(
+        KIMI_K3_W13_PACKED_SHAPE, dtype=torch.uint8, device=device
     )
-    w3_packed, w3_scale = _pack_expert_matrix(
-        device, shard + 22, ROUTED_PER_RANK, LATENT, KIMI_K3_W1W3_K
+    w13_scale = torch.empty(
+        KIMI_K3_W13_SCALE_SHAPE, dtype=torch.uint8, device=device
     )
+    for half, seed in enumerate((shard + 11, shard + 22)):
+        half_packed, half_scale = _pack_expert_matrix(
+            device, seed, ROUTED_PER_RANK, LATENT, KIMI_K3_W1W3_K
+        )
+        fuse_w13_half(w13_packed, w13_scale, half_packed, half_scale, half)
+        del half_packed, half_scale
     w2_packed, w2_scale = _pack_expert_matrix(
         device, shard + 33, LATENT, ROUTED_PER_RANK, ROUTED_PER_RANK
     )
@@ -282,10 +292,8 @@ def _build_weights(
             1.0
             + 0.25 * _normal((LATENT,), device, 4_004, 1.0).float()
         ).bfloat16().contiguous(),
-        expert_w1_packed=w1_packed,
-        expert_w1_scale=w1_scale,
-        expert_w3_packed=w3_packed,
-        expert_w3_scale=w3_scale,
+        expert_w13_packed=w13_packed,
+        expert_w13_scale=w13_scale,
         expert_w2_packed=w2_packed,
         expert_w2_scale=w2_scale,
         shared_gate_proj=_normal(
@@ -507,16 +515,19 @@ def routed_partial_reference(
     unique = torch.unique(expert_ids)
     for start in range(0, unique.numel(), _DEQUANT_CHUNK):
         chunk = unique[start:start + _DEQUANT_CHUNK]
-        w1 = dequant_kimi_k3_mxfp4(
-            weights.expert_w1_packed[chunk],
-            weights.expert_w1_scale[chunk],
-            logical_k=LATENT,
-        )
-        w3 = dequant_kimi_k3_mxfp4(
-            weights.expert_w3_packed[chunk],
-            weights.expert_w3_scale[chunk],
-            logical_k=LATENT,
-        )
+        packed = weights.expert_w13_packed[chunk]
+        scale = weights.expert_w13_scale[chunk]
+        # The fused chunk is both halves, so holding it while a half is
+        # dequantized costs a whole extra chunk over what the split payloads
+        # cost. Recover both halves first and drop the fused chunk before the
+        # dequantization allocates, which is the footprint the split oracle had.
+        gate = unfuse_w13_half(packed, scale, 0)
+        up = unfuse_w13_half(packed, scale, 1)
+        del packed, scale
+        w1 = dequant_kimi_k3_mxfp4(*gate, logical_k=LATENT)
+        del gate
+        w3 = dequant_kimi_k3_mxfp4(*up, logical_k=LATENT)
+        del up
         w2 = dequant_kimi_k3_mxfp4(
             weights.expert_w2_packed[chunk],
             weights.expert_w2_scale[chunk],

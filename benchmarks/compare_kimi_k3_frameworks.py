@@ -152,6 +152,12 @@ PHASE_CLOCK_NAMES = (
     "routed_gate_up",
     "routed_gate_up_stage",
     "routed_gate_up_mma",
+    "routed_gate_up_tma_issue",
+    "routed_gate_up_tma_wait",
+    "routed_gate_up_ring_full",
+    "routed_gate_up_mma_issue",
+    "routed_gate_up_activation",
+    "routed_gate_up_epilogue",
     "routed_down",
     "routed_down_stage",
     "routed_down_mma",
@@ -159,13 +165,33 @@ PHASE_CLOCK_NAMES = (
     "grid_barrier",
     "tail",
 )
-PHASE_CLOCK_BREAKDOWN_SUFFIXES = ("_stage", "_mma", "_epilogue")
+# Suffixes that name a breakdown *inside* one of the regions above rather than
+# a region of the launch. The fused gate/up unit reports six of its own on top
+# of the coarse `_stage`/`_mma` pair, and none of them may enter the total the
+# shares are taken against or the launch would be counted several times over.
+PHASE_CLOCK_BREAKDOWN_SUFFIXES = (
+    "_stage",
+    "_mma",
+    "_epilogue",
+    "_tma_issue",
+    "_tma_wait",
+    "_ring_full",
+    "_mma_issue",
+    "_activation",
+)
 
 
 def derive_phase_cycles(cycles: Mapping[str, int]) -> dict[str, int]:
-    """Expose each routed epilogue outside staging and MMA clocks."""
+    """Expose each routed epilogue outside staging and MMA clocks.
+
+    The fused gate/up unit times its own epilogue, so only the region that does
+    not gets one derived for it. Overwriting a measured counter with a residual
+    would hide exactly the difference the residual exists to estimate.
+    """
     derived = dict(cycles)
     for phase in ("routed_gate_up", "routed_down"):
+        if f"{phase}_epilogue" in derived:
+            continue
         total = derived.get(phase)
         stage = derived.get(f"{phase}_stage")
         mma = derived.get(f"{phase}_mma")

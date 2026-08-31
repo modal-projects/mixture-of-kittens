@@ -74,6 +74,14 @@ _TIMEOUT_CALLERS = (
     "persistent_kernel.cuh",
 )
 
+# The persistent kernel's whole include closure. Its headers include each other
+# and leave this directory once, for `../serial_sync.cuh`, so this is every
+# source the launch compiles and therefore every source that can end it.
+_DECODE_SOURCES = (
+    *sorted(_SOURCE_ROOT.glob("*.cuh")),
+    _SOURCE_ROOT.parent / "serial_sync.cuh",
+)
+
 
 def _source(name: str) -> str:
     return (_SOURCE_ROOT / name).read_text(encoding="utf-8")
@@ -134,7 +142,14 @@ def test_the_alignment_contract_covers_every_tensor_the_kernel_dereferences(
     contracted = {field for field, _ in _DECODE_ALIGNMENT}
     assert contracted.isdisjoint(_SCALAR_WORD_TENSORS)
     assert contracted | _SCALAR_WORD_TENSORS == tensors
-    assert all(alignment in (16, 256) for _, alignment in _DECODE_ALIGNMENT)
+    # Sixteen is a vector load, 256 is the scratch band's own grain, and 32 is
+    # what `cuTensorMapEncodeTiled` demands of the base address it encodes --
+    # so the fused routed gate/up payload is held to a stricter figure than
+    # any load of it would need.
+    assert all(
+        alignment in (16, 32, 256) for _, alignment in _DECODE_ALIGNMENT
+    )
+    assert dict(_DECODE_ALIGNMENT)["expert_w13_packed"] == 32
 
 
 def _misaligned(original: torch.Tensor, alignment: int) -> torch.Tensor:
@@ -316,6 +331,39 @@ def test_every_site_spins_on_the_same_bound() -> None:
     budget = _C._kimi_k3_tail_wait_timeout_clocks()
     assert budget > 0
     assert _C._kimi_k3_decode_wait_timeout_clocks() == budget
+
+
+@pytest.mark.parametrize(
+    "source", _DECODE_SOURCES, ids=[path.name for path in _DECODE_SOURCES]
+)
+def test_a_burnt_clock_budget_is_the_only_way_this_launch_can_trap(
+    source: Path,
+) -> None:
+    """Nothing in the decode sources may trap except a wait that ran out.
+
+    A trap ends the launch as `cudaErrorLaunchFailure` and takes the context
+    with it, so the host cannot read back the slot the trap wrote and every
+    trap looks alike from outside. That makes the reverse inference the only
+    one available: given a launch that failed and a sanitizer that found no
+    invalid access, a burnt clock budget is what happened. The inference is
+    only sound while every trap these sources compile is guarded by
+    ``wait_timed_out``, so that is held here rather than assumed.
+
+    It is what `racecheck` runs of this kernel keep hitting: the tool slows the
+    instrumented launch far enough that a rendezvous crosses the fifteen-second
+    bound, and the guard fires as designed.
+    """
+    guard = re.compile(
+        r"if\s*\(\s*wait_timed_out\(|void record_timeout_and_trap\("
+    )
+    lines = source.read_text(encoding="utf-8").splitlines()
+    for number, line in enumerate(lines):
+        if "trap;" not in line:
+            continue
+        above = "\n".join(lines[max(0, number - 20):number])
+        assert guard.search(above), (
+            f"{source.name}:{number + 1} traps with no bounded wait above it"
+        )
 
 
 @pytest.mark.parametrize("tokens", [CORE_TOKENS, TENSOR_TOKENS])

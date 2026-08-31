@@ -25,6 +25,7 @@ from mok.kimi_k3 import (
     kimi_k3_router_reference,
     kimi_k3_situ_reference,
 )
+from mok.kimi_k3_w13 import unfuse_w13_half
 
 LATENT = KIMI_K3_LATENT_SIZE
 ROUTED_PER_RANK = KIMI_K3_ROUTED_INTERMEDIATE_SIZE // KIMI_K3_TP_SIZE
@@ -165,9 +166,14 @@ def _routed_partial_reference(
         slots = flat_slots[mask]
         selected = quantized.index_select(0, tokens)
 
+        # The prepared shard stores gate and up fused, so the oracle reads the
+        # canonical half back out for the chunk it is on. One half at a time,
+        # for the same reason the dequantized matrices are: the chunk bound is
+        # what keeps this reference inside memory.
+        fused_packed = weights.expert_w13_packed[chunk]
+        fused_scale = weights.expert_w13_scale[chunk]
         w1 = dequant_kimi_k3_mxfp4(
-            weights.expert_w1_packed[chunk],
-            weights.expert_w1_scale[chunk],
+            *unfuse_w13_half(fused_packed, fused_scale, 0),
             logical_k=LATENT,
         )
         gate = torch.bmm(
@@ -176,15 +182,14 @@ def _routed_partial_reference(
         ).squeeze(-1)
         del w1
         w3 = dequant_kimi_k3_mxfp4(
-            weights.expert_w3_packed[chunk],
-            weights.expert_w3_scale[chunk],
+            *unfuse_w13_half(fused_packed, fused_scale, 1),
             logical_k=LATENT,
         )
         up = torch.bmm(
             w3.index_select(0, local_experts).float(),
             selected.unsqueeze(-1),
         ).squeeze(-1)
-        del w3
+        del w3, fused_packed, fused_scale
         situ = _mxfp8_dequantized(_situ_fp32(gate, up))
         del gate, up
         w2 = dequant_kimi_k3_mxfp4(

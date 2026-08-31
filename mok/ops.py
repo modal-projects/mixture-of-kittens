@@ -173,10 +173,11 @@ _DECODE_ALIGNMENT = (
     ("routed_expert_down_proj", 16),
     ("routed_expert_up_proj", 16),
     ("routed_latent_rmsnorm_weight", 16),
-    ("expert_w1_packed", 16),
-    ("expert_w1_scale", 16),
-    ("expert_w3_packed", 16),
-    ("expert_w3_scale", 16),
+    # Stricter than the rest: the tensor map the fused routed gate/up engine
+    # reads this payload through pins a 32-byte base, where every other weight
+    # only has to satisfy a 16-byte vector load.
+    ("expert_w13_packed", 32),
+    ("expert_w13_scale", 16),
     ("expert_w2_packed", 16),
     ("expert_w2_scale", 16),
     ("shared_gate_proj", 16),
@@ -196,8 +197,7 @@ _DECODE_SCHEMA = (
     "Tensor hidden_states, Tensor router_weight, "
     "Tensor router_correction_bias, Tensor routed_expert_down_proj, "
     "Tensor routed_expert_up_proj, Tensor routed_latent_rmsnorm_weight, "
-    "Tensor expert_w1_packed, Tensor expert_w1_scale, "
-    "Tensor expert_w3_packed, Tensor expert_w3_scale, "
+    "Tensor expert_w13_packed, Tensor expert_w13_scale, "
     "Tensor expert_w2_packed, Tensor expert_w2_scale, "
     "Tensor shared_gate_proj, Tensor shared_up_proj, Tensor shared_down_proj, "
     "Tensor(a!) scratch, "
@@ -223,10 +223,8 @@ def _kimi_k3_decode_cuda(
     routed_expert_down_proj: torch.Tensor,
     routed_expert_up_proj: torch.Tensor,
     routed_latent_rmsnorm_weight: torch.Tensor,
-    expert_w1_packed: torch.Tensor,
-    expert_w1_scale: torch.Tensor,
-    expert_w3_packed: torch.Tensor,
-    expert_w3_scale: torch.Tensor,
+    expert_w13_packed: torch.Tensor,
+    expert_w13_scale: torch.Tensor,
     expert_w2_packed: torch.Tensor,
     expert_w2_scale: torch.Tensor,
     shared_gate_proj: torch.Tensor,
@@ -255,10 +253,8 @@ def _kimi_k3_decode_cuda(
         routed_expert_down_proj,
         routed_expert_up_proj,
         routed_latent_rmsnorm_weight,
-        expert_w1_packed,
-        expert_w1_scale,
-        expert_w3_packed,
-        expert_w3_scale,
+        expert_w13_packed,
+        expert_w13_scale,
         expert_w2_packed,
         expert_w2_scale,
         shared_gate_proj,
@@ -289,10 +285,8 @@ def kimi_k3_decode(
     routed_expert_down_proj: torch.Tensor,
     routed_expert_up_proj: torch.Tensor,
     routed_latent_rmsnorm_weight: torch.Tensor,
-    expert_w1_packed: torch.Tensor,
-    expert_w1_scale: torch.Tensor,
-    expert_w3_packed: torch.Tensor,
-    expert_w3_scale: torch.Tensor,
+    expert_w13_packed: torch.Tensor,
+    expert_w13_scale: torch.Tensor,
     expert_w2_packed: torch.Tensor,
     expert_w2_scale: torch.Tensor,
     shared_gate_proj: torch.Tensor,
@@ -350,10 +344,8 @@ def kimi_k3_decode(
         routed_expert_down_proj,
         routed_expert_up_proj,
         routed_latent_rmsnorm_weight,
-        expert_w1_packed,
-        expert_w1_scale,
-        expert_w3_packed,
-        expert_w3_scale,
+        expert_w13_packed,
+        expert_w13_scale,
         expert_w2_packed,
         expert_w2_scale,
         shared_gate_proj,

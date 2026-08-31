@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <tuple>
 #include <vector>
 
@@ -717,28 +718,21 @@ static __host__ void kimi_k3_tail_entrypoint(
         static_cast<int>(active_tokens), properties.multiProcessorCount);
 }
 
-/// Run one whole TP8 Kimi K3 decode step in a single persistent launch.
+/// Validate one decode step's whole argument tuple and assemble the launch.
 ///
-/// The operator mutates the workspace and returns nothing: the assembled output
-/// is this rank's own mailbox storage, and a custom operator may not return a
-/// view that aliases one of its own mutated inputs. `mok.kimi_k3.kimi_k3_decode`
-/// takes that view afterwards.
-///
-/// Every rank must call this with the same active token count, for the reason
-/// spelled out above `kimi_k3_tail_entrypoint`: the cross-rank rendezvous is
-/// driven by one coordinator thread whose arrival does not depend on the count,
-/// so a divergent count returns mixed-generation rows rather than deadlocking.
-static __host__ void kimi_k3_decode_entrypoint(
+/// Every rule the operator enforces lives here rather than in the entrypoint
+/// that calls it: a hundred-odd checks -- shapes, dtypes, devices, alignments,
+/// symmetric pointer lists, multicast disjointness, and the workspace signature
+/// -- assembling one `LaunchArguments` that the launcher then only has to read.
+static __host__ persistent::LaunchArguments decode_launch_arguments(
     const at::Tensor &hidden_states,
     const at::Tensor &router_weight,
     const at::Tensor &router_correction_bias,
     const at::Tensor &routed_expert_down_proj,
     const at::Tensor &routed_expert_up_proj,
     const at::Tensor &routed_latent_rmsnorm_weight,
-    const at::Tensor &expert_w1_packed,
-    const at::Tensor &expert_w1_scale,
-    const at::Tensor &expert_w3_packed,
-    const at::Tensor &expert_w3_scale,
+    const at::Tensor &expert_w13_packed,
+    const at::Tensor &expert_w13_scale,
     const at::Tensor &expert_w2_packed,
     const at::Tensor &expert_w2_scale,
     const at::Tensor &shared_gate_proj,
@@ -785,10 +779,12 @@ static __host__ void kimi_k3_decode_entrypoint(
         {&routed_expert_up_proj, "routed_expert_up_proj", VECTOR_ALIGNMENT},
         {&routed_latent_rmsnorm_weight, "routed_latent_rmsnorm_weight",
          VECTOR_ALIGNMENT},
-        {&expert_w1_packed, "expert_w1_packed", VECTOR_ALIGNMENT},
-        {&expert_w1_scale, "expert_w1_scale", VECTOR_ALIGNMENT},
-        {&expert_w3_packed, "expert_w3_packed", VECTOR_ALIGNMENT},
-        {&expert_w3_scale, "expert_w3_scale", VECTOR_ALIGNMENT},
+        // Stricter than the rest: the tensor map the fused gate/up engine reads
+        // the payload through pins a 32-byte base. Its scales move by
+        // `cp.async.bulk`, which pins the usual sixteen.
+        {&expert_w13_packed, "expert_w13_packed",
+         expert_mxfp4::fused_w13::kFusedPackedAlignment},
+        {&expert_w13_scale, "expert_w13_scale", VECTOR_ALIGNMENT},
         {&expert_w2_packed, "expert_w2_packed", VECTOR_ALIGNMENT},
         {&expert_w2_scale, "expert_w2_scale", VECTOR_ALIGNMENT},
         {&shared_gate_proj, "shared_gate_proj", VECTOR_ALIGNMENT},
@@ -870,14 +866,17 @@ static __host__ void kimi_k3_decode_entrypoint(
                     "MoK: kimi_k3_decode requires uint8 ", name, " [",
                     kNumExperts, ", ", rows, ", ", columns, "]");
     };
-    check_expert(expert_w1_packed, "expert_w1_packed", kExpertW1W3PackedRows,
-                 kExpertW1W3PackedColumns);
-    check_expert(expert_w1_scale, "expert_w1_scale", kExpertW1W3PackedRows,
-                 kExpertW1W3ScaleColumns);
-    check_expert(expert_w3_packed, "expert_w3_packed", kExpertW1W3PackedRows,
-                 kExpertW1W3PackedColumns);
-    check_expert(expert_w3_scale, "expert_w3_scale", kExpertW1W3PackedRows,
-                 kExpertW1W3ScaleColumns);
+    // The routed gate and up projections arrive as one payload, in the
+    // tile-major order the fused engine's descriptor reads: six output tasks of
+    // 128 M rows, gate channels in the low half and their own up rows in the
+    // high half, seven K = 512 slabs each. `mok.kimi_k3_w13` builds it and
+    // `prepare_kimi_k3_decode_weights` is where the transform runs.
+    check_expert(expert_w13_packed, "expert_w13_packed",
+                 expert_mxfp4::fused_w13::kFusedPackedRows,
+                 expert_mxfp4::fused_w13::kFusedPackedColumns);
+    check_expert(expert_w13_scale, "expert_w13_scale",
+                 expert_mxfp4::fused_w13::kFusedScaleRows,
+                 expert_mxfp4::fused_w13::kFusedScaleColumns);
     check_expert(expert_w2_packed, "expert_w2_packed", kExpertW2PackedRows,
                  kExpertW2PackedColumns);
     check_expert(expert_w2_scale, "expert_w2_scale", kExpertW2PackedRows,
@@ -948,20 +947,15 @@ static __host__ void kimi_k3_decode_entrypoint(
 
     const cudaDeviceProp &properties = check_sm103(hidden_states, kOperation);
 
-    // The step must run on the tensors' own device and that device's current
-    // stream, whatever device happens to be current on entry.
-    const c10::cuda::CUDAGuard device_guard(device);
-    persistent::launch_decode(persistent::LaunchArguments{
+    return persistent::LaunchArguments{
         hidden_states,
         router_weight,
         router_correction_bias,
         routed_expert_down_proj,
         routed_expert_up_proj,
         routed_latent_rmsnorm_weight,
-        expert_w1_packed,
-        expert_w1_scale,
-        expert_w3_packed,
-        expert_w3_scale,
+        expert_w13_packed,
+        expert_w13_scale,
         expert_w2_packed,
         expert_w2_scale,
         shared_gate_proj,
@@ -980,7 +974,66 @@ static __host__ void kimi_k3_decode_entrypoint(
         properties.multiProcessorCount,
         static_cast<int>(persistent::benchmark_grid_ctas_for_testing()),
         persistent::benchmark_phase_profile_enabled() ? 1 : 0,
-    });
+    };
+}
+
+/// Run one whole TP8 Kimi K3 decode step in a single persistent launch.
+///
+/// The operator mutates the workspace and returns nothing: the assembled output
+/// is this rank's own mailbox storage, and a custom operator may not return a
+/// view that aliases one of its own mutated inputs. `mok.kimi_k3.kimi_k3_decode`
+/// takes that view afterwards.
+///
+/// Every rank must call this with the same active token count, for the reason
+/// spelled out above `kimi_k3_tail_entrypoint`: the cross-rank rendezvous is
+/// driven by one coordinator thread whose arrival does not depend on the count,
+/// so a divergent count returns mixed-generation rows rather than deadlocking.
+static __host__ void kimi_k3_decode_entrypoint(
+    const at::Tensor &hidden_states,
+    const at::Tensor &router_weight,
+    const at::Tensor &router_correction_bias,
+    const at::Tensor &routed_expert_down_proj,
+    const at::Tensor &routed_expert_up_proj,
+    const at::Tensor &routed_latent_rmsnorm_weight,
+    const at::Tensor &expert_w13_packed,
+    const at::Tensor &expert_w13_scale,
+    const at::Tensor &expert_w2_packed,
+    const at::Tensor &expert_w2_scale,
+    const at::Tensor &shared_gate_proj,
+    const at::Tensor &shared_up_proj,
+    const at::Tensor &shared_down_proj,
+    const at::Tensor &scratch,
+    const at::Tensor &collective_buffer,
+    const std::vector<std::int64_t> &collective_buffer_ptrs,
+    std::int64_t collective_buffer_multicast_ptr,
+    const at::Tensor &output_mailbox,
+    const std::vector<std::int64_t> &output_mailbox_ptrs,
+    std::int64_t output_mailbox_multicast_ptr,
+    const at::Tensor &barrier_buffer,
+    const std::vector<std::int64_t> &barrier_buffer_ptrs,
+    std::int64_t barrier_buffer_multicast_ptr,
+    const at::Tensor &barrier_target,
+    const at::Tensor &error_flag,
+    std::int64_t tp_rank,
+    std::int64_t active_tokens,
+    std::int64_t workspace_signature_value
+) {
+    const persistent::LaunchArguments arguments = decode_launch_arguments(
+        hidden_states, router_weight, router_correction_bias,
+        routed_expert_down_proj, routed_expert_up_proj,
+        routed_latent_rmsnorm_weight, expert_w13_packed, expert_w13_scale,
+        expert_w2_packed, expert_w2_scale,
+        shared_gate_proj, shared_up_proj, shared_down_proj, scratch,
+        collective_buffer, collective_buffer_ptrs,
+        collective_buffer_multicast_ptr, output_mailbox, output_mailbox_ptrs,
+        output_mailbox_multicast_ptr, barrier_buffer, barrier_buffer_ptrs,
+        barrier_buffer_multicast_ptr, barrier_target, error_flag, tp_rank,
+        active_tokens, workspace_signature_value);
+
+    // The step must run on the tensors' own device and that device's current
+    // stream, whatever device happens to be current on entry.
+    const c10::cuda::CUDAGuard device_guard(hidden_states.device());
+    persistent::launch_decode(arguments);
 }
 
 }  // namespace kimi_k3_decode

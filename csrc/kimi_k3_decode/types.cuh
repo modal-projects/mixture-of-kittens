@@ -21,9 +21,12 @@ inline constexpr float kRoutedAccumulatorScaleInverse = 0x1p-24f;
 static_assert(
     kRoutedAccumulatorScale * kRoutedAccumulatorScaleInverse == 1.0f);
 
-// The counters occupy one 256-byte scratch region either way, so the persistent
-// kernel's own slots come out of headroom that was already reserved.
-static constexpr int NUM_PHASE_COUNTERS = 64;
+// Thirty-six live counters and a 64-bit accumulator band that ends the region.
+// The band is what sets the count: twenty accumulated regions at two slots each
+// is forty slots, which does not fit above slot 35 in 64. Two 256-byte scratch
+// regions hold 128, and this region is the first, so widening it moves every
+// offset below by exactly one alignment grain and nothing else.
+static constexpr int NUM_PHASE_COUNTERS = 128;
 static constexpr int SCRATCH_ALIGNMENT = 256;
 
 // Hidden states and both projection weights are read through 16-byte vector loads
@@ -135,20 +138,20 @@ inline constexpr int kRouterScoreBytes =
 static constexpr int SCRATCH_BYTES =
     kRouterScoreBytes + scratch_region_bytes(kMaxTokens * kNumExperts);
 
-static_assert(kLatentMxfp8Bytes == 40448);
-static_assert(kLatentScaleBytes == 499200);
-static_assert(kSituMxfp8Bytes == 513536);
-static_assert(kSituScaleBytes == 1299968);
-static_assert(kRoutedAccumulatorBytes == 1324544);
-static_assert(kSharedGateBytes == 4994560);
-static_assert(kSharedUpBytes == 5191168);
-static_assert(kSharedActivatedBytes == 5387776);
-static_assert(kTailNormalizedBytes == 5584384);
-static_assert(kTailSharedShardBytes == 6501888);
-static_assert(kLatentXBytes == 6731264);
-static_assert(kUnitExpertBytes == 7648768);
-static_assert(kRouterScoreBytes == 7652352);
-static_assert(SCRATCH_BYTES == 8111104);
+static_assert(kLatentMxfp8Bytes == 40704);
+static_assert(kLatentScaleBytes == 499456);
+static_assert(kSituMxfp8Bytes == 513792);
+static_assert(kSituScaleBytes == 1300224);
+static_assert(kRoutedAccumulatorBytes == 1324800);
+static_assert(kSharedGateBytes == 4994816);
+static_assert(kSharedUpBytes == 5191424);
+static_assert(kSharedActivatedBytes == 5388032);
+static_assert(kTailNormalizedBytes == 5584640);
+static_assert(kTailSharedShardBytes == 6502144);
+static_assert(kLatentXBytes == 6731520);
+static_assert(kUnitExpertBytes == 7649024);
+static_assert(kRouterScoreBytes == 7652608);
+static_assert(SCRATCH_BYTES == 8111360);
 
 // Generation-tagged completion counters. Each role's last CTA clears its arrival
 // counter and bumps its generation, so a reused workspace never needs a host reset.
@@ -210,18 +213,29 @@ static_assert(kPersistentTimeoutPhase < NUM_PHASE_COUNTERS);
 static_assert(kGateUpArrivals < NUM_PHASE_COUNTERS);
 
 // ---------------------------------------------------------------------------
-// Benchmark-only phase clocks.
+// Phase clocks.
 //
 // A CTA reads `clock64()` around each region it runs and accumulates the delta
-// into one shared counter per region, so a single guarded launch reports where
-// its own resident CTAs spent their cycles. The counters are aligned pairs of
-// the phase region's unused tail slots, read as one 64-bit accumulator each:
-// a decode step is millions of cycles summed over 148 CTAs, which overflows 32
-// bits, and appending a scratch region would move every offset the private
-// stages pin.
+// into one shared counter per region, so a profiled launch reports where its
+// own resident CTAs spent their cycles. The counters are aligned pairs of the
+// phase region's tail slots, read as one 64-bit accumulator each: a decode step
+// is millions of cycles summed over 148 CTAs, which overflows 32 bits.
+//
+// Nothing here is benchmark-private. A profiled launch is one predicate on a
+// null pointer the caller already hands in, no stage compiles differently for
+// it, and the routed gate/up band below is deliberately fine enough to name
+// which part of the fused engine a future step is spending its time in --
+// which is the only instrument the remaining performance work has.
 // ---------------------------------------------------------------------------
 
 /// One accumulated region, in the order the kernel runs them.
+///
+/// The routed gate/up phase is reported twice over. `stage` and `mma` are the
+/// coarse split every gate/up unit this repository has ever had reports, kept
+/// so a profile is comparable with the recorded numbers of the units that came
+/// before; the six that follow are the fused engine's own partition of the same
+/// time, and they are what says whether the ring or the contraction is the
+/// binding constraint.
 enum PhaseClock : int {
     kClockReadinessWait = 0,
     kClockRouterScore,
@@ -231,6 +245,27 @@ enum PhaseClock : int {
     kClockRoutedGateUp,
     kClockRoutedGateUpStage,
     kClockRoutedGateUpMma,
+    /// Building descriptors and issuing a slab's two bulk copies.
+    kClockRoutedGateUpTmaIssue,
+    /// Waiting for a slab's payload and scales to land.
+    kClockRoutedGateUpTmaWait,
+    /// Waiting for the tensor core to free the stage about to be refilled --
+    /// the ring being full is the only reason this is ever nonzero.
+    kClockRoutedGateUpRingFull,
+    /// Staging the scale quads into tensor memory and issuing the sixteen
+    /// contractions of a slab.
+    kClockRoutedGateUpMmaIssue,
+    /// Gathering the batch's activation rows and scales for the whole of K.
+    ///
+    /// The one cost the engine cannot hand to the copy engine: the rows an
+    /// expert's batch names are scattered through the assignment order. It is
+    /// paid once per expert rather than once per `(task, slab)` pair, which is
+    /// the measurement the engine's shape exists for, so it is reported on its
+    /// own rather than folded into the staging above.
+    kClockRoutedGateUpActivation,
+    /// Reading the accumulator, pairing the gate and up row halves, and
+    /// quantizing one task's 64 `situ` columns.
+    kClockRoutedGateUpEpilogue,
     kClockRoutedDown,
     kClockRoutedDownStage,
     kClockRoutedDownMma,
@@ -244,7 +279,8 @@ enum PhaseClock : int {
 inline constexpr int kPhaseClockBegin =
     NUM_PHASE_COUNTERS - 2 * kPhaseClockCount;
 
-static_assert(kPhaseClockBegin == 36);
+static_assert(kPhaseClockCount == 20);
+static_assert(kPhaseClockBegin == 88);
 static_assert(kPhaseClockBegin % 2 == 0,
               "a 64-bit accumulator must start on an aligned slot pair");
 static_assert(kPhaseClockBegin > kGateUpArrivals,
@@ -260,6 +296,12 @@ inline constexpr const char *kPhaseClockNames[] = {
     "routed_gate_up",
     "routed_gate_up_stage",
     "routed_gate_up_mma",
+    "routed_gate_up_tma_issue",
+    "routed_gate_up_tma_wait",
+    "routed_gate_up_ring_full",
+    "routed_gate_up_mma_issue",
+    "routed_gate_up_activation",
+    "routed_gate_up_epilogue",
     "routed_down",
     "routed_down_stage",
     "routed_down_mma",

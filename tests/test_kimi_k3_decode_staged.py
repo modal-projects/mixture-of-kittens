@@ -32,6 +32,7 @@ from mok.kimi_k3 import (
     KimiK3DecodeWeights,
     KimiK3DecodeWorkspace,
 )
+from mok.kimi_k3_w13 import unfuse_w13
 
 from .kimi_k3_decode_support import (
     CORE_TOKENS,
@@ -75,11 +76,34 @@ def routed_staging(
         torch.cuda.empty_cache()
 
 
+@pytest.fixture(scope="module")
+def canonical_gate_up(
+    weights: KimiK3DecodeWeights,  # noqa: F811
+) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """The gate/up halves the private expert stage still takes separately.
+
+    Production stores one fused ``w13`` pair and the persistent kernel reads it
+    directly; the Task 6 stage predates that and keeps its canonical four-tensor
+    signature. Recovering the halves here rather than storing them means the
+    control costs a test fixture instead of a second copy of every routed
+    weight in the production bundle.
+    """
+    halves = unfuse_w13(weights.expert_w13_packed, weights.expert_w13_scale)
+    try:
+        yield halves
+    finally:
+        del halves
+        torch.cuda.empty_cache()
+
+
 def staged_decode(
     workspace: KimiK3DecodeWorkspace,
     weights: KimiK3DecodeWeights,
     hidden: torch.Tensor,
     routed_staging: torch.Tensor,
+    canonical_gate_up: tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ],
 ) -> torch.Tensor:
     """One decode step as four private launches over one workspace.
 
@@ -98,12 +122,13 @@ def staged_decode(
         workspace.scratch,
         active,
     )
+    w1_packed, w1_scale, w3_packed, w3_scale = canonical_gate_up
     routed = ops._kimi_k3_routed_experts(
         latent,
-        weights.expert_w1_packed,
-        weights.expert_w1_scale,
-        weights.expert_w3_packed,
-        weights.expert_w3_scale,
+        w1_packed,
+        w1_scale,
+        w3_packed,
+        w3_scale,
         weights.expert_w2_packed,
         weights.expert_w2_scale,
         routed_staging[:active],
@@ -149,6 +174,9 @@ def test_the_staged_adapter_computes_the_same_step(
     workspace: KimiK3DecodeWorkspace,
     weights: KimiK3DecodeWeights,
     routed_staging: torch.Tensor,
+    canonical_gate_up: tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ],
     tp8_context: tuple[int, int, torch.device],
     tokens: int,
 ) -> None:
@@ -163,7 +191,9 @@ def test_the_staged_adapter_computes_the_same_step(
     expected = decode_reference(hidden, weights)
 
     _synchronize_ranks(workspace)
-    actual = staged_decode(workspace, weights, hidden, routed_staging)
+    actual = staged_decode(
+        workspace, weights, hidden, routed_staging, canonical_gate_up
+    )
     torch.cuda.synchronize(device)
 
     assert actual.shape == (tokens, HIDDEN)
@@ -193,6 +223,9 @@ def test_one_launch_is_measured_against_a_four_launch_control(
     workspace: KimiK3DecodeWorkspace,
     weights: KimiK3DecodeWeights,
     routed_staging: torch.Tensor,
+    canonical_gate_up: tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ],
     tp8_context: tuple[int, int, torch.device],
     tokens: int,
 ) -> None:
@@ -212,14 +245,18 @@ def test_one_launch_is_measured_against_a_four_launch_control(
     expected = decode_reference(hidden, weights)
 
     _synchronize_ranks(workspace)
-    staged_decode(workspace, weights, hidden, routed_staging)
+    staged_decode(
+        workspace, weights, hidden, routed_staging, canonical_gate_up
+    )
     _synchronize_ranks(workspace)
     decode_step(workspace, weights, hidden)
     _synchronize_ranks(workspace)
 
     def staged_steps() -> None:
         for _ in range(REPEATS):
-            staged_decode(workspace, weights, hidden, routed_staging)
+            staged_decode(
+                workspace, weights, hidden, routed_staging, canonical_gate_up
+            )
 
     def production_steps() -> None:
         for _ in range(REPEATS):

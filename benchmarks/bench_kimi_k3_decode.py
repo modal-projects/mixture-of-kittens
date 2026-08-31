@@ -118,13 +118,18 @@ def _prepared_weight_bytes(weights: Any) -> int:
 
 
 def _expert_weight_bytes(weights: Any) -> int:
+    """Bytes one expert's own prepared matrices occupy.
+
+    The routed gate and up projections are one fused payload, so slice zero of
+    it is both of that expert's halves -- exactly the bytes the two separate
+    packed matrices and their two scale blobs used to contribute between them,
+    since the fuse is a permutation.
+    """
     return sum(
         _tensor_bytes(getattr(weights, name)[0])
         for name in (
-            "expert_w1_packed",
-            "expert_w1_scale",
-            "expert_w3_packed",
-            "expert_w3_scale",
+            "expert_w13_packed",
+            "expert_w13_scale",
             "expert_w2_packed",
             "expert_w2_scale",
         )

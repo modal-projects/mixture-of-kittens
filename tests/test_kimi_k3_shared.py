@@ -46,7 +46,7 @@ def _aligned(size: int) -> int:
 def _scratch_layout() -> dict[str, tuple[int, int]]:
     """Independent byte model of the C++ source-of-truth workspace."""
     regions = (
-        ("phase", 64 * 4),
+        ("phase", 128 * 4),
         ("expert_ids", MAX_TOKENS * 16 * 4),
         ("expert_weights", MAX_TOKENS * 16 * 4),
         ("expert_counts", 896 * 4),
@@ -293,13 +293,13 @@ def _assert_active_intermediates(
 def test_workspace_bytes_matches_shared_scratch_source_of_truth(
     device: torch.device,
 ) -> None:
-    assert SCRATCH_BYTES == 8_111_104
+    assert SCRATCH_BYTES == 8_111_360
     assert _C.kimi_k3_decode_workspace_bytes() == SCRATCH_BYTES
-    assert SCRATCH_LAYOUT["shared_gate"] == (4_994_560, 196_608)
-    assert SCRATCH_LAYOUT["shared_up"] == (5_191_168, 196_608)
-    assert SCRATCH_LAYOUT["shared_activated"] == (5_387_776, 196_608)
-    assert SCRATCH_LAYOUT["tail_normalized"] == (5_584_384, 917_504)
-    assert SCRATCH_LAYOUT["tail_shared_shard"] == (6_501_888, 229_376)
+    assert SCRATCH_LAYOUT["shared_gate"] == (4_994_816, 196_608)
+    assert SCRATCH_LAYOUT["shared_up"] == (5_191_424, 196_608)
+    assert SCRATCH_LAYOUT["shared_activated"] == (5_388_032, 196_608)
+    assert SCRATCH_LAYOUT["tail_normalized"] == (5_584_640, 917_504)
+    assert SCRATCH_LAYOUT["tail_shared_shard"] == (6_502_144, 229_376)
     for name, (offset, _) in SCRATCH_LAYOUT.items():
         if name != "total_bytes":
             assert offset % ALIGNMENT == 0, name

@@ -47,12 +47,25 @@ static_assert(routed_claim_batch(kRoutedClaimBatchThreshold + 1)
 
 /// Dynamic shared memory every CTA requests, in bytes.
 ///
-/// It has to cover the widest stage the kernel runs, which is one routed
-/// gate/up unit at 143 KiB. Requesting more than half of an SM's 227 KiB is
-/// also what makes the grid one CTA per SM, which is what the residency proof
-/// and the tensor-memory allocation both depend on. The remaining 67 KiB is
-/// headroom for the static shared memory the stages declare.
-inline constexpr int kPersistentSharedBytes = 160 * 1024;
+/// It has to cover the widest stage the kernel runs, which is the routed
+/// gate/up unit's ring: two 64 KiB weight slabs, all seven slabs of one
+/// expert's activation, both operands' scale quads, one result tile, and the
+/// kilobyte the allocator's absolute 1 KiB alignment can waste ahead of the
+/// first array. That is 216,064 bytes, and
+/// `expert_mxfp4::fused_w13::kFusedW13SharedBytes` derives the same number from
+/// the tiles themselves -- `persistent_kernel.cuh` asserts the two agree. It is
+/// spelled here rather than included from there because the engine's header
+/// includes *this* one, for the arrival primitive its unit publishes with.
+///
+/// Requesting more than half of an SM's 227 KiB is also what makes the grid one
+/// CTA per SM, which is what the residency proof and the tensor-memory
+/// allocation both depend on. The 16,384 bytes left over cover the 1,312 of
+/// static shared memory ptxas assigns the two instantiations, and are 51,200
+/// short of a third weight stage.
+inline constexpr int kPersistentSharedBytes = 216064;
+
+static_assert(2 * kPersistentSharedBytes > 227 * 1024,
+              "the persistent grid must be one CTA per SM");
 
 using serial_sync::barrier_reached;
 using serial_sync::generation_advanced;

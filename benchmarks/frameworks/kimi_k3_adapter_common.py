@@ -24,6 +24,7 @@ from mok.kimi_k3 import (
     KIMI_K3_TP_SIZE,
     kimi_k3_router_reference,
 )
+from mok.kimi_k3_w13 import unfuse_w13
 
 # Each loader validates ``architectures`` against its own model registry before
 # it will build a config, and the two registries spell the Kimi K3 linear
@@ -112,19 +113,21 @@ class NativeWeights:
 def native_weights(weights: Any) -> NativeWeights:
     """Rearrange a prepared shard into the fused native tensors.
 
-    The MXFP4 expert payload is passed through byte for byte: both frameworks
-    store exactly the ``[E, N, K/2]`` E2M1 pairs and ``[E, N, K/32]`` E8M0
-    scale bytes that :func:`mok.kimi_k3.pack_kimi_k3_mxfp4` produces. The only
-    rearrangement is concatenating the separate gate and up matrices into the
-    fused row block the native layers index.
+    The MXFP4 expert payload carries the same values byte for byte: both
+    frameworks store exactly the ``[E, N, K/2]`` E2M1 pairs and ``[E, N, K/32]``
+    E8M0 scale bytes that :func:`mok.kimi_k3.pack_kimi_k3_mxfp4` produces, in
+    the row block their own layers index. A prepared shard holds the routed gate
+    and up projections in the tile-major order the decode kernel reads instead,
+    so recovering that row block is `mok.kimi_k3_w13`'s inverse followed by the
+    concatenation the native layers want. This is the comparison side of the
+    benchmark, which keeps its own copy of the framework's layout either way.
     """
+    w1_packed, w1_scale, w3_packed, w3_scale = unfuse_w13(
+        weights.expert_w13_packed, weights.expert_w13_scale
+    )
     return NativeWeights(
-        w13_weight=torch.cat(
-            (weights.expert_w1_packed, weights.expert_w3_packed), dim=1
-        ).contiguous(),
-        w13_weight_scale=torch.cat(
-            (weights.expert_w1_scale, weights.expert_w3_scale), dim=1
-        ).contiguous(),
+        w13_weight=torch.cat((w1_packed, w3_packed), dim=1).contiguous(),
+        w13_weight_scale=torch.cat((w1_scale, w3_scale), dim=1).contiguous(),
         w2_weight=weights.expert_w2_packed,
         w2_weight_scale=weights.expert_w2_scale,
         gate_weight=weights.router_weight,

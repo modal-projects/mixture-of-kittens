@@ -29,6 +29,7 @@ Environment overrides:
 import io
 import json
 import os
+import re
 import subprocess
 import tarfile
 import tempfile
@@ -43,6 +44,7 @@ from benchmarks.compare_kimi_k3_frameworks import (
     pinned_image_reference,
 )
 from benchmarks.kimi_k3_artifacts import reproducible_tar_bytes
+from benchmarks.kimi_k3_sanitizer import sanitizer_verdict
 
 
 @dataclass(frozen=True)
@@ -290,27 +292,57 @@ def _run_kimi_k3_torchrun(
     *,
     timeout: int,
     environment: dict[str, str] | None = None,
-) -> None:
+    attribute_ranks: bool = False,
+    capture: bool = False,
+) -> str:
+    """Run one torchrun under the B300s, returning its output when captured.
+
+    ``capture`` still streams every line to the console as it arrives, because a
+    gate that stops making progress has to stay observable; it only additionally
+    keeps the text so a caller can persist it as the gate's artifact.
+    """
+    # Eight ranks write to one console, so an unlabelled `pytest -q` progress
+    # line is eight interleaved streams of dots and a run that stops making
+    # progress cannot be attributed to a test. `--tee 3` prefixes every line
+    # with its rank, which is what makes `-v` readable here.
+    labelling = ["--tee", "3", "--role", "rank"] if attribute_ranks else []
     command = [
         "python",
         "-m",
         "torch.distributed.run",
         "--standalone",
         "--nproc-per-node=8",
+        *labelling,
         *arguments,
     ]
     print(f"Launching: {' '.join(command)} on 8 x B300")
-    subprocess.run(
-        command,
-        cwd=REMOTE_ROOT,
-        env={
+    settings = {
+        "cwd": REMOTE_ROOT,
+        "env": {
             **os.environ,
             **(environment or {}),
             "PYTHONUNBUFFERED": "1",
         },
-        check=True,
-        timeout=timeout,
+        "timeout": timeout,
+    }
+    if not capture:
+        subprocess.run(command, check=True, **settings)
+        return ""
+    completed = subprocess.run(
+        command,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        errors="replace",
+        **settings,
     )
+    print(completed.stdout, end="")
+    if completed.returncode != 0:
+        raise subprocess.CalledProcessError(
+            completed.returncode, command, output=completed.stdout
+        )
+    return completed.stdout
 
 
 @app.function(image=B300_IMAGE, gpu="B300:8", timeout=14_400)
@@ -373,6 +405,458 @@ def bench_kimi_k3_decode(git_sha: str) -> bytes:
         if first_archive != second_archive:
             raise RuntimeError("normalized benchmark archive is not reproducible")
         return first_archive
+
+
+# Where a Kimi K3 verification gate leaves its evidence, written from inside the
+# container.
+#
+# A gate's result also comes back through its return value, but that path runs
+# over the local client's gRPC connection, and this repository's longest gates
+# outlive it: the saturated benchmark is 30,000 graph replays plus captures, and
+# racecheck is memcheck's work at a hundred times the cost. A connection that
+# drops at minute twenty takes the whole gate with it -- `--detach` keeps the
+# container running but there is no longer a client to hand the artifact to.
+# Writing the artifact to a volume before returning it decouples the evidence
+# from the connection: the gate is fetched afterwards with `modal volume get`,
+# and re-fetching is free.
+K3_VOLUME = modal.Volume.from_name(
+    "mok-kimi-k3-decode", create_if_missing=True
+)
+K3_ARTIFACTS = "/artifacts"
+
+
+def _persist_k3_artifact(name: str, payload: bytes | str) -> None:
+    """Write one gate's artifact into the volume and commit it."""
+    path = Path(K3_ARTIFACTS) / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(payload, str):
+        path.write_text(payload, encoding="utf-8")
+    else:
+        path.write_bytes(payload)
+    K3_VOLUME.commit()
+    print(f"persisted {name}: {path.stat().st_size} bytes")
+
+
+def _k3_test_files() -> tuple[str, ...]:
+    """Every Kimi K3 suite, in the order pytest would collect them."""
+    return tuple(
+        sorted(str(path) for path in Path("tests").glob("test_kimi_k3*.py"))
+    )
+
+
+@app.function(
+    image=B300_IMAGE,
+    gpu="B300:8",
+    timeout=14_400,
+    volumes={K3_ARTIFACTS: K3_VOLUME},
+)
+def verify_kimi_k3(
+    expression: str = "",
+    verbose: bool = True,
+    files: str = "",
+) -> None:
+    """Run the whole Kimi K3 suite on all eight ranks and keep pytest's own log."""
+    selection = ["-k", expression] if expression else []
+    chosen = tuple(files.split(",")) if files else _k3_test_files()
+    command = [
+        "-m",
+        "pytest",
+        "-v" if verbose else "-q",
+        "-x",
+        *chosen,
+        *selection,
+    ]
+
+    # Eight ranks tee into one stream and the interleave breaks lines mid-token,
+    # so the `-v` log cannot be read back to answer "did test X run". One
+    # single-process collection gives a clean list of node ids to check the
+    # inventory against; the count it reports is the count each rank then runs.
+    def collect() -> str:
+        collected = subprocess.run(
+            ["python", "-m", "pytest", "--collect-only", "-q", *chosen, *selection],
+            cwd=REMOTE_ROOT,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            timeout=900,
+        )
+        return collected.stdout
+
+    def persist(output: str, collected: str) -> None:
+        # The artifact has to carry pytest's own summary lines, because the
+        # report quotes the count and a bare "passed" cannot back that. A
+        # failing run persists too, so the failure is recoverable from the
+        # volume rather than only from the console.
+        _persist_k3_artifact(
+            "tests.log",
+            f"command: pytest {' '.join(command[2:])}\n"
+            f"files: {','.join(chosen)}\n"
+            f"expression: {expression!r}\n\n"
+            f"--- collected node ids (one process) ---\n{collected}\n"
+            f"--- the run, 8 ranks teed into one stream ---\n{output}",
+        )
+
+    collected = collect()
+    try:
+        output = _run_kimi_k3_torchrun(
+            command,
+            timeout=14_100,
+            attribute_ranks=verbose,
+            capture=True,
+        )
+    except subprocess.CalledProcessError as error:
+        persist(error.output or "", collected)
+        raise
+    persist(output, collected)
+
+
+#: What each sanitizer tool selects when it is not told otherwise.
+#:
+#: memcheck runs the three pinned route distributions, which it does in a couple
+#: of minutes. racecheck instruments every shared-memory access in a step whose
+#: shared traffic is the point, so it runs the same three: `concentrated` puts
+#: all 512 assignments on sixteen experts, which is the only shape whose batch
+#: exceeds the gate/up contraction's eight N columns and therefore the one that
+#: drives a second pass over the same weights, and `disjoint` gives 512 experts
+#: one row apiece, so seven of eight N columns are inactive and a CTA runs many
+#: units in a row over the ring's carried parity.
+K3_SANITIZER_SELECTION = {
+    "memcheck": "pinned_route_distributions",
+    "racecheck": "pinned_route_distributions",
+}
+
+
+@app.function(
+    image=B300_IMAGE,
+    gpu="B300:8",
+    timeout=14_400,
+    volumes={K3_ARTIFACTS: K3_VOLUME},
+)
+def sanitize_kimi_k3_decode(
+    tool: str = "memcheck",
+    expression: str = "",
+    files: str = "tests/test_kimi_k3_decode.py",
+    artifact: str = "",
+) -> dict[str, int | str]:
+    """Run the decode step under one compute-sanitizer tool on all eight ranks.
+
+    ``racecheck`` and ``memcheck`` are separate runs because the two tools
+    cannot be combined, and both are slow enough that the selection is narrowed
+    to the tests that actually drive the routed gate/up ring.
+
+    ``files`` exists so the same invocation can be pointed at a narrower or
+    wider suite: a finding is only attributable to a change if the same tool is
+    clean without it, and the answer to that has to be measured on the same
+    eight devices under the same tool rather than reasoned about.
+    """
+    if tool not in ("memcheck", "racecheck", "synccheck", "initcheck"):
+        raise ValueError(f"unknown compute-sanitizer tool {tool!r}")
+    expression = expression or K3_SANITIZER_SELECTION.get(
+        tool, "pinned_route_distributions"
+    )
+    command = [
+        "compute-sanitizer",
+        "--tool",
+        tool,
+        "--error-exitcode",
+        "99",
+        "--target-processes",
+        "all",
+        "python",
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc-per-node=8",
+        "-m",
+        "pytest",
+        "-q",
+        "-x",
+        *files.split(","),
+        "-k",
+        expression,
+    ]
+    print(f"Launching: {' '.join(command)} on 8 x B300")
+    completed = subprocess.run(
+        command,
+        cwd=REMOTE_ROOT,
+        env={
+            **os.environ,
+            "PYTHONUNBUFFERED": "1",
+        },
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+        timeout=14_100,
+    )
+    # A sanitizer run has two verdicts and reading one of them is how a clean
+    # report gets published for a run that never finished: racecheck once
+    # reported zero hazards for a step in which a rank had already segfaulted.
+    # `sanitizer_verdict` is the conjunction of both, and it is a pure function
+    # so `tests/test_kimi_k3_sanitizer.py` can hold it to captured runs on a CPU
+    # rather than by provoking the condition on eight GPUs.
+    verdict = sanitizer_verdict(tool, completed.returncode, completed.stdout)
+    print(completed.stdout, end="")
+    for line in verdict.summary_lines():
+        print(f"{tool} {line}")
+    # Persisted before the raise below, so a refused run is still recoverable
+    # from the volume rather than only from this container's console.
+    _persist_k3_artifact(
+        artifact or f"{tool}.log",
+        f"command: {' '.join(command)}\n"
+        + "\n".join(verdict.summary_lines())
+        + f"\n{completed.stdout}",
+    )
+    result = {
+        "command": " ".join(command),
+        "tool": tool,
+        "exit_code": verdict.exit_code,
+        "passed": verdict.passed,
+        "reported_errors": verdict.reported_errors,
+        "host_allowed_errors": verdict.host_allowed_errors,
+        "device_errors": verdict.device_errors,
+        "hazards": verdict.hazards,
+        "rank_summaries": len(verdict.rank_summaries),
+        "failures": list(verdict.failures),
+        "output": completed.stdout,
+    }
+    if not verdict.passed:
+        raise RuntimeError(
+            f"{tool} did not produce evidence: "
+            + "; ".join(verdict.failures)
+        )
+    return result
+
+
+@app.function(
+    image=B300_IMAGE,
+    gpu="B300",
+    timeout=3_600,
+    volumes={K3_ARTIFACTS: K3_VOLUME},
+)
+def sass_kimi_k3_decode() -> str:
+    """Report the SM103 SASS evidence for the decode kernel, per instantiation.
+
+    Resource usage and instruction-family counts for both persistent
+    instantiations, plus the routed gate/up ring's geometry and the residency
+    the driver measures for it. What the ring's arrival has to show is copy
+    engine transfers where the old unit had scalar staging -- `UTMALDG` up,
+    `LDG`/`STS` down -- with nothing spilled to local memory in either.
+    """
+    import re
+
+    import torch
+
+    from mok import _C
+
+    extension = _C.__file__
+    usage = subprocess.run(
+        ["cuobjdump", "--dump-resource-usage", extension],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    table = {
+        name: line
+        for name, line in re.findall(r"Function (\S+):\s*\n\s*(REG:.*)", usage)
+        if "kimi_k3_decode_persistent_kernel" in name
+    }
+    labels = {
+        "ILb0EE": "production_core",
+        "ILb1EE": "production_tensor",
+    }
+    families = ("UTMALDG", "UTCQMMA", "UTCHMMA", "LDG", "STS", "LDL", "STL", "LDTM")
+    report: dict[str, object] = {
+        "gpu": torch.cuda.get_device_name(0),
+        "extension": extension,
+        "routed_gate_up_geometry": dict(_C._kimi_k3_fused_w13_geometry()),
+        "shared_footprint": dict(
+            zip(
+                ("measured_bytes", "dynamic_block_offset", "launch_bytes"),
+                _C._kimi_k3_fused_w13_shared_footprint(),
+                strict=True,
+            )
+        ),
+        "grid_shape": dict(
+            zip(
+                ("ctas", "threads", "dynamic_shared_bytes"),
+                _C._kimi_k3_decode_grid_shape(),
+                strict=True,
+            )
+        ),
+        "resident_blocks_per_sm": {
+            "production_core": _C._kimi_k3_decode_resident_blocks_per_sm(False),
+            "production_tensor": _C._kimi_k3_decode_resident_blocks_per_sm(True),
+        },
+        "instantiations": {},
+    }
+    for mangled, line in sorted(table.items()):
+        label = next(
+            (name for key, name in labels.items() if key in mangled), mangled
+        )
+        dump = subprocess.run(
+            ["cuobjdump", "-sass", "-fun", mangled, extension],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        counts: dict[str, int] = {}
+        for sass_line in dump.splitlines():
+            match = re.match(
+                r"\s+/\*[0-9a-f]{4,}\*/\s+(@!?\S+\s+)?([A-Z][A-Z0-9_.]*)",
+                sass_line,
+            )
+            if match:
+                family = match.group(2).split(".")[0]
+                counts[family] = counts.get(family, 0) + 1
+        report["instantiations"][label] = {
+            "symbol": mangled,
+            "resources": {
+                key: int(value)
+                for key, value in re.findall(r"([A-Z]+):(\d+)", line)
+            },
+            "instruction_counts": {
+                family: counts.get(family, 0) for family in families
+            },
+            "total_instructions": sum(counts.values()),
+        }
+    rendered = json.dumps(report, indent=2, sort_keys=True)
+    print(rendered)
+    _persist_k3_artifact("sass.json", rendered)
+    return rendered
+
+
+@app.function(
+    image=B300_IMAGE,
+    gpu="B300:8",
+    timeout=86_400,
+    volumes={K3_ARTIFACTS: K3_VOLUME},
+)
+def bench_kimi_k3_decode_persisted(git_sha: str) -> bytes:
+    """Run the decode benchmark and put its archive in the volume as well.
+
+    The same gate `bench_kimi_k3_decode` runs. It exists separately because the
+    tables take hours and their only delivery path is the client connection,
+    which is the one thing no amount of retrying inside the container can
+    protect; this writes the archive to the volume before returning it.
+    """
+    archive = bench_kimi_k3_decode.local(git_sha)
+    _persist_k3_artifact("decode_benchmark.tar", archive)
+    return archive
+
+
+K3_GATES = ("tests", "sass", "benchmark", "memcheck", "racecheck")
+
+
+@app.local_entrypoint()
+def verify(
+    git_sha: str,
+    output_dir: str = "kimi_k3_verification_b300",
+    gates: str = ",".join(K3_GATES),
+    spawn: bool = False,
+) -> None:
+    """Run the named Kimi K3 B300 gates and persist each one's artifact.
+
+    Correctness, both sanitizer tools, the SASS evidence, and the saturated
+    benchmark. Run one after another rather than all at once: four of the five
+    want all eight B300s, and a run that asked for thirty-two would be queued
+    behind itself rather than finishing sooner. A gate that fails is recorded
+    and the rest still run, so one failure does not cost the other evidence.
+
+    ``gates`` selects a subset, which is what makes the evidence recoverable:
+    the client connection that carries a gate's result is the one thing here
+    that no amount of retrying inside the container can protect, so each gate
+    can be re-run on its own in a fresh client process without redoing the
+    ones that already landed.
+
+    ``spawn`` goes further and does not wait at all. Run it under `--detach`
+    and the gate finishes on its own, writing its artifact into the
+    `mok-kimi-k3-decode` volume; `modal volume get` collects it afterwards.
+    That is the only way to run the saturated benchmark and racecheck, whose
+    hours outlast any client connection.
+    """
+    root = Path(output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    requested = tuple(name.strip() for name in gates.split(",") if name.strip())
+    unknown = sorted(set(requested) - set(K3_GATES))
+    if unknown:
+        raise SystemExit(f"unknown Kimi K3 gates: {unknown}")
+    functions = {
+        "tests": (verify_kimi_k3, (), {}),
+        "sass": (sass_kimi_k3_decode, (), {}),
+        "benchmark": (bench_kimi_k3_decode_persisted, (git_sha,), {}),
+        "memcheck": (sanitize_kimi_k3_decode, (), {"tool": "memcheck"}),
+        "racecheck": (sanitize_kimi_k3_decode, (), {"tool": "racecheck"}),
+    }
+    if spawn:
+        for name in requested:
+            function, args, keywords = functions[name]
+            handle = function.spawn(*args, **keywords)
+            print(f"{name}: spawned {handle.object_id}")
+        print(
+            "collect with: modal volume get mok-kimi-k3-decode "
+            f"'**' {output_dir}"
+        )
+        return
+    runners = {
+        name: (lambda function=function, args=args, keywords=keywords: (
+            function.remote(*args, **keywords)
+        ))
+        for name, (function, args, keywords) in functions.items()
+    }
+    failures = []
+    for name in requested:
+        gate = runners[name]
+        try:
+            result = gate()
+        except Exception as error:  # noqa: BLE001 - every gate must be attempted
+            (root / f"{name}.error.txt").write_text(str(error), encoding="utf-8")
+            failures.append(name)
+            print(f"{name}: FAILED ({type(error).__name__})")
+            continue
+        (root / f"{name}.error.txt").unlink(missing_ok=True)
+        if name in ("memcheck", "racecheck"):
+            (root / f"{name}.log").write_text(
+                f"command: {result['command']}\n"
+                f"verdict: {'passed' if result['passed'] else 'FAILED'}\n"
+                f"exit_code: {result['exit_code']}\n"
+                f"reported_errors: {result['reported_errors']}\n"
+                f"host_allowed_errors: {result['host_allowed_errors']}\n"
+                f"device_errors: {result['device_errors']}\n"
+                f"hazards: {result['hazards']}\n"
+                f"rank_summaries: {result['rank_summaries']}\n"
+                + "".join(
+                    f"failure: {reason}\n" for reason in result["failures"]
+                )
+                + result["output"],
+                encoding="utf-8",
+            )
+            print(
+                f"{name}: {result['device_errors']} device errors, "
+                f"{result['hazards']} hazards "
+                f"({result['reported_errors']} reported, "
+                f"{result['host_allowed_errors']} host-allowed), "
+                f"{result['rank_summaries']} rank summaries"
+            )
+            # `sanitize_kimi_k3_decode` refuses a run that produced no evidence
+            # before it returns, so reaching here already means the conjunction
+            # held. Gating on it again is what keeps that true if the remote
+            # ever starts returning a verdict instead of raising on one.
+            if not result["passed"]:
+                failures.append(name)
+        elif name == "sass":
+            (root / "sass.json").write_text(result, encoding="utf-8")
+        elif name == "benchmark":
+            (root / "decode_benchmark.tar").write_bytes(result)
+        else:
+            (root / "tests.log").write_text("passed\n", encoding="utf-8")
+        print(f"{name}: done")
+    print(f"artifacts: {sorted(path.name for path in root.iterdir())}")
+    if failures:
+        raise SystemExit(f"Kimi K3 gates failed: {sorted(failures)}")
 
 
 @app.function(image=B300_IMAGE, gpu="B300", timeout=7_200)

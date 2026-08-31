@@ -4,6 +4,7 @@
 
 #include "expert_mxfp4.cuh"
 #include "persistent_sync.cuh"
+#include "expert_mxfp4_fused_w13.cuh"
 #include "expert_mxfp4_grouped.cuh"
 #include "router.cuh"
 #include "shared.cuh"
@@ -26,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <type_traits>
@@ -90,11 +92,15 @@ static_assert(kMaximumBenchmarkCtas == kPersistentCtas);
 static_assert(kBenchmarkGridCtas[2] < kBenchmarkGridCtas[3]);
 
 /// The widest shared-memory footprint any stage this kernel runs asks for.
+///
+/// The routed gate/up unit's ring, by a wide margin: it holds two 64 KiB weight
+/// slabs and the whole of one expert's activation, where no other stage holds
+/// more than 128 KiB. So it is the stage the whole grid's request is sized to.
 inline constexpr int kWidestStageSharedBytes =
-    expert_mxfp4::kGateUpUnitSharedBytes
-            > expert_mxfp4::kDownUnitSharedBytes
-        ? expert_mxfp4::kGateUpUnitSharedBytes
-        : expert_mxfp4::kDownUnitSharedBytes;
+    expert_mxfp4::fused_w13::kFusedW13SharedBytes;
+
+static_assert(kWidestStageSharedBytes >= expert_mxfp4::kGateUpUnitSharedBytes);
+static_assert(kWidestStageSharedBytes >= expert_mxfp4::kDownUnitSharedBytes);
 
 // Each CTA holds all 512 tensor-memory columns, so the grid is only correct if
 // every launched CTA lands alone on an SM. Requesting more than half of an
@@ -102,7 +108,9 @@ inline constexpr int kWidestStageSharedBytes =
 // independently of any occupancy heuristic.
 static_assert(2 * kPersistentSharedBytes > kittens::MAX_SHARED_MEMORY,
               "the persistent grid must be one CTA per SM");
-static_assert(kPersistentSharedBytes <= kittens::MAX_SHARED_MEMORY - 1024,
+static_assert(kPersistentSharedBytes
+                  <= kittens::MAX_SHARED_MEMORY
+                         - expert_mxfp4::fused_w13::kFusedStaticSharedReserve,
               "the persistent grid must leave room for static shared memory");
 static_assert(kPersistentSharedBytes >= kWidestStageSharedBytes,
               "the persistent grid must fit its widest stage");
@@ -112,6 +120,51 @@ static_assert(
     "the persistent grid must fit grouped routed down");
 static_assert(kPersistentSharedBytes >= router::kSharedBytes,
               "the persistent grid must fit the router's scoring buffer");
+
+// The grid's request is the gate/up ring's, so the two have to be one number.
+// `kPersistentSharedBytes` is spelled independently in `persistent_sync.cuh`
+// because the engine's header includes that one for its arrival primitive, and
+// the include cannot go both ways.
+static_assert(kPersistentSharedBytes
+                  == expert_mxfp4::fused_w13::kFusedW13SharedBytes,
+              "the persistent grid must request exactly the routed gate/up "
+              "ring's footprint");
+
+/// Routed gate/up units one occupied expert is decomposed into.
+///
+/// One, not six. The expert's six output tasks run inside a single claim, which
+/// is what lets the unit gather that expert's activation once and let all six
+/// tasks read it -- so five of every six queue claims disappear along with five
+/// of every six gathers.
+inline constexpr int kGateUpUnitsPerExpert = 1;
+
+/// Gate/up arrivals one occupied expert publishes, which is what phase 4 waits
+/// for.
+///
+/// Deliberately *not* the queue length. The unit finishes its six 64-column
+/// ranges one at a time and publishes one arrival per range, because a routed
+/// down unit cannot start until all 384 columns of `situ` exist no matter how
+/// the work that wrote them was claimed.
+inline constexpr int kGateUpArrivalsPerExpert =
+    expert_mxfp4::fused_w13::kFusedTasks;
+
+static_assert(kGateUpArrivalsPerExpert == 6);
+static_assert(kGateUpArrivalsPerExpert * expert_mxfp4::fused_w13::
+                                             kFusedSituGroups
+                  == expert_mxfp4::kSituGroups,
+              "the arrivals must cover every situ quantization group, or "
+              "grouped down would start on a partly written expert");
+
+// The instantiation must be one CTA per SM and must still be able to run every
+// other stage of the step.
+static_assert(2 * kPersistentSharedBytes > kittens::MAX_SHARED_MEMORY
+                  && kPersistentSharedBytes >= kWidestStageSharedBytes
+                  && kPersistentSharedBytes
+                         >= expert_mxfp4::grouped_pipeline::
+                                kGroupedDownPersistentSharedBytes
+                  && kPersistentSharedBytes >= router::kSharedBytes,
+              "the instantiation must stay one CTA per SM and still run every "
+              "other stage of the step");
 
 // ---------------------------------------------------------------------------
 // Logical task counts.
@@ -141,7 +194,7 @@ inline constexpr TaskPlan task_plan(const int active_tokens) {
                            : skinny_gemm::kCoreCtas)
             + (tensor_path ? 2 * shared_experts::kTensorGateCtas
                            : shared_experts::kCoreGateCtas),
-        experts * expert_mxfp4::kGateUpTiles,
+        experts * kGateUpUnitsPerExpert,
         (tensor_path ? shared_experts::kActivationCtas : 0)
             + experts
                   * expert_mxfp4::grouped_pipeline::kGroupedDownUnits
@@ -198,6 +251,9 @@ static_assert(kLongestQueueTicket == 6928,
 static_assert(static_cast<unsigned int>(kLongestQueueTicket)
                   < 0xffffffffu / 2u,
               "a queue counter must not approach the unsigned wrap");
+static_assert(kNumExperts * kGateUpUnitsPerExpert <= kLongestQueueUnits,
+              "the gate/up queue must fit the bound every queue counter is "
+              "sized against");
 
 inline std::tuple<int, int, int, int, int> task_plan_for_testing(
     const std::int64_t active_tokens
@@ -360,10 +416,13 @@ void kimi_k3_decode_persistent_kernel(
     const __nv_bfloat16 *__restrict__ routed_expert_down_proj,
     const __nv_bfloat16 *__restrict__ routed_expert_up_proj,
     const __nv_bfloat16 *__restrict__ routed_latent_rmsnorm_weight,
-    const std::uint8_t *__restrict__ expert_w1_packed,
-    const std::uint8_t *__restrict__ expert_w1_scale,
-    const std::uint8_t *__restrict__ expert_w3_packed,
-    const std::uint8_t *__restrict__ expert_w3_scale,
+    // The routed gate/up payload travels as a tensor map rather than as a
+    // pointer: the engine reads a `(task, slab)` tile with one
+    // `cp.async.bulk.tensor.5d`, and a kernel may only name a descriptor it was
+    // handed by value in a `__grid_constant__` parameter. Its scales stay an
+    // ordinary pointer, because a slab's are already contiguous.
+    const __grid_constant__ CUtensorMap expert_w13_packed,
+    const std::uint8_t *__restrict__ expert_w13_scale,
     const std::uint8_t *__restrict__ expert_w2_packed,
     const std::uint8_t *__restrict__ expert_w2_scale,
     const __nv_bfloat16 *__restrict__ shared_gate_proj,
@@ -583,9 +642,11 @@ void kimi_k3_decode_persistent_kernel(
     // projection-first phase, before route selection and assignment building.
     // -----------------------------------------------------------------------
     {
-        constexpr int routed_units_per_expert =
-            expert_mxfp4::kGateUpTiles;
-        const int units = expert_units * routed_units_per_expert;
+        const int units = expert_units * kGateUpUnitsPerExpert;
+        // The unit's ring barriers are armed by the first unit this CTA runs
+        // and then reused, so the flag has to be a CTA-lifetime fact rather
+        // than something each unit rediscovers.
+        bool first_unit = true;
         while (true) {
             const unsigned long long queue_mark = clocks.now();
             const int batch_begin = claim_unit_batch(
@@ -594,17 +655,19 @@ void kimi_k3_decode_persistent_kernel(
             mark = clocks.lap(kClockRoutedQueue, queue_mark);
             if (batch_begin < 0) break;
             for (int unit = batch_begin; unit < claim_end_slot; ++unit) {
-                const int expert = scratch.unit_expert[
-                    unit / routed_units_per_expert];
+                const int expert = scratch.unit_expert[unit];
                 const int begin = scratch.expert_offsets[expert];
-                expert_mxfp4::routed_gate_up_unit(
-                    shared_raw, tensor_pool, expert_w1_packed,
-                    expert_w1_scale, expert_w3_packed, expert_w3_scale,
-                    scratch, expert, begin,
-                    scratch.expert_offsets[expert + 1] - begin,
-                    unit % routed_units_per_expert, clocks);
-                __syncthreads();
-                publish_count_at(&scratch.expert_counts[expert]);
+                const int rows =
+                    scratch.expert_offsets[expert + 1] - begin;
+                // The unit publishes its own six arrivals, one per completed
+                // 64-column range, because the ranges complete inside it
+                // rather than at its boundary.
+                expert_mxfp4::fused_w13::routed_gate_up_fused_unit(
+                    shared_raw, tensor_pool, &expert_w13_packed,
+                    expert_w13_scale, scratch,
+                    &scratch.expert_counts[expert], expert, begin, rows,
+                    clocks, first_unit);
+                first_unit = false;
                 mark = clocks.lap(kClockRoutedGateUp, mark);
             }
         }
@@ -680,7 +743,7 @@ void kimi_k3_decode_persistent_kernel(
                 wait_for_count_at(
                     scratch, error_flag,
                     &scratch.expert_counts[expert], kGateUpArrivals,
-                    expert_mxfp4::kGateUpTiles,
+                    kGateUpArrivalsPerExpert,
                     kErrorPersistentGateUpDownReadiness);
                 mark = clocks.lap(
                     kClockReadinessWait, readiness_mark);
@@ -804,6 +867,7 @@ template<bool TENSOR_PATH>
 static __host__ int resident_blocks_per_sm() {
     static std::array<std::atomic<int>, kMaxCudaDevices> measured{};
     static std::array<std::once_flag, kMaxCudaDevices> reserved;
+    constexpr int shared_bytes = kPersistentSharedBytes;
     int device = 0;
     C10_CUDA_CHECK(cudaGetDevice(&device));
     TORCH_CHECK(device >= 0 && device < kMaxCudaDevices,
@@ -813,14 +877,16 @@ static __host__ int resident_blocks_per_sm() {
         C10_CUDA_CHECK(cudaFuncSetAttribute(
             kimi_k3_decode_persistent_kernel<TENSOR_PATH>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
-            kPersistentSharedBytes));
+            shared_bytes));
         int blocks = 0;
         C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &blocks,
             kimi_k3_decode_persistent_kernel<TENSOR_PATH>,
-            kDecodeCtaThreads, kPersistentSharedBytes));
+            kDecodeCtaThreads, shared_bytes));
         measured[static_cast<std::size_t>(device)].store(
             blocks, std::memory_order_relaxed);
+        // The count is the graph-capture contract: two per device, one per
+        // capacity path, both paid before any capture.
         shared_memory_reservations()[static_cast<std::size_t>(device)]
             .fetch_add(1, std::memory_order_relaxed);
     });
@@ -878,10 +944,8 @@ struct LaunchArguments {
     const at::Tensor &routed_expert_down_proj;
     const at::Tensor &routed_expert_up_proj;
     const at::Tensor &routed_latent_rmsnorm_weight;
-    const at::Tensor &expert_w1_packed;
-    const at::Tensor &expert_w1_scale;
-    const at::Tensor &expert_w3_packed;
-    const at::Tensor &expert_w3_scale;
+    const at::Tensor &expert_w13_packed;
+    const at::Tensor &expert_w13_scale;
     const at::Tensor &expert_w2_packed;
     const at::Tensor &expert_w2_scale;
     const at::Tensor &shared_gate_proj;
@@ -929,10 +993,9 @@ static __host__ void launch_persistent(
             bf16(arguments.routed_expert_down_proj),
             bf16(arguments.routed_expert_up_proj),
             bf16(arguments.routed_latent_rmsnorm_weight),
-            bytes(arguments.expert_w1_packed),
-            bytes(arguments.expert_w1_scale),
-            bytes(arguments.expert_w3_packed),
-            bytes(arguments.expert_w3_scale),
+            *expert_mxfp4::fused_w13::fused_w13_packed_map(
+                arguments.expert_w13_packed.data_ptr()),
+            bytes(arguments.expert_w13_scale),
             bytes(arguments.expert_w2_packed),
             bytes(arguments.expert_w2_scale),
             bf16(arguments.shared_gate_proj),

@@ -8,24 +8,31 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
-
-KIMI_K3_HIDDEN_SIZE = 7168
-KIMI_K3_LATENT_SIZE = 3584
-KIMI_K3_ROUTED_INTERMEDIATE_SIZE = 3072
-KIMI_K3_SHARED_INTERMEDIATE_SIZE = 6144
-KIMI_K3_NUM_EXPERTS = 896
-KIMI_K3_TOPK = 16
-KIMI_K3_TP_SIZE = 8
-KIMI_K3_MAX_TOKENS = 128
-KIMI_K3_RMS_EPS = 1e-5
-KIMI_K3_SITU_BETA = 4.0
-KIMI_K3_SITU_LINEAR_BETA = 25.0
-KIMI_K3_CAPACITY_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128)
-KIMI_K3_MXFP4_GROUP_SIZE = 32
-KIMI_K3_MXFP4_UNIT_SCALE_BYTE = 0x7F
-# Routed w1/w3 store native K: mixed W4A8 `kind::mxf8f6f4` block scaling runs at
-# K=32, so the contraction needs no padding to a wider instruction shape.
-KIMI_K3_W1W3_K = KIMI_K3_LATENT_SIZE
+from mok.kimi_k3_shapes import (
+    KIMI_K3_CAPACITY_BUCKETS,
+    KIMI_K3_HIDDEN_SIZE,
+    KIMI_K3_LATENT_SIZE,
+    KIMI_K3_MAX_TOKENS,
+    KIMI_K3_MXFP4_GROUP_SIZE,
+    KIMI_K3_MXFP4_UNIT_SCALE_BYTE,
+    KIMI_K3_NUM_EXPERTS,
+    KIMI_K3_RMS_EPS,
+    KIMI_K3_ROUTED_INTERMEDIATE_SIZE,
+    KIMI_K3_SHARED_INTERMEDIATE_SIZE,
+    KIMI_K3_SITU_BETA,
+    KIMI_K3_SITU_LINEAR_BETA,
+    KIMI_K3_TOPK,
+    KIMI_K3_TP_SIZE,
+    KIMI_K3_W1W3_K,
+)
+from mok.kimi_k3_w13 import (
+    KIMI_K3_W13_PACKED_SHAPE,
+    KIMI_K3_W13_SCALE_SHAPE,
+    fuse_w13,
+    fuse_w13_half,
+    fused_w13_prepared_bytes,
+    unfuse_w13,
+)
 
 
 def _operators() -> Any:
@@ -57,6 +64,15 @@ class KimiK3DecodeWeights:
     latent projections from 7168 to 3584 and from 3584 to 7168, respectively.
     They are distinct from the per-expert gate, up, and down projection tensors
     accepted by ``kimi_k3_moe_reference``.
+
+    A routed expert's gate and up projections are stored fused rather than
+    separately: ``expert_w13_packed`` and ``expert_w13_scale`` hold both, in the
+    tile-major order the decode kernel's gate/up unit reads them, and there is
+    no separate ``w1``/``w3`` copy. The transform is a permutation, so the pair
+    occupies exactly the bytes the four tensors it replaces did --
+    :func:`mok.kimi_k3_w13.unfuse_w13` recovers the per-projection view for a
+    caller that needs it. Only ``expert_w2`` keeps its canonical shape, because
+    the routed-down pipeline contracts it in its canonical order.
     """
 
     router_weight: torch.Tensor
@@ -64,10 +80,8 @@ class KimiK3DecodeWeights:
     routed_expert_down_proj: torch.Tensor
     routed_expert_up_proj: torch.Tensor
     routed_latent_rmsnorm_weight: torch.Tensor
-    expert_w1_packed: torch.Tensor
-    expert_w1_scale: torch.Tensor
-    expert_w3_packed: torch.Tensor
-    expert_w3_scale: torch.Tensor
+    expert_w13_packed: torch.Tensor
+    expert_w13_scale: torch.Tensor
     expert_w2_packed: torch.Tensor
     expert_w2_scale: torch.Tensor
     shared_gate_proj: torch.Tensor
@@ -375,10 +389,10 @@ def validate_kimi_k3_decode_inputs(
           KIMI_K3_SHARED_INTERMEDIATE_SIZE // KIMI_K3_TP_SIZE)),
     )
     uint8_layouts = (
-        ("expert_w1_packed", weights.expert_w1_packed, (896, 384, 1792)),
-        ("expert_w1_scale", weights.expert_w1_scale, (896, 384, 112)),
-        ("expert_w3_packed", weights.expert_w3_packed, (896, 384, 1792)),
-        ("expert_w3_scale", weights.expert_w3_scale, (896, 384, 112)),
+        ("expert_w13_packed", weights.expert_w13_packed,
+         KIMI_K3_W13_PACKED_SHAPE),
+        ("expert_w13_scale", weights.expert_w13_scale,
+         KIMI_K3_W13_SCALE_SHAPE),
         ("expert_w2_packed", weights.expert_w2_packed, (896, 3584, 192)),
         ("expert_w2_scale", weights.expert_w2_scale, (896, 3584, 12)),
     )
@@ -471,10 +485,8 @@ def kimi_k3_decode(
         weights.routed_expert_down_proj,
         weights.routed_expert_up_proj,
         weights.routed_latent_rmsnorm_weight,
-        weights.expert_w1_packed,
-        weights.expert_w1_scale,
-        weights.expert_w3_packed,
-        weights.expert_w3_scale,
+        weights.expert_w13_packed,
+        weights.expert_w13_scale,
         weights.expert_w2_packed,
         weights.expert_w2_scale,
         weights.shared_gate_proj,
@@ -651,6 +663,13 @@ def prepare_kimi_k3_decode_weights(
     no prepared expert matrix is padded. Replicated tensors are passed through
     without copying.
 
+    The gate and up projections are then fused: they are returned as the single
+    ``expert_w13_packed``/``expert_w13_scale`` pair the decode kernel's gate/up
+    unit reads, in place of four per-projection tensors. The fuse is a lossless
+    permutation and occupies the same bytes, and each half is written into the
+    destination and released before the other is packed, so preparation's peak
+    never holds two packed halves and the result at once.
+
     This runs once per model load. The decode operator consumes the returned
     packed tensors directly and never repacks them.
     """
@@ -706,14 +725,34 @@ def prepare_kimi_k3_decode_weights(
 
     routed_start = tp_rank * routed_width
     shared_start = tp_rank * shared_width
-    expert_w1_packed, expert_w1_scale = pack_kimi_k3_mxfp4(
-        _own(expert_w1.narrow(1, routed_start, routed_width)),
-        padded_k=KIMI_K3_W1W3_K,
+    expert_w13_packed = torch.empty(
+        KIMI_K3_W13_PACKED_SHAPE,
+        dtype=torch.uint8,
+        device=router_weight.device,
     )
-    expert_w3_packed, expert_w3_scale = pack_kimi_k3_mxfp4(
-        _own(expert_w3.narrow(1, routed_start, routed_width)),
-        padded_k=KIMI_K3_W1W3_K,
+    expert_w13_scale = torch.empty(
+        KIMI_K3_W13_SCALE_SHAPE,
+        dtype=torch.uint8,
+        device=router_weight.device,
     )
+    # One half at a time, straight into its slots of the fused destination. The
+    # halves are the largest transient here -- 688 MiB of packed bytes each --
+    # and neither is needed once its rows have landed, so the second is packed
+    # only after the first has been released.
+    for half, source in enumerate((expert_w1, expert_w3)):
+        half_packed, half_scale = pack_kimi_k3_mxfp4(
+            _own(source.narrow(1, routed_start, routed_width)),
+            padded_k=KIMI_K3_W1W3_K,
+        )
+        fuse_w13_half(
+            expert_w13_packed,
+            expert_w13_scale,
+            half_packed,
+            half_scale,
+            half,
+        )
+        del half_packed, half_scale
+
     expert_w2_packed, expert_w2_scale = pack_kimi_k3_mxfp4(
         _own(expert_w2.narrow(2, routed_start, routed_width)),
         padded_k=routed_width,
@@ -725,10 +764,8 @@ def prepare_kimi_k3_decode_weights(
         routed_expert_down_proj=routed_latent_down_proj,
         routed_expert_up_proj=routed_latent_up_proj,
         routed_latent_rmsnorm_weight=routed_latent_norm_weight,
-        expert_w1_packed=expert_w1_packed,
-        expert_w1_scale=expert_w1_scale,
-        expert_w3_packed=expert_w3_packed,
-        expert_w3_scale=expert_w3_scale,
+        expert_w13_packed=expert_w13_packed,
+        expert_w13_scale=expert_w13_scale,
         expert_w2_packed=expert_w2_packed,
         expert_w2_scale=expert_w2_scale,
         shared_gate_proj=_own(shared_gate_proj.narrow(0, shared_start, shared_width)),
@@ -930,6 +967,8 @@ __all__ = [
     "KIMI_K3_SITU_LINEAR_BETA",
     "KIMI_K3_TOPK",
     "KIMI_K3_TP_SIZE",
+    "KIMI_K3_W13_PACKED_SHAPE",
+    "KIMI_K3_W13_SCALE_SHAPE",
     "KIMI_K3_W1W3_K",
     "KimiK3DecodeConfig",
     "KimiK3DecodeWorkspace",
@@ -937,6 +976,8 @@ __all__ = [
     "clear_kimi_k3_decode_workspace_cache",
     "create_kimi_k3_decode_workspace",
     "dequant_kimi_k3_mxfp4",
+    "fuse_w13",
+    "fused_w13_prepared_bytes",
     "get_kimi_k3_decode_workspace",
     "kimi_k3_decode",
     "kimi_k3_moe_reference",
@@ -945,6 +986,7 @@ __all__ = [
     "kimi_k3_situ_reference",
     "pack_kimi_k3_mxfp4",
     "prepare_kimi_k3_decode_weights",
+    "unfuse_w13",
     "validate_kimi_k3_decode_hidden_states",
     "validate_kimi_k3_decode_inputs",
 ]

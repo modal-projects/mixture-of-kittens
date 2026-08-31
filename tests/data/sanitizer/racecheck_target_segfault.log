@@ -1,0 +1,133 @@
+command: compute-sanitizer --tool racecheck --error-exitcode 99 --target-processes all python -m torch.distributed.run --standalone --nproc-per-node=8 -m pytest -q -x tests/test_kimi_k3_decode.py -k pinned_route_distributions
+exit_code: 1
+trimmed: blank lines only; every marker line is verbatim
+========= COMPUTE-SANITIZER
+................Fatal Python error: Segmentation fault
+Thread 0x00002b1ecab1c600 (most recent call first):
+  File "/root/mok/tests/kimi_k3_decode_support.py", line 533 in routed_partial_reference
+  File "/root/mok/tests/kimi_k3_decode_support.py", line 600 in decode_reference
+  File "/root/mok/tests/test_kimi_k3_decode.py", line 229 in test_pinned_route_distributions_match_the_reference
+  File "/usr/local/lib/python3.12/site-packages/_pytest/python.py", line 167 in pytest_pyfunc_call
+  File "/usr/local/lib/python3.12/site-packages/pluggy/_callers.py", line 121 in _multicall
+  File "/usr/local/lib/python3.12/site-packages/pluggy/_manager.py", line 120 in _hookexec
+  File "/usr/local/lib/python3.12/site-packages/pluggy/_hooks.py", line 512 in __call__
+  File "/usr/local/lib/python3.12/site-packages/_pytest/python.py", line 1707 in runtest
+  File "/usr/local/lib/python3.12/site-packages/_pytest/runner.py", line 184 in pytest_runtest_call
+  File "/usr/local/lib/python3.12/site-packages/pluggy/_callers.py", line 121 in _multicall
+  File "/usr/local/lib/python3.12/site-packages/pluggy/_manager.py", line 120 in _hookexec
+  File "/usr/local/lib/python3.12/site-packages/pluggy/_hooks.py", line 512 in __call__
+  File "/usr/local/lib/python3.12/site-packages/_pytest/runner.py", line 250 in <lambda>
+  File "/usr/local/lib/python3.12/site-packages/_pytest/runner.py", line 361 in from_call
+  File "/usr/local/lib/python3.12/site-packages/_pytest/runner.py", line 249 in call_and_report
+  File "/usr/local/lib/python3.12/site-packages/_pytest/runner.py", line 139 in runtestprotocol
+  File "/usr/local/lib/python3.12/site-packages/_pytest/runner.py", line 118 in pytest_runtest_protocol
+  File "/usr/local/lib/python3.12/site-packages/pluggy/_callers.py", line 121 in _multicall
+  File "/usr/local/lib/python3.12/site-packages/pluggy/_manager.py", line 120 in _hookexec
+  File "/usr/local/lib/python3.12/site-packages/pluggy/_hooks.py", line 512 in __call__
+  File "/usr/local/lib/python3.12/site-packages/_pytest/main.py", line 408 in pytest_runtestloop
+  File "/usr/local/lib/python3.12/site-packages/pluggy/_callers.py", line 121 in _multicall
+  File "/usr/local/lib/python3.12/site-packages/pluggy/_manager.py", line 120 in _hookexec
+  File "/usr/local/lib/python3.12/site-packages/pluggy/_hooks.py", line 512 in __call__
+  File "/usr/local/lib/python3.12/site-packages/_pytest/main.py", line 384 in _main
+  File "/usr/local/lib/python3.12/site-packages/_pytest/main.py", line 330 in wrap_session
+  File "/usr/local/lib/python3.12/site-packages/_pytest/main.py", line 377 in pytest_cmdline_main
+  File "/usr/local/lib/python3.12/site-packages/pluggy/_callers.py", line 121 in _multicall
+  File "/usr/local/lib/python3.12/site-packages/pluggy/_manager.py", line 120 in _hookexec
+  File "/usr/local/lib/python3.12/site-packages/pluggy/_hooks.py", line 512 in __call__
+  File "/usr/local/lib/python3.12/site-packages/_pytest/config/__init__.py", line 229 in _main
+  File "/usr/local/lib/python3.12/site-packages/_pytest/config/__init__.py", line 253 in _console_main
+  File "/usr/local/lib/python3.12/site-packages/pytest/__main__.py", line 9 in <module>
+  File "<frozen runpy>", line 88 in _run_code
+  File "<frozen runpy>", line 198 in _run_module_as_main
+Extension modules: numpy._core._multiarray_umath, numpy.linalg._umath_linalg, torch._C, torch._C._dynamo.autograd_compiler, torch._C._dynamo.eval_frame, torch._C._dynamo.guards, torch._C._dynamo.utils, torch._C._fft, torch._C._linalg, torch._C._nested, torch._C._nn, torch._C._sparse, torch._C._special, cuda.bindings._bindings.cydriver, cuda.bindings.cydriver, cuda.bindings.driver, cuda.bindings._bindings.cyruntime_ptds, cuda.bindings._bindings.cyruntime, cuda.bindings.cyruntime, cuda.bindings.runtime, numpy.random._common, numpy.random.bit_generator, numpy.random._bounded_integers, numpy.random._pcg64, numpy.random._generator, numpy.random._mt19937, numpy.random._philox, numpy.random._sfc64, numpy.random.mtrand (total: 29)
+W0831 01:22:14.642000 35 site-packages/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 53 closing signal SIGTERM
+W0831 01:22:14.644000 35 site-packages/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 55 closing signal SIGTERM
+W0831 01:22:14.645000 35 site-packages/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 56 closing signal SIGTERM
+W0831 01:22:14.648000 35 site-packages/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 57 closing signal SIGTERM
+W0831 01:22:14.651000 35 site-packages/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 58 closing signal SIGTERM
+W0831 01:22:14.651000 35 site-packages/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 59 closing signal SIGTERM
+W0831 01:22:14.651000 35 site-packages/torch/distributed/elastic/multiprocessing/api.py:1028] Sending process 60 closing signal SIGTERM
+E0831 01:22:19.442000 35 site-packages/torch/distributed/elastic/multiprocessing/api.py:1002] failed (exitcode: -11) local_rank: 1 (pid: 54) of binary: /usr/local/bin/python
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/usr/local/lib/python3.12/site-packages/torch/distributed/run.py", line 1032, in <module>
+    main()
+  File "/usr/local/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/site-packages/torch/distributed/run.py", line 1028, in main
+    run(args)
+  File "/usr/local/lib/python3.12/site-packages/torch/distributed/run.py", line 1019, in run
+    elastic_launch(
+  File "/usr/local/lib/python3.12/site-packages/torch/distributed/launcher/api.py", line 194, in __call__
+    return launch_agent(
+           ^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/site-packages/torch/distributed/launcher/api.py", line 383, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+====================================================
+pytest FAILED
+----------------------------------------------------
+Failures:
+[1]:
+  time      : 2026-08-31_01:22:19
+  host      : localhost
+  rank      : 0 (local_rank: 0)
+  exitcode  : -15 (pid: 53)  (SIGTERM)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 53
+[2]:
+  time      : 2026-08-31_01:22:19
+  host      : localhost
+  rank      : 2 (local_rank: 2)
+  exitcode  : -15 (pid: 55)  (SIGTERM)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 55
+[3]:
+  time      : 2026-08-31_01:22:19
+  host      : localhost
+  rank      : 3 (local_rank: 3)
+  exitcode  : -15 (pid: 56)  (SIGTERM)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 56
+[4]:
+  time      : 2026-08-31_01:22:19
+  host      : localhost
+  rank      : 4 (local_rank: 4)
+  exitcode  : -15 (pid: 57)  (SIGTERM)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 57
+[5]:
+  time      : 2026-08-31_01:22:19
+  host      : localhost
+  rank      : 5 (local_rank: 5)
+  exitcode  : -15 (pid: 58)  (SIGTERM)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 58
+[6]:
+  time      : 2026-08-31_01:22:19
+  host      : localhost
+  rank      : 6 (local_rank: 6)
+  exitcode  : -15 (pid: 59)  (SIGTERM)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 59
+[7]:
+  time      : 2026-08-31_01:22:19
+  host      : localhost
+  rank      : 7 (local_rank: 7)
+  exitcode  : -15 (pid: 60)  (SIGTERM)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 60
+----------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-08-31_01:22:14
+  host      : localhost
+  rank      : 1 (local_rank: 1)
+  exitcode  : -11 (pid: 54)  (SIGSEGV)
+  error_file: <N/A>
+  traceback : Signal 11 (SIGSEGV) received by PID 54
+====================================================
+========= Target application returned an error
+========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)

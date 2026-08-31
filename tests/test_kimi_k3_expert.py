@@ -54,7 +54,7 @@ def _aligned(size: int) -> int:
 def _scratch_layout() -> dict[str, tuple[int, int]]:
     """Independent byte-level model of ``kimi_k3_decode::Scratch``."""
     regions = (
-        ("phase", 64 * 4),
+        ("phase", 128 * 4),
         ("expert_ids", MAX_ASSIGNMENTS * 4),
         ("expert_weights", MAX_ASSIGNMENTS * 4),
         ("expert_counts", EXPERTS * 4),
@@ -433,21 +433,21 @@ def test_workspace_bytes_matches_extended_expert_scratch(
 ) -> None:
     from mok import _C
 
-    assert SCRATCH_BYTES == 8_111_104
+    assert SCRATCH_BYTES == 8_111_360
     assert _C.kimi_k3_decode_workspace_bytes() == SCRATCH_BYTES
     for name, (offset, _) in SCRATCH_LAYOUT.items():
         if name != "total_bytes":
             assert offset % ALIGNMENT == 0, name
-    assert SCRATCH_LAYOUT["latent_mxfp8"] == (40_448, 458_752)
-    assert SCRATCH_LAYOUT["latent_scale"] == (499_200, 14_336)
-    assert SCRATCH_LAYOUT["situ_mxfp8"] == (513_536, 786_432)
-    assert SCRATCH_LAYOUT["situ_scale"] == (1_299_968, 24_576)
-    assert SCRATCH_LAYOUT["routed_accumulator"] == (1_324_544, 3_670_016)
-    assert SCRATCH_LAYOUT["shared_gate"] == (4_994_560, 196_608)
-    assert SCRATCH_LAYOUT["shared_up"] == (5_191_168, 196_608)
-    assert SCRATCH_LAYOUT["shared_activated"] == (5_387_776, 196_608)
-    assert SCRATCH_LAYOUT["tail_normalized"] == (5_584_384, 917_504)
-    assert SCRATCH_LAYOUT["tail_shared_shard"] == (6_501_888, 229_376)
+    assert SCRATCH_LAYOUT["latent_mxfp8"] == (40_704, 458_752)
+    assert SCRATCH_LAYOUT["latent_scale"] == (499_456, 14_336)
+    assert SCRATCH_LAYOUT["situ_mxfp8"] == (513_792, 786_432)
+    assert SCRATCH_LAYOUT["situ_scale"] == (1_300_224, 24_576)
+    assert SCRATCH_LAYOUT["routed_accumulator"] == (1_324_800, 3_670_016)
+    assert SCRATCH_LAYOUT["shared_gate"] == (4_994_816, 196_608)
+    assert SCRATCH_LAYOUT["shared_up"] == (5_191_424, 196_608)
+    assert SCRATCH_LAYOUT["shared_activated"] == (5_388_032, 196_608)
+    assert SCRATCH_LAYOUT["tail_normalized"] == (5_584_640, 917_504)
+    assert SCRATCH_LAYOUT["tail_shared_shard"] == (6_502_144, 229_376)
 
 
 def test_down_row_gain_tag_is_nonperiodic_and_exactly_representable(

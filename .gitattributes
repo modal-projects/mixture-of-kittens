@@ -1,0 +1,7 @@
+# Captured tool output, kept byte-for-byte.
+#
+# compute-sanitizer ends its blank continuation lines with "========= " and
+# torchrun ends its ChildFailedError line with a space. Those are part of what
+# was captured, and tests/test_kimi_k3_sanitizer.py asserts against the capture,
+# so the whitespace checks must not be applied to them.
+tests/data/sanitizer/*.log -whitespace

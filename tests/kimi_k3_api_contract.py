@@ -37,10 +37,8 @@ WEIGHT_FIELDS = (
     "routed_expert_down_proj",
     "routed_expert_up_proj",
     "routed_latent_rmsnorm_weight",
-    "expert_w1_packed",
-    "expert_w1_scale",
-    "expert_w3_packed",
-    "expert_w3_scale",
+    "expert_w13_packed",
+    "expert_w13_scale",
     "expert_w2_packed",
     "expert_w2_scale",
     "shared_gate_proj",
@@ -81,21 +79,23 @@ LOW_LEVEL_MUTATED_ARGUMENTS = (
 # A fake trace has no addresses to fold, so it carries this placeholder in
 # place of a real workspace signature.
 TRACE_SIGNATURE = 0
+# The routed gate and up projections are one fused tile-major payload: 42
+# `(task, slab)` tiles of 128 rows, gate channels in the low half of a tile and
+# their own up rows in the high half. Same bytes as the four tensors it replaced,
+# in the order the gate/up unit's descriptor reads them.
 MXFP4_LAYOUTS = (
-    ("expert_w1_packed", (896, 384, 1792)),
-    ("expert_w1_scale", (896, 384, 112)),
-    ("expert_w3_packed", (896, 384, 1792)),
-    ("expert_w3_scale", (896, 384, 112)),
+    ("expert_w13_packed", (896, 5376, 256)),
+    ("expert_w13_scale", (896, 42, 2048)),
     ("expert_w2_packed", (896, 3584, 192)),
     ("expert_w2_scale", (896, 3584, 12)),
 )
-# The K=3648 layout the prepared contract carried before Task 4b, when W1/W3
-# were padded for the FP4-by-FP4 K96 helper instead of mixed W4A8 K32.
-STALE_PADDED_MXFP4_LAYOUTS = (
-    ("expert_w1_packed", (896, 384, 1824)),
-    ("expert_w1_scale", (896, 384, 114)),
-    ("expert_w3_packed", (896, 384, 1824)),
-    ("expert_w3_scale", (896, 384, 114)),
+# The per-projection layout the prepared contract carried before the fused
+# gate/up engine landed. It is exactly as many bytes as the pair above, which is
+# why the pair replaced it rather than joining it -- but it is not the order the
+# descriptor reads, so it must no longer validate.
+STALE_SPLIT_MXFP4_LAYOUTS = (
+    ("expert_w13_packed", (896, 384, 1792)),
+    ("expert_w13_scale", (896, 384, 112)),
 )
 NONCONTRACT_HIDDEN_SHAPES = ((8, 7167), (8, 7168, 1))
 
@@ -152,10 +152,8 @@ def _valid_weights(kimi_k3: ModuleType):
         routed_expert_down_proj=meta_bf16((3584, 7168)),
         routed_expert_up_proj=meta_bf16((7168, 3584)),
         routed_latent_rmsnorm_weight=meta_bf16((3584,)),
-        expert_w1_packed=meta_uint8((896, 384, 1792)),
-        expert_w1_scale=meta_uint8((896, 384, 112)),
-        expert_w3_packed=meta_uint8((896, 384, 1792)),
-        expert_w3_scale=meta_uint8((896, 384, 112)),
+        expert_w13_packed=meta_uint8((896, 5376, 256)),
+        expert_w13_scale=meta_uint8((896, 42, 2048)),
         expert_w2_packed=meta_uint8((896, 3584, 192)),
         expert_w2_scale=meta_uint8((896, 3584, 12)),
         shared_gate_proj=meta_bf16((768, 7168)),
@@ -166,7 +164,7 @@ def _valid_weights(kimi_k3: ModuleType):
 
 
 def _fake_operator_args(hidden_states: torch.Tensor) -> tuple[object, ...]:
-    weights = tuple(hidden_states.new_empty((1,)) for _ in range(14))
+    weights = tuple(hidden_states.new_empty((1,)) for _ in range(12))
     scratch = hidden_states.new_empty((1,), dtype=torch.uint8)
     collective_buffer = hidden_states.new_empty((1,))
     output_mailbox = hidden_states.new_empty((1,))
@@ -262,16 +260,16 @@ def check_prepared_contract_uses_native_k32_layout() -> None:
     assert "KIMI_K3_W1W3_PADDED_K" not in kimi_k3.__all__
 
 
-def check_decode_rejects_stale_padded_mxfp4_layout() -> None:
-    """The K=3648 prepared layout must no longer validate."""
+def check_decode_rejects_stale_split_mxfp4_layout() -> None:
+    """The per-projection prepared layout must no longer validate."""
     kimi_k3, _, _ = _load_contract_modules()
     hidden_states = torch.empty(16, 7168, dtype=torch.bfloat16, device="meta")
     stale = {
         field_name: torch.empty(shape, dtype=torch.uint8, device="meta")
-        for field_name, shape in STALE_PADDED_MXFP4_LAYOUTS
+        for field_name, shape in STALE_SPLIT_MXFP4_LAYOUTS
     }
 
-    with pytest.raises(ValueError, match="expert_w1_packed"):
+    with pytest.raises(ValueError, match="expert_w13_packed"):
         kimi_k3.validate_kimi_k3_decode_inputs(
             hidden_states, replace(_valid_weights(kimi_k3), **stale)
         )
@@ -391,8 +389,8 @@ CHECKS: dict[str, Callable[[], None]] = {
         check_decode_requires_tp8_sharded_shared_weights,
     "prepared_contract_uses_native_k32_layout":
         check_prepared_contract_uses_native_k32_layout,
-    "decode_rejects_stale_padded_mxfp4_layout":
-        check_decode_rejects_stale_padded_mxfp4_layout,
+    "decode_rejects_stale_split_mxfp4_layout":
+        check_decode_rejects_stale_split_mxfp4_layout,
     **{
         f"decode_rejects_noncanonical_mxfp4_layout[{field_name}]": partial(
             check_decode_rejects_noncanonical_mxfp4_layout, field_name, shape

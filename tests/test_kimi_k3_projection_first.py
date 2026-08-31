@@ -75,7 +75,13 @@ def test_durable_phase_profiler_keeps_aggregate_grid_barrier_clock() -> None:
         "void kimi_k3_decode_persistent_kernel(",
     )
 
-    assert "NUM_PHASE_COUNTERS = 64" in types
+    # Two 256-byte scratch grains rather than one. The accumulator band ends the
+    # region and it grew: the routed gate/up phase reports six subphases of its
+    # own now, and twenty accumulated regions at two slots each do not fit above
+    # the thirty-six live counters in 64.
+    assert "NUM_PHASE_COUNTERS = 128" in types
+    assert "kPhaseClockCount == 20" in types
+    assert "kPhaseClockBegin == 88" in types
     assert '"grid_barrier"' in types
     assert "kClockGridBarrier" in kernel
     assert "route_latent_makespan" not in types

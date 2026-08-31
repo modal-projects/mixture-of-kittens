@@ -24,11 +24,14 @@ from mok.kimi_k3 import (
     KIMI_K3_ROUTED_INTERMEDIATE_SIZE,
     KIMI_K3_SHARED_INTERMEDIATE_SIZE,
     KIMI_K3_TP_SIZE,
+    KIMI_K3_W13_PACKED_SHAPE,
+    KIMI_K3_W13_SCALE_SHAPE,
     KIMI_K3_W1W3_K,
     KimiK3DecodeWeights,
     kimi_k3_router_reference,
     pack_kimi_k3_mxfp4,
 )
+from mok.kimi_k3_w13 import fuse_w13_half
 
 HIDDEN = KIMI_K3_HIDDEN_SIZE
 LATENT = KIMI_K3_LATENT_SIZE
@@ -118,20 +121,25 @@ def build_weights(
         raise RuntimeError("prepared Kimi K3 decode weights need 16 GiB free")
 
     shard = 1_000_000 * (tp_rank + 1)
-    w1_packed, w1_scale = _pack_expert_matrix(
-        device,
-        shard + 11,
-        ROUTED_PER_RANK,
-        LATENT,
-        KIMI_K3_W1W3_K,
+    # Straight into the fused destination, one projection at a time, so the run
+    # never holds a canonical half beside the payload it is being folded into --
+    # the same shape `prepare_kimi_k3_decode_weights` prepares in.
+    w13_packed = torch.empty(
+        KIMI_K3_W13_PACKED_SHAPE, dtype=torch.uint8, device=device
     )
-    w3_packed, w3_scale = _pack_expert_matrix(
-        device,
-        shard + 22,
-        ROUTED_PER_RANK,
-        LATENT,
-        KIMI_K3_W1W3_K,
+    w13_scale = torch.empty(
+        KIMI_K3_W13_SCALE_SHAPE, dtype=torch.uint8, device=device
     )
+    for half, seed in enumerate((shard + 11, shard + 22)):
+        half_packed, half_scale = _pack_expert_matrix(
+            device,
+            seed,
+            ROUTED_PER_RANK,
+            LATENT,
+            KIMI_K3_W1W3_K,
+        )
+        fuse_w13_half(w13_packed, w13_scale, half_packed, half_scale, half)
+        del half_packed, half_scale
     w2_packed, w2_scale = _pack_expert_matrix(
         device,
         shard + 33,
@@ -170,10 +178,8 @@ def build_weights(
             1.0
             + 0.25 * _normal((LATENT,), device, 4_004, 1.0).float()
         ).bfloat16().contiguous(),
-        expert_w1_packed=w1_packed,
-        expert_w1_scale=w1_scale,
-        expert_w3_packed=w3_packed,
-        expert_w3_scale=w3_scale,
+        expert_w13_packed=w13_packed,
+        expert_w13_scale=w13_scale,
         expert_w2_packed=w2_packed,
         expert_w2_scale=w2_scale,
         shared_gate_proj=_normal(

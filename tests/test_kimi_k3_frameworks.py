@@ -813,6 +813,47 @@ def test_phase_clock_names_match_the_kernel_scratch_band() -> None:
     assert "assignments" not in names
     assert "routed_gate_up_stage" in names
     assert "routed_gate_up_mma" in names
+    # The fused unit's own partition of the gate/up band. Each one has to be a
+    # breakdown suffix as well, or the comparison would add it to the launch
+    # total it is a fraction of.
+    for subphase in (
+        "routed_gate_up_tma_issue",
+        "routed_gate_up_tma_wait",
+        "routed_gate_up_ring_full",
+        "routed_gate_up_mma_issue",
+        "routed_gate_up_activation",
+        "routed_gate_up_epilogue",
+    ):
+        assert subphase in names, subphase
+        assert subphase.endswith(compare.PHASE_CLOCK_BREAKDOWN_SUFFIXES), subphase
+
+
+def test_a_measured_gate_up_epilogue_is_not_overwritten_by_the_residual() -> None:
+    """The fused unit times its epilogue, so nothing may estimate it instead.
+
+    ``routed_down`` still has no epilogue counter of its own and keeps the
+    residual. Reporting a residual over a measured counter would hide the gap
+    between the six subphases and the band they partition, which is the only
+    signal that a subphase is missing time.
+    """
+    compare = _compare()
+
+    cycles = compare.derive_phase_cycles(
+        {
+            "routed_gate_up": 600,
+            "routed_gate_up_stage": 500,
+            "routed_gate_up_mma": 90,
+            "routed_gate_up_epilogue": 7,
+            "routed_down": 300,
+            "routed_down_stage": 250,
+            "routed_down_mma": 40,
+        }
+    )
+
+    assert cycles["routed_gate_up_epilogue"] == 7
+    assert cycles["routed_down_epilogue"] == 10
+    # And none of the gate/up breakdown enters the launch total.
+    assert compare.summarize_phase_cycles(cycles)["accounted_cycles"] == 900
 
 
 def test_dry_run_writes_the_complete_comparison_manifest(tmp_path: Path) -> None:

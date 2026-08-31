@@ -51,16 +51,20 @@ def test_api_contract_pins_native_k32_expert_layouts() -> None:
     """The contract data itself must stay on native K, not padded K.
 
     Every rejection case above is derived from this table, so a silent return to
-    the K=3648 padding would make those cases test the wrong contract.
+    the K=3648 padding would make those cases test the wrong contract. The
+    gate/up entry is the fused tile-major pair the routed unit reads directly;
+    ``5376 * 256`` and ``42 * 2048`` are the same bytes per expert as the four
+    per-projection tensors they replaced, which is what
+    ``tests/test_kimi_k3_w13.py`` measures.
     """
     assert dict(MXFP4_LAYOUTS) == {
-        "expert_w1_packed": (896, 384, 1792),
-        "expert_w1_scale": (896, 384, 112),
-        "expert_w3_packed": (896, 384, 1792),
-        "expert_w3_scale": (896, 384, 112),
+        "expert_w13_packed": (896, 5376, 256),
+        "expert_w13_scale": (896, 42, 2048),
         "expert_w2_packed": (896, 3584, 192),
         "expert_w2_scale": (896, 3584, 12),
     }
+    assert 5376 * 256 == 2 * 384 * 1792
+    assert 42 * 2048 == 2 * 384 * 112
 
 
 def test_api_contract_does_not_stub_the_mok_package() -> None:
@@ -154,7 +158,7 @@ def test_workspace_create_is_caller_owned_with_canonical_layout(
         assert created.device == device
         assert created.max_tokens == 128
 
-        assert created.scratch.shape == (8_111_104,)
+        assert created.scratch.shape == (8_111_360,)
         assert created.scratch.dtype == torch.uint8
         assert created.collective_buffer.shape == (128, 10752)
         assert created.collective_buffer.dtype == torch.bfloat16

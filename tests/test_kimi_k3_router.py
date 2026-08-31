@@ -22,7 +22,7 @@ KIMI_K3_MAX_TOKENS = 128
 KIMI_K3_MAX_ROUTES = KIMI_K3_MAX_TOKENS * KIMI_K3_TOPK
 KIMI_K3_CAPACITY_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128)
 SCRATCH_ALIGNMENT = 256
-NUM_PHASE_COUNTERS = 64
+NUM_PHASE_COUNTERS = 128
 
 _ROUTE_AND_PROJECT_ARGUMENTS = (
     "hidden_states",
@@ -313,7 +313,7 @@ def test_workspace_bytes_matches_the_documented_scratch_layout(
 ) -> None:
     from mok import _C
 
-    assert SCRATCH_BYTES == 8_111_104
+    assert SCRATCH_BYTES == 8_111_360
     assert _C.kimi_k3_decode_workspace_bytes() == SCRATCH_BYTES
     assert SCRATCH_LAYOUT["phase"][0] == 0
     assert SCRATCH_LAYOUT["expert_ids"][0] * 4 % SCRATCH_ALIGNMENT == 0
@@ -322,16 +322,16 @@ def test_workspace_bytes_matches_the_documented_scratch_layout(
     assert SCRATCH_LAYOUT["offsets"][0] * 4 % SCRATCH_ALIGNMENT == 0
     assert SCRATCH_LAYOUT["assignment_tokens"][0] * 4 % SCRATCH_ALIGNMENT == 0
     assert SCRATCH_LAYOUT["assignment_slots"][0] * 4 % SCRATCH_ALIGNMENT == 0
-    assert SCRATCH_LAYOUT["latent_mxfp8"][0] * 4 == 40_448
-    assert SCRATCH_LAYOUT["latent_scale"][0] * 4 == 499_200
-    assert SCRATCH_LAYOUT["situ_mxfp8"][0] * 4 == 513_536
-    assert SCRATCH_LAYOUT["situ_scale"][0] * 4 == 1_299_968
-    assert SCRATCH_LAYOUT["routed_accumulator"][0] * 4 == 1_324_544
-    assert SCRATCH_LAYOUT["shared_gate"][0] * 4 == 4_994_560
-    assert SCRATCH_LAYOUT["shared_up"][0] * 4 == 5_191_168
-    assert SCRATCH_LAYOUT["shared_activated"][0] * 4 == 5_387_776
-    assert SCRATCH_LAYOUT["tail_normalized"][0] * 4 == 5_584_384
-    assert SCRATCH_LAYOUT["tail_shared_shard"][0] * 4 == 6_501_888
+    assert SCRATCH_LAYOUT["latent_mxfp8"][0] * 4 == 40_704
+    assert SCRATCH_LAYOUT["latent_scale"][0] * 4 == 499_456
+    assert SCRATCH_LAYOUT["situ_mxfp8"][0] * 4 == 513_792
+    assert SCRATCH_LAYOUT["situ_scale"][0] * 4 == 1_300_224
+    assert SCRATCH_LAYOUT["routed_accumulator"][0] * 4 == 1_324_800
+    assert SCRATCH_LAYOUT["shared_gate"][0] * 4 == 4_994_816
+    assert SCRATCH_LAYOUT["shared_up"][0] * 4 == 5_191_424
+    assert SCRATCH_LAYOUT["shared_activated"][0] * 4 == 5_388_032
+    assert SCRATCH_LAYOUT["tail_normalized"][0] * 4 == 5_584_640
+    assert SCRATCH_LAYOUT["tail_shared_shard"][0] * 4 == 6_502_144
 
 
 @pytest.mark.parametrize("tokens", [1, 8, 16, 128])

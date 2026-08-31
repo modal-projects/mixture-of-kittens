@@ -137,7 +137,14 @@ def test_readiness_pipeline_is_the_only_production_instantiation() -> None:
     assert "template<bool TENSOR_PATH>" in persistent
     assert "GATE_UP_GROUP_SIZE" not in persistent
     assert "PIPELINE_GATE_UP_DOWN" not in persistent
-    assert kernel.count("routed_gate_up_unit(") == 1
+    # The gate/up phase is the fused-W13 engine and nothing else can be reached
+    # from here: the template argument that once chose between candidates is
+    # gone, and so is the unit it chose between them and.
+    assert kernel.count(
+        "expert_mxfp4::fused_w13::routed_gate_up_fused_unit("
+    ) == 1
+    assert "expert_mxfp4::routed_gate_up_unit(" not in kernel
+    assert "ENGINE" not in persistent
     assert kernel.count("grouped_down_unit(") == 1
     assert "grouped_gate_up_unit(" not in kernel
     assert "routed_down_unit(" not in kernel
@@ -164,16 +171,26 @@ def test_production_pipeline_uses_dependency_readiness_without_deadlock() -> Non
     assert "kGateUpArrivals" in persistent
     assert "publish_count_at(" in sync
     assert "wait_for_count_at(" in sync
-    assert "publish_count_at(&scratch.expert_counts[expert])" in kernel
     assert "&scratch.expert_counts[expert]" in kernel
-    assert "kGateUpTiles" in kernel
+    # One claim per expert, six arrivals per expert. The claim count is what the
+    # queue is as long as; the arrival count is what the down phase waits for,
+    # and the two are separate constants because they are separate facts.
+    assert "kGateUpUnitsPerExpert = 1;" in persistent
+    assert "kGateUpArrivalsPerExpert" in persistent
     assert "kErrorPersistentGateUpDownReadiness" in persistent
 
     gate_up = kernel.split("// Phase 3:", 1)[1].split("// Phase 4:", 1)[0]
     down = kernel.split("// Phase 4:", 1)[1].split("// Phase 5:", 1)[0]
+    # The arrivals are published from inside the unit, because the ranges the
+    # down phase waits on complete inside it rather than at its boundary.
     assert gate_up.index("claim_unit_batch(") < gate_up.index(
-        "publish_count_at(&scratch.expert_counts[expert])"
+        "&scratch.expert_counts[expert]"
     )
+    engine = _function_body(
+        _source("expert_mxfp4_fused_w13.cuh"),
+        "void routed_gate_up_fused_unit(",
+    )
+    assert engine.count("persistent::publish_count_at(arrival_counter);") == 1
     assert down.index("wait_for_count_at(") < down.index(
         "grouped_down_unit("
     )
