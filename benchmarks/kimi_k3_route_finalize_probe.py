@@ -496,9 +496,7 @@ def _run(output: Path, samples: int, repeats: int) -> None:
                     graphs[label] = graph
                     validations[label] = validation
 
-                case_repeats = (
-                    repeats if case.name in PRIMARY_MODES else 1
-                )
+                case_repeats = repeats
                 timings, improvement_pct = _measure_interleaved(
                     graphs, workspaces, device, samples, case_repeats
                 )
