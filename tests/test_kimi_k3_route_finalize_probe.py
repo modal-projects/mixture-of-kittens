@@ -66,6 +66,8 @@ def test_candidate_probe_contains_every_required_gate() -> None:
     assert "DEFAULT_REPEATS = 5" in probe
     assert "PRIMARY_MODES = (\"maximally_disjoint\",)" in probe
     assert "PROFILE_TOKENS = (16, 32, 128)" in probe
+    assert "case_repeats = repeats" in probe
+    assert "repeats if case.name in PRIMARY_MODES else 1" not in probe
     assert "runtime.decode_reference" in probe
     assert "runtime.assert_decode_close" in probe
     assert "profiled_kernel_names" in probe
