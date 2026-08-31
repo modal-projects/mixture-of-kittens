@@ -74,3 +74,9 @@ def test_candidate_probe_contains_every_required_gate() -> None:
     assert "minimum_m16_improvement_pct=8.0" in probe
     assert "minimum_m128_improvement_pct=0.0" in probe
     assert "sanitize_kimi_k3_route_finalize" in modal
+    assert '"route-finalize variant entry"' in probe
+    assert '"route-finalize eager launch complete"' in probe
+    assert '"route-finalize variant validation complete"' in probe
+    assert "check=False" in modal
+    assert '"exit_code": completed.returncode' in modal
+    assert "debug_log.exists()" in modal
