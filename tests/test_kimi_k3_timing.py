@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from . import modal_sources
+
 
 def test_percentile_uses_linear_interpolation() -> None:
     timing = importlib.import_module("benchmarks.kimi_k3_timing")
@@ -241,7 +243,7 @@ def test_archive_bytes_ignore_source_metadata(tmp_path: Path) -> None:
 
 
 def test_modal_exposes_exact_tp8_b300_decode_entrypoints() -> None:
-    source = (Path(__file__).parents[1] / "modal_app.py").read_text()
+    source = modal_sources.read()
     build_files = source.split("BUILD_FILES =", 1)[1].split(
         "REMOTE_ROOT =", 1
     )[0]
@@ -252,9 +254,11 @@ def test_modal_exposes_exact_tp8_b300_decode_entrypoints() -> None:
     assert source.count('gpu="B300:8"') >= 2
     assert '"--nproc-per-node=8"' in source
     assert "MOK_GIT_SHA" not in builder
-    assert '"modal_app.py"' not in build_files
+    # Orchestration is added after the compile layer, so editing it reuses the
+    # cached CUDA build instead of recompiling the extension.
+    assert "ORCHESTRATION_FILES" not in build_files
     assert builder.index(".run_commands(") < builder.index(
-        '"modal_app.py"',
+        "ORCHESTRATION_FILES",
         builder.index(".run_commands("),
     )
     assert "return first_archive" in source

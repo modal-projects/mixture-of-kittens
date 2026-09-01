@@ -43,6 +43,7 @@ from .kimi_k3_decode_support import (
     _synchronize_ranks,
     assert_decode_close,
     assert_identical_across_ranks,
+    assert_one_production_launch,
     barrier_schedule,
     decode_reference,
     decode_step as _decode,
@@ -733,33 +734,90 @@ def test_random_jitter_between_launches_does_not_change_the_answer(
 def test_the_dependency_local_schedule_is_what_a_decode_step_runs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Promotion is a default, so the default is what gets asserted.
+    """A decode step runs it, and the barrier schedule is benchmark-only.
 
-    A process that has set nothing runs the dependency-local schedule, and it
-    does so with no environment variable set: gating the promoted schedule
-    behind the benchmark guard would mean production could not reach the
-    schedule it was promoted to. The barrier schedule is still selectable, which
-    is what the A/B and the equality tests need, and selecting it is an explicit
-    act rather than a side effect of an unset variable.
+    The default is the promoted schedule, and reaching the other one is guarded
+    exactly like the grid override, the phase clocks and the gate/up engine. The
+    reason is the adaptive integration rather than the promotion: the barrier
+    schedule launches `kimi_k3_decode_persistent_kernel`, which is compiled
+    against the resident two-stage ring, so an unguarded write to this switch
+    routes a public decode through both retired paths at once.
 
-    The grid override keeps its own guard. That it is unset throughout here is
-    the point: the two switches are independent now, and only one of them is
-    still benchmark-only.
+    So the guard is read on every query rather than only on the write. A process
+    that selected the barrier schedule and then dropped the variable is back on
+    the dependency-local schedule, which makes the stored value irrelevant to
+    production rather than merely usually-correct.
     """
     monkeypatch.delenv("MOK_KIMI_K3_ENABLE_GRID_TUNING", raising=False)
+    assert _C._kimi_k3_decode_dependency_schedule(), (
+        "a process that has set nothing must be on the promoted schedule"
+    )
+    with pytest.raises(RuntimeError, match="benchmark-only"):
+        _C._kimi_k3_decode_set_dependency_schedule(False)
+
+    monkeypatch.setenv("MOK_KIMI_K3_ENABLE_GRID_TUNING", "1")
     previous = _C._kimi_k3_decode_dependency_schedule()
     try:
-        assert previous, "a fresh process must already be on the new schedule"
-
         _C._kimi_k3_decode_set_dependency_schedule(False)
+        assert not _C._kimi_k3_decode_dependency_schedule()
+
+        # The write stands and the guard is what hides it: dropping the variable
+        # while the storage still says "barrier" reads back as the promoted
+        # schedule, and setting it again reveals the value that was never lost.
+        monkeypatch.delenv("MOK_KIMI_K3_ENABLE_GRID_TUNING")
+        assert _C._kimi_k3_decode_dependency_schedule()
+        monkeypatch.setenv("MOK_KIMI_K3_ENABLE_GRID_TUNING", "1")
         assert not _C._kimi_k3_decode_dependency_schedule()
 
         _C._kimi_k3_decode_set_dependency_schedule(True)
         assert _C._kimi_k3_decode_dependency_schedule()
-
-        # Unsetting the benchmark guard cannot take the schedule away, which is
-        # the behaviour that changed: it used to force production.
-        monkeypatch.delenv("MOK_KIMI_K3_ENABLE_GRID_TUNING", raising=False)
-        assert _C._kimi_k3_decode_dependency_schedule()
     finally:
+        _C._kimi_k3_decode_set_dependency_schedule(previous)
+
+
+def test_an_unguarded_step_cannot_reach_the_barrier_schedule_once_set(
+    workspace: KimiK3DecodeWorkspace,
+    weights: KimiK3DecodeWeights,
+    tp8_context: tuple[int, int, torch.device],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The leak this closes, checked on the device rather than on the reader.
+
+    A benchmark process selects the barrier schedule and then drops the guard --
+    which is what happens the moment a harness returns, or a `with` block exits,
+    or a captured graph is replayed by something else. What the next public
+    decode must launch is the dependency-local kernel with production's engine,
+    and it must launch nothing else. Asking the reader is not enough here: the
+    reader is the thing under test, so the profiler is what answers.
+
+    The stored value is deliberately left saying "barrier" for the unguarded
+    launch, because a test that put it back first would be checking the manager
+    rather than the guard.
+    """
+    _, _, device = tp8_context
+    hidden = hidden_states(device, TENSOR_TOKENS)
+    expected = decode_reference(hidden, weights)
+
+    monkeypatch.setenv("MOK_KIMI_K3_ENABLE_GRID_TUNING", "1")
+    previous = _C._kimi_k3_decode_dependency_schedule()
+    try:
+        _C._kimi_k3_decode_set_dependency_schedule(False)
+        assert not _C._kimi_k3_decode_dependency_schedule()
+
+        monkeypatch.delenv("MOK_KIMI_K3_ENABLE_GRID_TUNING")
+        # Warm up under the same conditions as the profiled launch, so lazy
+        # initialization is not what the profiler sees.
+        _decode(workspace, weights, hidden)
+        _synchronize_ranks(workspace)
+        names = profiled_kernel_names(
+            lambda: kimi_k3_decode(CONFIG, workspace, weights, hidden)
+        )
+        # Exactly one launch, of the dependency-local schedule, compiled with
+        # production's gate/up engine -- the barrier kernel's absence is checked
+        # by name too, because it is the one this switch could have reached.
+        assert_one_production_launch(names)
+        assert not [name for name in names if PRODUCTION_KERNEL in name], names
+        assert_decode_close(_decode(workspace, weights, hidden), expected)
+    finally:
+        monkeypatch.setenv("MOK_KIMI_K3_ENABLE_GRID_TUNING", "1")
         _C._kimi_k3_decode_set_dependency_schedule(previous)

@@ -27,6 +27,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from benchmarks import kimi_k3_launch_names as launch_names
 from mok import _C
 from mok.kimi_k3 import (
     KIMI_K3_HIDDEN_SIZE,
@@ -108,8 +109,16 @@ PRIVATE_STAGE_KERNELS = (
 # same 148-CTA grid, so every "one launch, and none of the private stages" test
 # reads the same either way. The barrier schedule is still reachable through the
 # schedule switch, and `BARRIER_SCHEDULE_KERNEL` is what it is called there.
-PERSISTENT_KERNEL = "kimi_k3_decode_dependency_local_kernel"
-BARRIER_SCHEDULE_KERNEL = "kimi_k3_decode_persistent_kernel"
+#
+# A substring of the schedule's name is not enough on its own, because the
+# schedule carries the gate/up engine as a template argument and each engine is
+# its own `__global__`. `assert_one_production_launch` reads that argument and
+# refuses anything but production's, which is what keeps a benchmark process
+# that left an arm selected from passing a one-launch test.
+PERSISTENT_KERNEL = launch_names.DEPENDENCY_LOCAL_KERNEL
+BARRIER_SCHEDULE_KERNEL = launch_names.BARRIER_SCHEDULE_KERNEL
+assert_one_production_launch = launch_names.assert_one_production_launch
+is_production_launch = launch_names.is_production_launch
 
 # Enough experts to keep the oracle's weight traffic bounded without making its
 # Python loop the cost of the suite.
@@ -146,40 +155,96 @@ SCHEDULE_QUEUES = 7
 
 
 @contextlib.contextmanager
+def benchmark_guard() -> Iterator[None]:
+    """Hold the guard for a block, and pin the switches the block did not ask for.
+
+    Every private switch reads `MOK_KIMI_K3_ENABLE_GRID_TUNING` on every query
+    rather than only on the write, which is what makes a process that dropped the
+    variable launch production. So a block that wants a switch in effect at the
+    *launch* has to hold the variable across the launch and not merely across the
+    setter.
+
+    Which means holding it un-hides every other switch at the same time, and that
+    is not something the caller asked for. Two of them reach the launch
+    configuration itself: `decode_step.cuh` reads the grid override and the phase
+    profile flag when it builds the launch, so a test that left either dirty --
+    relying, correctly under the old rules, on the guard being unset to hide it --
+    would hand its value to the next schedule manager's launch. That is not
+    hypothetical: `test_the_benchmark_grid_override_cannot_leak_into_production`
+    leaves the storage on the smallest candidate grid, and the first barrier
+    schedule launch after it wedged its grid barrier and took the watchdog's trap.
+
+    So the manager that holds the guard owns them, and pins both to production for
+    the block. The gate/up engine is deliberately not pinned: it selects a compiled
+    arm rather than the launch geometry, and `selected_engine` is a manager in its
+    own right that callers compose with this one.
+    """
+    previous = os.environ.get("MOK_KIMI_K3_ENABLE_GRID_TUNING")
+    os.environ["MOK_KIMI_K3_ENABLE_GRID_TUNING"] = "1"
+    try:
+        grid = _C._kimi_k3_decode_benchmark_grid()
+        profile = _C._kimi_k3_decode_phase_profile()
+        _C._kimi_k3_decode_set_benchmark_grid(PERSISTENT_CTAS)
+        _C._kimi_k3_decode_set_phase_profile(False)
+        try:
+            yield
+        finally:
+            _C._kimi_k3_decode_set_benchmark_grid(grid)
+            _C._kimi_k3_decode_set_phase_profile(profile)
+    finally:
+        if previous is None:
+            os.environ.pop("MOK_KIMI_K3_ENABLE_GRID_TUNING", None)
+        else:
+            os.environ["MOK_KIMI_K3_ENABLE_GRID_TUNING"] = previous
+
+
+@contextlib.contextmanager
 def dependency_local_schedule() -> Iterator[None]:
     """Select the dependency-local schedule, restoring what was there before.
 
-    Restoring rather than clearing, because since promotion this schedule is the
-    default: a manager that cleared to the barrier schedule on the way out would
-    hand it to every launch downstream of the block it was scoping.
+    Restoring rather than clearing, because this schedule is what a decode step
+    launches: a manager that cleared to the barrier schedule on the way out
+    would hand it to every launch downstream of the block it was scoping.
+
+    The guard is held across the block even though this is the schedule an
+    unguarded read returns anyway, so that the two managers are the same shape
+    and neither is relying on the default to do its work.
     """
-    previous = _C._kimi_k3_decode_dependency_schedule()
-    _C._kimi_k3_decode_set_dependency_schedule(True)
-    try:
-        yield
-    finally:
-        _C._kimi_k3_decode_set_dependency_schedule(previous)
+    with benchmark_guard():
+        previous = _C._kimi_k3_decode_dependency_schedule()
+        _C._kimi_k3_decode_set_dependency_schedule(True)
+        try:
+            yield
+        finally:
+            _C._kimi_k3_decode_set_dependency_schedule(previous)
 
 
 @contextlib.contextmanager
 def barrier_schedule() -> Iterator[None]:
     """Select the retained barrier schedule, restoring what was there before.
 
-    The schedule production ran before promotion. It is kept because it is the
-    other half of the A/B and because the equality tests compare against it: two
-    schedules that must agree bit for bit is a much stronger statement than one
-    schedule that agrees with the oracle inside a tolerance.
+    The schedule production ran before promotion, compiled against the resident
+    two-stage ring. It is kept because it is the other half of the A/B and
+    because the equality tests compare against it: two schedules that must agree
+    bit for bit is a much stronger statement than one schedule that agrees with
+    the oracle inside a tolerance.
+
+    It is reachable only behind the benchmark guard, which the manager holds for
+    the whole block rather than only around the setter -- the reader consults the
+    guard at launch, so a block that dropped it would silently be measuring the
+    dependency-local schedule under the barrier schedule's name.
 
     Both managers live here rather than in the suite that measures the schedules,
-    because since promotion every suite that wants one schedule in particular has
-    to say so, and a test that leaves it to the default is one-sided.
+    because every suite that wants one schedule in particular has to say so, and
+    a test that leaves it to the default is one-sided.
     """
-    previous = _C._kimi_k3_decode_dependency_schedule()
-    _C._kimi_k3_decode_set_dependency_schedule(False)
-    try:
-        yield
-    finally:
-        _C._kimi_k3_decode_set_dependency_schedule(previous)
+    with benchmark_guard():
+        previous = _C._kimi_k3_decode_dependency_schedule()
+        _C._kimi_k3_decode_set_dependency_schedule(False)
+        try:
+            yield
+        finally:
+            _C._kimi_k3_decode_set_dependency_schedule(previous)
 
 
 def schedule_queue_tickets(workspace_scratch: torch.Tensor) -> list[int]:

@@ -120,15 +120,27 @@ def dependency_local_schedule(enabled: bool) -> Iterator[None]:
 
     Restores whatever was selected before rather than forcing a value on the way
     out. Clearing to ``False`` was right while the dependency-local schedule was
-    opt-in; now that it is the default, a harness that captured one graph under
+    opt-in; now that it is what launches, a harness that captured one graph under
     this manager would hand the barrier schedule to everything after it.
+
+    The selector is benchmark-only, so the guard is held for the whole block: the
+    reader consults it at launch, and a capture that dropped it would record the
+    dependency-local schedule under whichever name the caller asked for.
     """
-    previous = _C._kimi_k3_decode_dependency_schedule()
-    _C._kimi_k3_decode_set_dependency_schedule(enabled)
+    previous_guard = os.environ.get("MOK_KIMI_K3_ENABLE_GRID_TUNING")
+    os.environ["MOK_KIMI_K3_ENABLE_GRID_TUNING"] = "1"
     try:
-        yield
+        previous = _C._kimi_k3_decode_dependency_schedule()
+        _C._kimi_k3_decode_set_dependency_schedule(enabled)
+        try:
+            yield
+        finally:
+            _C._kimi_k3_decode_set_dependency_schedule(previous)
     finally:
-        _C._kimi_k3_decode_set_dependency_schedule(previous)
+        if previous_guard is None:
+            os.environ.pop("MOK_KIMI_K3_ENABLE_GRID_TUNING", None)
+        else:
+            os.environ["MOK_KIMI_K3_ENABLE_GRID_TUNING"] = previous_guard
 
 
 def schedule_edge_cycles(

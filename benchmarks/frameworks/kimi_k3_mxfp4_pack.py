@@ -41,17 +41,19 @@ from benchmarks.frameworks.kimi_k3_mxfp4_cases import (
     build_case,
     count_zero_groups,
 )
-from modal_app import IMAGE as MOK_IMAGE_BASE
-from modal_app import SPEC
+from modal_images import IMAGE as MOK_IMAGE_BASE
+from modal_images import ORCHESTRATION_FILES, SPEC
 
 app = modal.App("k3-mxfp4-pack")
 volume = modal.Volume.from_name("k3-mxfp4-crosscheck", create_if_missing=True)
 BRIDGE = "/bridge"
 
-# Appended after the cached compile layer, so this only adds modal_app.py itself.
-MOK_IMAGE = MOK_IMAGE_BASE.add_local_file(
-    REPO_ROOT / "modal_app.py", remote_path="/root/mok/modal_app.py", copy=True
-)
+# Appended after the cached compile layer, so this only re-adds orchestration.
+MOK_IMAGE = MOK_IMAGE_BASE
+for _file in ORCHESTRATION_FILES:
+    MOK_IMAGE = MOK_IMAGE.add_local_file(
+        REPO_ROOT / _file, remote_path=f"/root/mok/{_file}", copy=True
+    )
 
 
 @app.function(image=MOK_IMAGE, gpu=SPEC.gpu, timeout=3600, volumes={BRIDGE: volume})

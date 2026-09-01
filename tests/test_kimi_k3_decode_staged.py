@@ -45,6 +45,7 @@ from .kimi_k3_decode_support import (
     decode_reference,
     decode_step,
     hidden_states,
+    is_production_launch,
     profiled_kernel_names,
     weights,  # noqa: F401
     workspace,  # noqa: F401
@@ -275,7 +276,9 @@ def test_one_launch_is_measured_against_a_four_launch_control(
     assert len(staged_names) > REPEATS, staged_names
 
     assert not _stage_kernels(production_names), production_names
-    assert all(PERSISTENT_KERNEL in name for name in production_names), (
+    # Every one of them production's own instantiation, not merely the
+    # dependency-local schedule under some engine.
+    assert all(is_production_launch(name) for name in production_names), (
         production_names
     )
     assert 0 < len(production_names) <= REPEATS, production_names

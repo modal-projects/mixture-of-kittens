@@ -35,9 +35,10 @@ from pathlib import Path
 
 import pytest
 
+from . import kimi_k3_decode_sources as decode_sources
+from . import modal_sources
 from .kimi_k3_w13_contract import CHECKS, RESULT_MARKER
 
-_CSRC = Path(__file__).resolve().parent.parent / "csrc" / "kimi_k3_decode"
 _REPO = Path(__file__).resolve().parent.parent
 
 
@@ -124,7 +125,7 @@ def test_the_c_entrypoint_validates_the_fused_shapes_from_the_engine() -> None:
     the boundary, and the only figures that can do that are the ones the
     descriptor is built from.
     """
-    source = (_CSRC / "entrypoints.cuh").read_text()
+    source = decode_sources.read("entrypoints.cuh")
     body = _body(source, "static __host__ persistent::LaunchArguments decode_launch_arguments(")
     assert "expert_w1_" not in body
     assert "expert_w3_" not in body
@@ -151,7 +152,7 @@ def test_the_kernel_reaches_only_the_fused_gate_up_unit() -> None:
     unconditional -- there is no longer a value of anything that could reach a
     different gate/up unit.
     """
-    source = (_CSRC / "persistent_kernel.cuh").read_text()
+    source = decode_sources.read("persistent_kernel.cuh")
     assert "ENGINE" not in source, "the engine selector must be gone"
     assert "expert_mxfp4::routed_gate_up_unit(" not in source, (
         "the superseded gate/up unit must not be reachable from the kernel"
@@ -177,7 +178,7 @@ def test_the_queue_claims_one_unit_per_expert_and_publishes_six_arrivals(
     once and publishes six, and the two numbers are named separately rather than
     one being reused for the other.
     """
-    source = (_CSRC / "persistent_kernel.cuh").read_text()
+    source = decode_sources.read("persistent_kernel.cuh")
     assert "inline constexpr int kGateUpUnitsPerExpert = 1;" in source
     assert re.search(
         r"inline constexpr int kGateUpArrivalsPerExpert =\s*"
@@ -197,7 +198,7 @@ def test_the_queue_claims_one_unit_per_expert_and_publishes_six_arrivals(
 
     # And the unit's own publishing has to be one arrival per finished range, on
     # the pass that finished it.
-    engine = (_CSRC / "expert_mxfp4_fused_w13.cuh").read_text()
+    engine = decode_sources.read("expert_mxfp4_fused_w13.cuh")
     body = _body(engine, "static __device__ void routed_gate_up_fused_unit(")
     assert body.count("persistent::publish_count_at(arrival_counter);") == 1, (
         "the unit must publish from exactly one place, inside the task loop"
@@ -219,7 +220,7 @@ def test_the_ring_is_armed_once_per_cta_and_never_re_armed_per_unit() -> None:
     corner case but the common one: measured on B300 at a shallower depth it
     deadlocked every unit after a CTA's first.
     """
-    engine = (_CSRC / "expert_mxfp4_fused_w13.cuh").read_text()
+    engine = decode_sources.read("expert_mxfp4_fused_w13.cuh")
     signature = "static __device__ void routed_gate_up_fused_unit("
     assert "const bool first_unit" in engine
     body = _body(engine, signature)
@@ -237,7 +238,7 @@ def test_the_ring_is_armed_once_per_cta_and_never_re_armed_per_unit() -> None:
     assert "stream_parity[0] = arrived_phase" in body
     assert "stream_parity[1] = retired_phase" in body
 
-    kernel = (_CSRC / "persistent_kernel.cuh").read_text()
+    kernel = decode_sources.read("persistent_kernel.cuh")
     assert "bool first_unit = true;" in kernel, (
         "the flag must be a CTA-lifetime local of the persistent kernel"
     )
@@ -261,7 +262,7 @@ def test_only_warp_zero_reads_the_carried_parity() -> None:
     ranks. The reads were dead, so the numbers were never wrong, but an
     unsynchronised shared access is a hazard whether or not it is benign.
     """
-    engine = (_CSRC / "expert_mxfp4_fused_w13.cuh").read_text()
+    engine = decode_sources.read("expert_mxfp4_fused_w13.cuh")
     body = _body(engine, "static __device__ void routed_gate_up_fused_unit(")
 
     # Every read of the carried parity must sit inside a warp-0 guard, and that
@@ -309,7 +310,7 @@ def test_the_gather_runs_once_per_pass_ahead_of_the_six_tasks() -> None:
     issues -- 42 gathers where seven exist -- which is exactly the cost this
     shape removed.
     """
-    engine = (_CSRC / "expert_mxfp4_fused_w13.cuh").read_text()
+    engine = decode_sources.read("expert_mxfp4_fused_w13.cuh")
     body = _body(engine, "static __device__ void routed_gate_up_fused_unit(")
     assert body.count("stage_fused_unit_activation(") == 1, (
         "the unit must stage its activation from exactly one place"
@@ -327,35 +328,69 @@ def test_the_gather_runs_once_per_pass_ahead_of_the_six_tasks() -> None:
 
 
 def test_no_benchmark_only_fused_switch_survives_in_public_surface() -> None:
-    """The engine selector, its process guard, and its private launcher are gone.
+    """The V1/V2/V3-era selector and its private launcher are gone for good.
 
-    While three candidates existed they were reached from a guarded private
-    entrypoint. Production runs one of them now, so none of that machinery has a
-    caller, and a switch with no caller is a switch that can be flipped.
+    While three candidates existed they were reached from a private entrypoint
+    of their own, with a process guard of their own. Production runs one of
+    them now, so that entrypoint and that guard have no caller, and a switch
+    with no caller is a switch that can be flipped.
+
+    The A/B's baseline may still name an engine in C++ -- it is a template
+    argument -- but only behind the grid-tuning guard, which
+    `test_the_baseline_gate_up_engine_cannot_leak_into_production` holds. What
+    may never come back is the machinery below, and what may never name an
+    engine at all is the Python surface: an engine reachable from `mok` would be
+    a switch a caller could flip without setting anything.
+
+    Production is `kEngineFusedAdaptive`, and it is what a process that has set
+    nothing launches. That is the sense in which its two rings are not switches:
+    the selector production reads is `batch_rows` inside the kernel, neither ring
+    has an id, and no host-side name reaches either.
     """
-    forbidden = (
+    retired = (
         "kFusedW13BenchmarkGuard",
         "fused_w13_benchmark_enabled",
         "launch_decode_fused_w13_benchmark",
         "kimi_k3_decode_fused_w13_benchmark",
         "kEngineFusedTask",
-        "kEngineFusedExpert",
         "kEngineFusedPacked",
         "kEngineProduction",
+        # The two rings' own ids, and the predicates that told them apart. They
+        # existed while the four-shape A/B was measuring them against each other
+        # and against the resident ring. The selector runs both now, so an id for
+        # either is a second way into code that already runs on every step.
+        "kEngineFusedSlabMajor",
+        "kEngineFusedCompact",
+        "engine_is_slab_buffered",
+        "engine_is_compact",
+        "engine_holds_slab_ring",
+        "engine_holds_compact_ring",
     )
-    for module in (
-        "csrc/bindings.cu",
-        "csrc/kimi_k3_decode/entrypoints.cuh",
-        "csrc/kimi_k3_decode/expert_mxfp4_fused_w13.cuh",
-        "csrc/kimi_k3_decode/persistent_kernel.cuh",
-        "mok/kimi_k3.py",
-        "mok/ops.py",
-        "mok/_fake_impls.py",
-        "modal_app.py",
-    ):
+    # Every decode header, parts included, and every module of the package that
+    # could reach one. Sweeping whole directories rather than naming files is
+    # what keeps a retired switch from reappearing where nobody listed it.
+    package = sorted(path.relative_to(_REPO) for path in (_REPO / "mok").glob("*.py"))
+    modules = (
+        [
+            f"csrc/kimi_k3_decode/{decode_sources.name(path)}"
+            for path in decode_sources.headers()
+        ]
+        + [str(path) for path in package]
+        + [str(path.relative_to(_REPO)) for path in modal_sources.files()]
+        + ["csrc/bindings.cu"]
+    )
+    for module in modules:
         source = (_REPO / module).read_text()
-        for name in forbidden:
-            assert name not in source, (module, name)
+        for name in retired:
+            # Whole identifiers, because `kEngineFusedTask` would otherwise
+            # match an engine named for a loop order rather than V1's retired
+            # one.
+            assert re.search(rf"\b{name}\b", source) is None, (module, name)
+
+    for path in package:
+        source = (_REPO / path).read_text()
+        assert "kEngine" not in source, str(path)
+        assert "gate_up_engine" not in source, str(path)
 
 
 def test_the_bounded_layout_probe_has_a_caller() -> None:
@@ -366,7 +401,7 @@ def test_the_bounded_layout_probe_has_a_caller() -> None:
     worth compiling if something calls it, so the call is asserted here rather
     than left to whoever next reads the header.
     """
-    engine = (_CSRC / "expert_mxfp4_fused_w13.cuh").read_text()
+    engine = decode_sources.read("expert_mxfp4_fused_w13.cuh")
     bindings = (_REPO / "csrc" / "bindings.cu").read_text()
     assert "kimi_k3_fused_w13_tma_probe_entrypoint" in engine
     assert "_kimi_k3_fused_w13_tma_probe" in bindings
@@ -386,7 +421,7 @@ def test_the_phase_clocks_carry_the_gate_up_subphases_durably() -> None:
     ``PhaseClocks`` every other phase uses, so it is off unless a profiled
     launch turned the whole band on.
     """
-    types_source = (_CSRC / "types.cuh").read_text()
+    types_source = decode_sources.read("types.cuh")
     for clock in (
         "kClockRoutedGateUpTmaIssue",
         "kClockRoutedGateUpTmaWait",
@@ -402,7 +437,7 @@ def test_the_phase_clocks_carry_the_gate_up_subphases_durably() -> None:
             clock.replace("kClock", "") in types_source
         ), clock
 
-    engine = (_CSRC / "expert_mxfp4_fused_w13.cuh").read_text()
+    engine = decode_sources.read("expert_mxfp4_fused_w13.cuh")
     body = _body(engine, "static __device__ void routed_gate_up_fused_unit(")
     for clock in (
         "kClockRoutedGateUpTmaIssue",

@@ -71,6 +71,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("_kimi_k3_decode_wait_timeout_clocks", []() {
         return kimi_k3_decode::persistent::kWaitTimeoutClocks;
     });
+    // The budget as compiled, broken into what production ships and what this
+    // build scaled it by. A sanitizer image raises the scale so racecheck can
+    // reach a verdict about races rather than about the watchdog; every other
+    // image must report a scale of one.
+    m.def("_kimi_k3_decode_wait_timeout_budget", []() {
+        return std::make_tuple(
+            static_cast<std::int64_t>(serial_sync::kWaitTimeoutBaseClocks),
+            static_cast<std::int64_t>(serial_sync::kWaitTimeoutScale),
+            static_cast<std::int64_t>(serial_sync::kWaitTimeoutClocks));
+    });
     m.def("_kimi_k3_timeout_sites", []() {
         std::vector<std::tuple<std::string, std::int64_t, std::int64_t,
                                std::int64_t>> sites;
@@ -106,10 +116,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "", pybind11::arg("enabled"));
     m.def("_kimi_k3_decode_dependency_schedule",
           &kimi_k3_decode::persistent::dependency_schedule_for_testing);
+    m.def("_kimi_k3_decode_set_gate_up_engine",
+          &kimi_k3_decode::persistent::set_gate_up_engine_for_testing, "",
+          pybind11::arg("engine"));
+    m.def("_kimi_k3_decode_gate_up_engine",
+          &kimi_k3_decode::persistent::gate_up_engine_for_testing);
+    m.def("_kimi_k3_decode_gate_up_engine_ledger",
+          &kimi_k3_decode::persistent::gate_up_engine_ledger_for_testing, "",
+          pybind11::arg("engine"));
     m.def("_kimi_k3_decode_schedule_resident_blocks_per_sm",
           &kimi_k3_decode::persistent::
               schedule_resident_blocks_per_sm_for_testing,
-          "", pybind11::arg("tensor_path"));
+          "", pybind11::arg("tensor_path"),
+          pybind11::arg("engine") =
+              kimi_k3_decode::expert_mxfp4::fused_w13::kEngineFusedAdaptive);
     m.def("_kimi_k3_decode_schedule_edges",
           &kimi_k3_decode::persistent::schedule::schedule_edges_for_testing);
     m.def("_kimi_k3_decode_schedule_edge_diagnostics",

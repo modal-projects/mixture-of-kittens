@@ -13,15 +13,24 @@ happened. Two are trimmed, each says so in its own header, and the trimming only
 ever removed lines the parser does not read: host backtrace frames in the
 memcheck capture and blank lines in the racecheck one.
 
-No GPU, no compiled extension, no ``mok`` import.
+No GPU, no compiled extension, no ``mok`` import. The one test here that runs a
+real process tree runs ordinary Python children, because what it checks is the
+orchestration's -- that a tool which outlives its budget takes its descendants
+with it and still leaves a verdict behind.
 """
 
 from __future__ import annotations
 
+import os
 import re
+import signal
+import sys
+import time
 from pathlib import Path
 
 import pytest
+
+from . import modal_sources
 
 from benchmarks.kimi_k3_sanitizer import (
     HOST_ALLOWANCE_PER_RANK,
@@ -372,20 +381,19 @@ def test_every_sanitizer_gate_selects_tests_that_exist_in_its_own_suite() -> Non
         assert tool in ("memcheck", "racecheck", "synccheck", "initcheck")
 
 
-def test_a_tool_left_out_of_the_default_gates_can_still_be_asked_for() -> None:
-    """The tool that cannot finish is the one somebody will want to re-run.
+def test_a_tool_outside_the_default_gates_can_still_be_asked_for() -> None:
+    """A gate's name has to be definable even when it is not a default.
 
-    racecheck is defined and deliberately outside the default set: it completes
-    against the barrier schedule and traps against the dependency-local one, so
-    a default run that included it would be red on every run for a reason that
-    does not change. Which makes it exactly the gate a reader re-runs by name to
-    find out whether it still traps -- and a name check taken against the
-    default set alone would refuse that request as an unknown gate.
+    The default set and the definable set are different things, and conflating
+    them refuses a by-name request for anything outside the defaults as an
+    unknown gate. That mattered while racecheck was outside them and it still
+    has to hold, because the next tool that cannot finish will be asked for the
+    same way.
 
     Read from ``modal_app``'s text rather than by importing it, because this
     file's whole point is to hold without ``modal`` installed.
     """
-    source = (Path(__file__).resolve().parents[1] / "modal_app.py").read_text()
+    source = modal_sources.read()
     body = source[source.index("def verify("):source.index("    functions = {")]
 
     assert "definable = set(K3_GATES) | set(K3_SANITIZER_GATES)" in body
@@ -393,14 +401,310 @@ def test_a_tool_left_out_of_the_default_gates_can_still_be_asked_for() -> None:
     # The shape that was wrong: the default set as the only definition.
     assert "set(requested) - set(K3_GATES)" not in body
 
+
+def test_every_sanitizer_tool_is_a_default_gate_now() -> None:
+    """All three tools run by default, and the image is why.
+
+    racecheck was outside the defaults because the tool's slowdown held a
+    legitimate rendezvous past the watchdog's fifteen seconds, so the gate failed
+    closed on a fact about the watchdog rather than about races -- on every run.
+    A gate that is always red is a gate a reader learns to skip.
+
+    `B300_SANITIZER_IMAGE` compiles the bounded spins with a wider budget, which
+    removes the reason rather than the gate. So the assertion is now that nothing
+    is absent, and that the definition still says why it is safe to have widened
+    anything -- written where the definition is, not somewhere a reader has to
+    go looking.
+    """
+    source = modal_sources.read()
     opened = source.index("K3_GATES = (")
     default = source[opened:source.index("\n)\n", opened)]
     named = set(re.findall(r'^    "([a-z-]+)",$', default, re.M))
     assert named, default
     absent = sorted(set(K3_SANITIZER_GATES) - named)
-    assert absent == ["racecheck"], absent
+    assert absent == [], absent
 
-    # And the reason it is absent is written down where it is absent: the
-    # comment the definition carries, not somewhere a reader has to find.
     reason = source[source.index("#: The gates a default"):opened]
-    assert "racecheck" in reason and "fifteen seconds" in reason, reason
+    assert "B300_SANITIZER_IMAGE" in reason, reason
+    assert "compile-time" in reason, reason
+    assert "fifteen seconds" in reason, reason
+
+
+def test_only_the_sanitizer_image_widens_the_bounded_spin() -> None:
+    """The widened budget may reach the sanitizer gates and nothing else.
+
+    It is compiled in, so an image that carries it is a different binary from
+    the one every other gate measures and ships. Two things keep that from
+    spreading: `build_image` defaults the scale to one, so every image that does
+    not ask gets production's budget; and only the sanitizer function is
+    declared against the widened image.
+    """
+    source = modal_sources.read()
+
+    assert "def build_image(\n    spec: GPUSpec, wait_timeout_scale: int = 1\n)" in source
+    assert 'IMAGE = build_image(SPEC)\n' in source
+    assert 'B300_IMAGE = build_image(SPECS["B300"])\n' in source
+    assert "B300_SANITIZER_IMAGE = build_image(\n" in source
+    assert "wait_timeout_scale=SANITIZER_WAIT_TIMEOUT_SCALE" in source
+
+    # Exactly one function runs in it, and it is the sanitizer one.
+    widened = [
+        block
+        for block in source.split("@app.function(")[1:]
+        if "image=B300_SANITIZER_IMAGE" in block.split(")\n", 1)[0]
+    ]
+    assert len(widened) == 1, len(widened)
+    assert widened[0].split("def ", 1)[1].startswith(
+        "sanitize_kimi_k3_decode("
+    ), widened[0][:200]
+
+
+def test_the_base_the_scale_is_taken_against_is_the_compiled_one() -> None:
+    """The scale multiplies a constant that lives in a header, not here.
+
+    `modal_images` has to state the base to derive a scale from it, and a
+    restated constant is a constant that drifts. The one in `serial_sync.cuh` is
+    the one the device compiles, so it is the one this copy has to equal.
+    """
+    from modal_images import WAIT_TIMEOUT_BASE_CLOCKS
+
+    header = (
+        Path(__file__).resolve().parents[1] / "csrc" / "serial_sync.cuh"
+    ).read_text()
+    declared = re.search(
+        r"kWaitTimeoutBaseClocks = ([\d']+)ULL;", header
+    )
+    assert declared, "the header no longer names a base"
+    assert int(declared.group(1).replace("'", "")) == WAIT_TIMEOUT_BASE_CLOCKS
+
+
+def test_the_sanitizer_gate_times_out_before_its_watchdog_can() -> None:
+    """Under the tool, the gate is the bound and the watchdog is not.
+
+    A watchdog trap and a real hang are indistinguishable to the tool -- both
+    come back as zero hazards for a launch that did not finish -- so the one
+    thing that must not happen under a sanitizer is the watchdog firing first.
+    Five runs were lost to a scale that was picked rather than derived, so the
+    budget is now the gate's whole wall clock counted at a clock ceiling, and
+    this is that ordering as an assertion: whatever the part clocks at, the
+    budget outlasts the gate.
+    """
+    from modal_images import (
+        B300_CLOCK_CEILING_HZ,
+        SANITIZER_GATE_TIMEOUT,
+        SANITIZER_WAIT_TIMEOUT_SCALE,
+        WAIT_TIMEOUT_BASE_CLOCKS,
+    )
+
+    budget = SANITIZER_WAIT_TIMEOUT_SCALE * WAIT_TIMEOUT_BASE_CLOCKS
+    assert budget >= SANITIZER_GATE_TIMEOUT * B300_CLOCK_CEILING_HZ
+
+    source = modal_sources.read()
+    opened = source.index("def sanitize_kimi_k3_decode(")
+    declared = source[source.rindex("@app.function(", 0, opened):opened]
+    assert "timeout=SANITIZER_GATE_TIMEOUT," in declared, declared
+
+
+def test_the_tools_budget_is_what_is_left_of_the_gates() -> None:
+    """Not the gate's timeout less a constant, which is a deadline past Modal's.
+
+    Modal counts a function's timeout from the call, so the image's startup and
+    the imports are spent before the tool starts. A subprocess handed
+    ``GATE - 300`` from four minutes in has a deadline after Modal's, and the
+    container is killed with the tool still running -- which is one eight-hour
+    racecheck run, reported as nothing at all because the artifact is written
+    after the call that never returned.
+
+    So the budget is measured: what remains of the gate at the moment the tool
+    starts, less what writing the artifact needs.
+    """
+    from modal_images import SANITIZER_GATE_TIMEOUT, SANITIZER_TEARDOWN_SECONDS
+
+    assert 0 < SANITIZER_TEARDOWN_SECONDS < SANITIZER_GATE_TIMEOUT
+
+    source = modal_sources.read()
+    opened = source.index("def sanitize_kimi_k3_decode(")
+    body = source[opened:source.index("\n@app.function(", opened)]
+    assert "entered = time.monotonic()" in body
+    assert (
+        "remaining = SANITIZER_GATE_TIMEOUT - (time.monotonic() - entered)"
+        in body
+    )
+    assert "budget = remaining - SANITIZER_TEARDOWN_SECONDS" in body
+    assert "budget=budget" in body
+    # And the constant subtraction that caused it is gone rather than moved.
+    assert "SANITIZER_GATE_TIMEOUT - 300" not in source
+
+
+def test_the_sanitizer_runs_as_its_own_session_and_is_never_run_blocking() -> None:
+    """`subprocess.run(timeout=...)` is the wrong call for this gate, twice.
+
+    It ends only the process it started, and what it starts is
+    `compute-sanitizer`, whose child is a torchrun whose children hold eight
+    devices. And it buffers, so a run that will take eight hours is
+    indistinguishable from one that hung in its first minute -- which is how the
+    last one was watched for eight hours with no output at all.
+
+    So the gate uses the process-group pattern the benchmark gates already use,
+    and this requires the parts of it that matter: its own session, a bounded
+    stream, and the group ended on the way out. The behaviour is checked against a
+    real process tree in
+    `test_a_tool_over_its_budget_takes_its_descendants_and_leaves_a_verdict`;
+    this is the narrower claim that the blocking call is gone from the module
+    rather than moved somewhere else in it.
+    """
+    source = modal_sources.read()
+    opened = source.index("def _run_sanitizer_session(")
+    body = source[opened:source.index("\n@app.function(", opened)]
+
+    assert "subprocess.Popen(" in body
+    assert "start_new_session=True," in body
+    assert "_stream_bounded(" in body
+    assert "_end_session(process)" in body
+    # No sanitizer path may block on a call that cannot reach the ranks. Read
+    # past the docstring, which names the call it replaced. The module's other
+    # `subprocess.run` calls are `cuobjdump` and `nvidia-smi`, which have no
+    # children and no budget.
+    code = body[body.index('"""', body.index('"""') + 3) + 3:]
+    assert "subprocess.run(" not in code
+    # `process.wait(timeout=...)` is fine and is there: it reaps the leader after
+    # its stream closed, and the group is ended if even that runs out.
+    assert "process.wait(timeout=left)" in code
+
+
+def test_a_cut_off_tool_reports_what_it_had_rather_than_raising() -> None:
+    """A `TimeoutExpired` that escapes is a gate that reports nothing.
+
+    The artifact is written after the run, so an exception out of it skips the
+    write entirely: the volume keeps whatever the *previous* run left, and a
+    reader fetching it gets a stale verdict with a plausible timestamp. That is
+    worse than a failure. So the cut-off is returned rather than raised, the
+    partial output is kept and marked partial, and the verdict is reached on it --
+    where the missing summary line makes it fail closed.
+    """
+    source = modal_sources.read()
+    helper = source.index("def _run_sanitizer_session(")
+    helper_body = source[helper:source.index("\n@app.function(", helper)]
+    assert "the output above is partial" in helper_body
+    assert "return 124, output + note, True" in helper_body
+    # Returned, not raised: nothing in the helper raises the cut-off onward.
+    assert "raise subprocess.TimeoutExpired" not in helper_body
+
+    opened = source.index("def sanitize_kimi_k3_decode(")
+    body = source[opened:source.index("\n@app.function(", opened)]
+    assert "verdict = sanitizer_verdict(tool, exit_code, output)" in body
+    # And the timeout is visible in the result rather than only in the log.
+    assert '"timed_out": timed_out,' in body
+
+
+def test_a_partial_run_fails_closed_even_with_no_hazards() -> None:
+    """The verdict on a cut-off run must refuse it, on the tool's own output.
+
+    This is the fail-closed property from finding 1 applied to the new path: the
+    output a killed racecheck leaves has no `RACECHECK SUMMARY` line and no
+    pytest summary, so the verdict has to refuse it on both counts rather than
+    read "no hazards reported" as "no hazards".
+    """
+    partial = (
+        "========= COMPUTE-SANITIZER\n"
+        "tests/test_kimi_k3_adaptive_gate_up.py .\n"
+        "\n========= MoK: racecheck was still running after 28000s and was "
+        "killed; the output above is partial\n"
+    )
+    verdict = sanitizer_verdict("racecheck", 124, partial)
+    assert not verdict.passed
+    reasons = "; ".join(verdict.failures)
+    # Both counts, not either: an exit code outside the permitted set, and no
+    # rank having printed a summary. A run cut off mid-launch fails on both, and
+    # the zero hazards it does report are the absence of a summary line rather
+    # than a finding about the kernel.
+    assert "exited 124" in reasons, reasons
+    assert "pytest summary" in reasons, reasons
+    assert "RACECHECK SUMMARY" not in partial
+
+
+def test_a_tool_over_its_budget_takes_its_descendants_and_leaves_a_verdict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole timeout path, on a real process tree.
+
+    `compute-sanitizer`'s child is a torchrun and a torchrun's children are eight
+    ranks holding eight B300s, so what a timeout has to end is the group and not
+    the process the gate started. `subprocess.run(timeout=...)` ends only the
+    latter, which in a container about to be reused leaves devices nobody owns.
+
+    The stand-in is the same shape: a parent that forks a grandchild ignoring
+    SIGTERM the way a rank inside a driver call effectively does. What is asserted
+    is the three things the gate needs and the old path got wrong -- the
+    grandchild does not survive, the partial output comes back rather than being
+    raised away, and the artifact and the refusal are both produced from it.
+    """
+    from modal_k3_gates import _run_sanitizer_session
+
+    marker = tmp_path / "grandchild.pid"
+    script = (
+        "import subprocess, sys, time\n"
+        "child = subprocess.Popen([\n"
+        "    sys.executable, '-u', '-c',\n"
+        "    'import signal, time\\n'\n"
+        "    'signal.signal(signal.SIGTERM, signal.SIG_IGN)\\n'\n"
+        "    'time.sleep(600)\\n',\n"
+        "])\n"
+        f"open({str(marker)!r}, 'w').write(str(child.pid))\n"
+        "print('========= COMPUTE-SANITIZER')\n"
+        "print('tests/test_kimi_k3_adaptive_gate_up.py .')\n"
+        "time.sleep(600)\n"
+    )
+    exit_code, output, timed_out = _run_sanitizer_session(
+        [sys.executable, "-u", "-c", script],
+        tool="racecheck",
+        budget=6,
+        cwd=str(tmp_path),
+    )
+
+    assert timed_out is True
+    assert exit_code == 124
+    # What it had, kept: both lines the stand-in printed before it went quiet.
+    assert "========= COMPUTE-SANITIZER" in output
+    assert "tests/test_kimi_k3_adaptive_gate_up.py ." in output
+    # And marked, so a reader cannot take a truncated stream for a complete one.
+    assert "the output above is partial" in output
+
+    grandchild = int(marker.read_text())
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        try:
+            os.kill(grandchild, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:
+        os.kill(grandchild, signal.SIGKILL)
+        pytest.fail(f"grandchild {grandchild} outlived the sanitizer's session")
+
+    # The verdict the gate would reach on this, and the artifact it would write.
+    verdict = sanitizer_verdict("racecheck", exit_code, output)
+    assert not verdict.passed
+    reasons = "; ".join(verdict.failures)
+    assert "exited 124" in reasons, reasons
+
+    import modal_k3_gates
+
+    class _Volume:
+        def __init__(self) -> None:
+            self.commits = 0
+
+        def commit(self) -> None:
+            self.commits += 1
+
+    volume = _Volume()
+    monkeypatch.setattr(modal_k3_gates, "K3_ARTIFACTS", str(tmp_path))
+    monkeypatch.setattr(modal_k3_gates, "K3_VOLUME", volume)
+    modal_k3_gates._persist_k3_artifact(
+        "racecheck.log", "\n".join(verdict.summary_lines()) + f"\n{output}"
+    )
+    written = (tmp_path / "racecheck.log").read_text()
+    assert volume.commits == 1
+    assert "verdict: FAILED" in written
+    assert "the output above is partial" in written

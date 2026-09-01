@@ -52,6 +52,17 @@ PERSISTENT_SYMBOL = "kimi_k3_decode_persistent_kernel"
 # both still ship.
 SCHEDULE_SYMBOL = "kimi_k3_decode_dependency_local_kernel"
 
+# The gate/up engines that schedule is instantiated for. Production's is what a
+# step that has set nothing runs; the baseline is the resident two-stage ring it
+# replaced, reachable only behind the grid-tuning guard. Each is its own
+# compiled function, so the no-spill and residency claims are asked separately.
+PRODUCTION_ENGINE = 2
+#: The resident ring production replaced, kept compiled so the integration's
+#: A/B stays reproducible -- and checked here for the same reason production is:
+#: a baseline that spilled would have been measured on a different grid than the
+#: one the comparison is attributed to.
+BASELINE_ENGINES = (3,)
+
 # The private per-stage entry point the MXFP4 unit tests drive. It compiles the
 # same routed gate/up and down units the persistent kernel inlines, at the same
 # register ceiling, so it is the first place register pressure shows up.
@@ -67,11 +78,11 @@ ROUTED_EXPERTS_SYMBOL = "kimi_k3_routed_experts_kernel"
 # pressure, not a claim that 48 is acceptable.
 PRIVATE_ROUTED_STACK_CEILING = 48
 
-# Itanium mangling spells ``TENSOR_PATH`` out, so the two instantiations can be
-# told apart. There are exactly two: the template carried a gate/up engine
-# selector while three candidates were being measured against each other, and
-# the winner is the only gate/up unit the kernel has, so the selector is gone
-# along with the six instantiations it multiplied the build by.
+# Itanium mangling spells ``TENSOR_PATH`` out, so the instantiations can be told
+# apart. The barrier kernel has exactly two, one per capacity path, and the
+# trailing ``E`` is what says its argument list ends there -- the schedule
+# kernel carries an engine and a layouts type after the flag, so it matches
+# ``ILb0ELi<engine>E`` instead.
 PRODUCTION_CORE_MANGLING = "ILb0EE"
 PRODUCTION_TENSOR_MANGLING = "ILb1EE"
 
@@ -223,30 +234,45 @@ def persistent_symbols(extension_path: Path) -> dict[str, str]:
 
 
 @pytest.fixture(scope="module")
-def schedule_symbols(extension_path: Path) -> dict[str, str]:
-    """The candidate schedule's two instantiations, keyed by capacity path.
+def schedule_symbols(extension_path: Path) -> dict[tuple[int, str], str]:
+    """The candidate schedule's instantiations, keyed by engine and path.
 
     Matched on the mangled ``bool`` literal rather than on production's
     ``ILb0EE``: the candidate carries a second template parameter for the
     layouts type, so the argument list does not end after the capacity flag.
+    The engine is a template argument too, so the build has one instantiation
+    per engine per capacity path and each one is its own compiled function with
+    its own registers -- keying on the path alone would let two of them collide
+    and publish whichever the dump emitted last.
     """
     usage = _resource_usage(extension_path)
     found = [name for name in usage if SCHEDULE_SYMBOL in name]
-    assert len(found) == 2, found
     symbols = {}
     for name in found:
         flags = set(re.findall(r"ILb([01])E", name))
-        assert len(flags) == 1, (name, flags)
-        symbols["tensor" if flags == {"1"} else "core"] = name
-    assert sorted(symbols) == ["core", "tensor"], found
+        engines = set(re.findall(r"ILb[01]ELi(\d+)E", name))
+        assert len(flags) == 1 and len(engines) == 1, (name, flags, engines)
+        path = "tensor" if flags == {"1"} else "core"
+        symbols[(int(next(iter(engines))), path)] = name
+    # Every engine the kernel admits, on both capacity paths, and nothing else.
+    # A build that grew an engine nobody declared is a build that grew a switch.
+    engine_ids = sorted({engine for engine, _ in symbols})
+    assert engine_ids == [PRODUCTION_ENGINE, *BASELINE_ENGINES], engine_ids
+    assert sorted(symbols) == sorted(
+        (engine, path)
+        for engine in engine_ids
+        for path in ("core", "tensor")
+    ), found
     return symbols
 
 
+@pytest.mark.parametrize("engine", [PRODUCTION_ENGINE, *BASELINE_ENGINES])
 @pytest.mark.parametrize("path_name", ["core", "tensor"])
 def test_neither_schedule_instantiation_spills(
     extension_path: Path,
-    schedule_symbols: dict[str, str],
+    schedule_symbols: dict[tuple[int, str], str],
     path_name: str,
+    engine: int,
 ) -> None:
     """The candidate is only worth measuring if it co-resides like production.
 
@@ -255,37 +281,45 @@ def test_neither_schedule_instantiation_spills(
     running. A spill would cost the register budget that residency comes out
     of, so the latency number the A/B produces would be measuring a different
     grid than the one the design argues about.
+
+    Asked of every engine rather than of production's alone. A candidate that
+    buys a deeper ring buys it with live state, and whether that state fits in
+    registers is a property of the instantiation that carries it.
     """
-    usage = _resource_usage(extension_path)[schedule_symbols[path_name]]
+    usage = _resource_usage(extension_path)[schedule_symbols[(engine, path_name)]]
     assert usage["STACK"] == 0, usage
     assert usage["LOCAL"] == 0, usage
-    dynamic_shared = _C._kimi_k3_decode_grid_shape()[2]
+    launch_shared = _C._kimi_k3_decode_gate_up_engine_ledger(engine)[0]
     properties = torch.cuda.get_device_properties(0)
-    assert dynamic_shared + usage["SHARED"] <= (
+    assert launch_shared + usage["SHARED"] <= (
         properties.shared_memory_per_block_optin
     ), usage
     assert _C._kimi_k3_decode_schedule_resident_blocks_per_sm(
-        path_name == "tensor"
+        path_name == "tensor", engine
     ) == 1
 
 
+@pytest.mark.parametrize("engine", [PRODUCTION_ENGINE, *BASELINE_ENGINES])
 @pytest.mark.parametrize("path_name", ["core", "tensor"])
 def test_neither_schedule_instantiation_touches_local_memory(
     extension_path: Path,
-    schedule_symbols: dict[str, str],
+    schedule_symbols: dict[tuple[int, str], str],
     path_name: str,
+    engine: int,
 ) -> None:
     """The same claim as ``STACK:0``, read off the instructions themselves."""
-    families = _mnemonics(extension_path, schedule_symbols[path_name])
+    families = _mnemonics(extension_path, schedule_symbols[(engine, path_name)])
     assert families.isdisjoint(FORBIDDEN), sorted(families & FORBIDDEN)
 
 
+@pytest.mark.parametrize("engine", [PRODUCTION_ENGINE, *BASELINE_ENGINES])
 @pytest.mark.parametrize("path_name", ["core", "tensor"])
 def test_the_schedule_instantiations_run_the_stages_production_runs(
     extension_path: Path,
-    schedule_symbols: dict[str, str],
+    schedule_symbols: dict[tuple[int, str], str],
     persistent_symbols: dict[str, str],
     path_name: str,
+    engine: int,
 ) -> None:
     """The candidate reorders the stages; it does not reimplement them.
 
@@ -295,11 +329,15 @@ def test_the_schedule_instantiations_run_the_stages_production_runs(
     stage compiled differently for the candidate, which is the failure mode
     that would make the A/B a comparison of two kernels rather than of two
     orders of arrival.
+
+    The gate/up engine is one of those stages, so this is asked of every engine
+    too: a candidate that reached its contraction some other way would be a
+    different kernel wearing the same schedule.
     """
     required = REQUIRED_EVERYWHERE | (
         REQUIRED_TENSOR_ONLY if path_name == "tensor" else frozenset()
     )
-    candidate = _mnemonics(extension_path, schedule_symbols[path_name])
+    candidate = _mnemonics(extension_path, schedule_symbols[(engine, path_name)])
     production = _mnemonics(extension_path, persistent_symbols[path_name])
     assert required <= candidate, sorted(required - candidate)
     assert required <= production, sorted(required - production)
@@ -488,6 +526,14 @@ def test_the_ring_asks_for_exactly_the_bytes_the_grid_launches_with(
     Every other stage fits inside it with slack, so this is the one stage whose
     arithmetic decides the launch configuration -- and the launch configuration
     is what decides whether 148 CTAs land one per SM.
+
+    Two grids and two rings, and the pairing is the thing being asserted.
+    `_kimi_k3_fused_w13_geometry` and `_kimi_k3_decode_grid_shape` both describe
+    the resident two-stage ring under the barrier schedule, which is the pair
+    that still has to agree because that schedule is still compiled. What a
+    decode step launches is the dependency-local schedule under the adaptive
+    engine, whose request is its own and larger, and that is asserted against the
+    engine's compiled ledger rather than against either of these.
     """
     assert fused_geometry["staging_bytes"] == (
         2 * 65536 + 2 * 2048 + 7 * 8192 + 7 * 2048 + 8192
@@ -500,6 +546,15 @@ def test_the_ring_asks_for_exactly_the_bytes_the_grid_launches_with(
     )
     assert fused_geometry["shared_bytes"] == 216064
     assert _C._kimi_k3_decode_grid_shape()[2] == fused_geometry["shared_bytes"]
+
+    # And the ring that ships asks for more than the one these two describe, so a
+    # reader who took either figure for production's would be under by 12,288.
+    shipping = int(_C._kimi_k3_decode_gate_up_engine_ledger(2)[0])
+    baseline = int(_C._kimi_k3_decode_gate_up_engine_ledger(3)[0])
+    assert baseline == fused_geometry["shared_bytes"]
+    assert shipping == 228_352
+    assert shipping > baseline
+    assert shipping <= fused_geometry["opt_in_maximum"]
 
 
 def test_the_allocator_skip_the_ring_pays_for_is_the_skip_it_measures(

@@ -31,6 +31,12 @@ def _evidence():
     return importlib.import_module("benchmarks.kimi_k3_report_evidence")
 
 
+def _report_gates():
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    return importlib.import_module("benchmarks.kimi_k3_report_gates")
+
+
 def _profile(
     *,
     barrier: int,
@@ -438,8 +444,7 @@ def test_the_stress_launch_count_is_the_number_its_own_gate_asserts(
     equality leg runs one pass of the same grid and launches both schedules per
     element, which makes its count a function of the same two numbers.
     """
-    evidence = _evidence()
-    plan = evidence._stress_plan()
+    plan = _report_gates()._stress_plan()
     assert plan is not None
 
     assert plan["oracle_verified"] % plan["passes"] == 0
@@ -451,7 +456,7 @@ def test_the_stress_launch_count_is_the_number_its_own_gate_asserts(
     # bucket while 2 and 4 were missing from the tuple itself.
     assert {2, 4} <= set(plan["tokens"])
 
-    assert evidence._stress_plan(Path("/nonexistent.py")) is None
+    assert _report_gates()._stress_plan(Path("/nonexistent.py")) is None
 
 
 def test_the_trap_tables_are_the_diagnostics_the_trapped_launch_wrote(

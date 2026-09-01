@@ -15,6 +15,7 @@ real launch, so this file also runs under ``torchrun --standalone
 from __future__ import annotations
 
 import dataclasses
+import os
 import re
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from mok.kimi_k3 import (
 )
 from mok.ops import _DECODE_ALIGNMENT
 
+from . import kimi_k3_decode_sources as decode_sources
 from .kimi_k3_decode_support import (
     CONFIG,
     CORE_TOKENS,
@@ -64,7 +66,7 @@ _SCALAR_WORD_TENSORS = frozenset(
     }
 )
 
-_SOURCE_ROOT = Path(__file__).resolve().parents[1] / "csrc" / "kimi_k3_decode"
+_SOURCE_ROOT = decode_sources.SOURCE_ROOT
 
 # Every source that either defines a bounded wait or names the code one
 # reports. The structural tests walk these rather than trusting the table.
@@ -85,13 +87,13 @@ _TIMEOUT_CALLERS = (
 # and leave this directory once, for `../serial_sync.cuh`, so this is every
 # source the launch compiles and therefore every source that can end it.
 _DECODE_SOURCES = (
-    *sorted(_SOURCE_ROOT.glob("*.cuh")),
+    *decode_sources.headers(),
     _SOURCE_ROOT.parent / "serial_sync.cuh",
 )
 
 
 def _source(name: str) -> str:
-    return (_SOURCE_ROOT / name).read_text(encoding="utf-8")
+    return decode_sources.read(name)
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +367,42 @@ def test_every_site_spins_on_the_same_bound() -> None:
     assert _C._kimi_k3_decode_wait_timeout_clocks() == budget
 
 
+def test_the_wait_budget_is_the_one_this_image_declares() -> None:
+    """Production's budget is fifteen seconds, and only a sanitizer image moves.
+
+    compute-sanitizer slows a launch by one to two orders of magnitude, so a
+    rendezvous that takes microseconds unmeasured can take longer than fifteen
+    seconds under racecheck -- and the `trap` that ends the bounded spin then
+    takes the launch down as `cudaErrorLaunchFailure`, which the tool reports as
+    zero hazards for a run that never finished. Five racecheck runs were lost to
+    that, so the sanitizer image compiles a wider budget.
+
+    That widening is the thing this test exists to fence. Two failures matter
+    and they are opposite:
+
+    * a production image that silently carried the wider budget would ship a
+      watchdog that no longer surfaces a lost peer in fifteen seconds;
+    * a sanitizer image that silently failed to get it would produce another
+      clean-looking racecheck run that had actually tripped the watchdog.
+
+    Both are caught by requiring the *compiled* scale to equal the scale the
+    image *declares*, rather than by asserting a number. A production image
+    declares nothing, so it must compile a scale of one -- and the base is
+    asserted unconditionally in every image, so nothing about the knob can
+    change what production ships.
+    """
+    base, scale, effective = _C._kimi_k3_decode_wait_timeout_budget()
+
+    # Roughly fifteen seconds of B300 clocks, in every image there is.
+    assert base == 30_000_000_000
+    assert effective == base * scale
+    assert effective == _C._kimi_k3_decode_wait_timeout_clocks()
+
+    declared = int(os.environ.get("MOK_WAIT_TIMEOUT_SCALE", "1"))
+    assert scale == declared, (scale, declared)
+    assert scale >= 1
+
+
 def _enclosing_definition(lines: list[str], number: int) -> int:
     """The line the function containing ``lines[number]`` starts on.
 
@@ -414,7 +452,11 @@ def test_an_unguarded_trap_is_still_caught_after_widening_the_window() -> None:
 
 
 @pytest.mark.parametrize(
-    "source", _DECODE_SOURCES, ids=[path.name for path in _DECODE_SOURCES]
+    "source",
+    _DECODE_SOURCES,
+    # Named by path, not base name: the umbrellas' parts directories each hold
+    # a `kernel.cuh` and so does this one.
+    ids=[str(path.relative_to(_SOURCE_ROOT.parent)) for path in _DECODE_SOURCES],
 )
 def test_a_burnt_clock_budget_is_the_only_way_this_launch_can_trap(
     source: Path,

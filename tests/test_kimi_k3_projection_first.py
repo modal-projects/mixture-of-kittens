@@ -4,12 +4,20 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from . import kimi_k3_decode_sources as decode_sources
+from . import modal_sources
+
 
 ROOT = Path(__file__).parents[1]
 
 
 def _source(path: str) -> str:
     return (ROOT / path).read_text(encoding="utf-8")
+
+
+def _decode(name: str) -> str:
+    """A decode header's whole text, parts it umbrellas inlined."""
+    return decode_sources.read(name)
 
 
 def _function_body(text: str, signature: str) -> str:
@@ -26,7 +34,7 @@ def _function_body(text: str, signature: str) -> str:
 
 
 def test_production_issues_projection_and_shared_work_before_scores() -> None:
-    persistent = _source("csrc/kimi_k3_decode/persistent_kernel.cuh")
+    persistent = _decode("persistent_kernel.cuh")
     kernel = _function_body(
         persistent,
         "void kimi_k3_decode_persistent_kernel(",
@@ -53,12 +61,11 @@ def test_production_issues_projection_and_shared_work_before_scores() -> None:
 
 def test_temporary_projection_ab_surface_is_removed() -> None:
     sources = "\n".join(
-        _source(path)
-        for path in (
-            "csrc/bindings.cu",
-            "csrc/kimi_k3_decode/entrypoints.cuh",
-            "benchmarks/kimi_k3_decode_runtime.py",
-            "modal_app.py",
+        (
+            _source("csrc/bindings.cu"),
+            _decode("entrypoints.cuh"),
+            _source("benchmarks/kimi_k3_decode_runtime.py"),
+            modal_sources.read(),
         )
     )
 
@@ -69,9 +76,9 @@ def test_temporary_projection_ab_surface_is_removed() -> None:
 
 
 def test_durable_phase_profiler_keeps_aggregate_grid_barrier_clock() -> None:
-    types = _source("csrc/kimi_k3_decode/types.cuh")
+    types = _decode("types.cuh")
     kernel = _function_body(
-        _source("csrc/kimi_k3_decode/persistent_kernel.cuh"),
+        _decode("persistent_kernel.cuh"),
         "void kimi_k3_decode_persistent_kernel(",
     )
 

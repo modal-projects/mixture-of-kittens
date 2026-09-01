@@ -1,13 +1,13 @@
 """Source contracts for Kimi K3 scheduling experiments."""
 
-from pathlib import Path
+from . import kimi_k3_decode_sources as decode_sources
 
 
-_SOURCE_ROOT = Path(__file__).parents[1] / "csrc" / "kimi_k3_decode"
+_SOURCE_ROOT = decode_sources.SOURCE_ROOT
 
 
 def _source(name: str) -> str:
-    return (_SOURCE_ROOT / name).read_text(encoding="utf-8")
+    return decode_sources.read(name)
 
 
 def _function_body(text: str, signature: str) -> str:

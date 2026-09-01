@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from . import modal_sources
+
 
 def test_temporary_agent_instrumentation_has_been_removed() -> None:
     root = Path(__file__).parents[1]
@@ -14,13 +16,13 @@ def test_temporary_agent_instrumentation_has_been_removed() -> None:
         root / "benchmarks" / "kimi_k3_batched_expert_probe.py",
         root / "benchmarks" / "kimi_k3_decode_runtime.py",
         root / "benchmarks" / "compare_kimi_k3_frameworks.py",
-        root / "modal_app.py",
         root / "tests" / "kimi_k3_decode_support.py",
         root / "tests" / "test_kimi_k3_decode.py",
     )
 
-    for source in sources:
-        text = source.read_text(encoding="utf-8")
+    texts = [source.read_text(encoding="utf-8") for source in sources]
+    texts.append(modal_sources.read())
+    for text in texts:
         assert "/opt/cursor/logs/debug.log" not in text
         assert "agent log" not in text
         assert "hypothesisId" not in text
@@ -44,12 +46,13 @@ def test_rejected_candidate_switching_has_been_removed() -> None:
     assert not (root / "benchmarks" / "kimi_k3_grouped_pipeline.py").exists()
     assert not (root / "benchmarks" / "kimi_k3_gate_up_grouping.py").exists()
 
-    sources = (
-        root / "benchmarks" / "kimi_k3_decode_runtime.py",
-        root / "modal_app.py",
+    texts = (
+        (root / "benchmarks" / "kimi_k3_decode_runtime.py").read_text(
+            encoding="utf-8"
+        ),
+        modal_sources.read(),
     )
-    for source in sources:
-        text = source.read_text(encoding="utf-8")
+    for text in texts:
         assert "MOK_KIMI_K3_ENABLE_GROUPED_PIPELINE" not in text
         assert "_kimi_k3_decode_set_grouped_pipeline" not in text
         assert "bench_kimi_k3_grouped_pipeline" not in text
@@ -163,9 +166,7 @@ def test_m16_route_shape_has_no_same_expert_pair_to_pack() -> None:
 
 
 def test_modal_exposes_a_focused_single_b300_probe() -> None:
-    source = (Path(__file__).parents[1] / "modal_app.py").read_text(
-        encoding="utf-8"
-    )
+    source = modal_sources.read()
 
     assert "def bench_kimi_k3_batched_expert_probe(" in source
     assert "def diagnose_kimi_k3_batched_expert_probe(" in source

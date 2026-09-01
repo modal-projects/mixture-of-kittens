@@ -263,13 +263,36 @@ def sanitizer_verdict(
 #: suite, which is why the two tools read two files. racecheck does not: it is
 #: the tool that already struggles to finish the narrow selection, and a run
 #: that times out is worth less than a narrower one that ends.
+#:
+#: All three also take an adaptive-selector case that alternates arms on one
+#: workspace, because production's gate/up path is two rings now and the hazard
+#: peculiar to that is not reachable from a route table: a unit that ran one ring
+#: hands the next unit semaphores out of the same shared allocation. Arming both
+#: rings' mbarriers on the first unit, and carrying each ring's parity in its own
+#: shared words, is exactly the kind of claim racecheck is for.
+#:
+#: Which case that is differs by tool, and the difference is a measured one
+#: rather than a preference. `survives_a_repeated_step` makes the claim over
+#: three laps of four occupancies including `balanced` at 128, and memcheck runs
+#: it inside twelve minutes. racecheck did not finish it in eight hours: it
+#: instruments every shared access in a kernel that is almost entirely shared
+#: traffic, and the 128-token laps are where that lands. So racecheck takes
+#: `alternates_arms_on_one_workspace`, which crosses the threshold in both
+#: directions three times using `concentrated` at four and eight tokens -- the
+#: cheapest route that puts a whole launch on a named arm -- and is an
+#: eight-token step throughout. It is weaker in one stated way, that both arms
+#: are never live inside one CTA, and that part is memcheck's and the suite's.
 K3_SANITIZER_SELECTION = {
     "memcheck": (
         "pinned_route_distributions or adversarial_routes or full_expert_batch"
+        " or across_the_compact_threshold or survives_a_repeated_step"
     ),
-    "racecheck": "pinned_route_distributions",
+    "racecheck": (
+        "pinned_route_distributions or alternates_arms_on_one_workspace"
+    ),
     "synccheck": (
         "pinned_route_distributions or adversarial_routes or full_expert_batch"
+        " or across_the_compact_threshold or survives_a_repeated_step"
     ),
 }
 
@@ -321,6 +344,17 @@ K3_DECODE_FILE = "tests/test_kimi_k3_decode.py"
 #: both of them rather than only the default.
 K3_SCHEDULE_FILE = "tests/test_kimi_k3_dependency_schedule.py"
 
+#: The adaptive gate/up suite, which is the only place both rings run.
+#:
+#: Every other suite reaches production's gate/up path through whatever route
+#: it happened to build, and the realistic ones are all inside the compact
+#: threshold. This file is the one that crosses it deliberately -- one row count
+#: at a time from one to eight, and a repeated step that alternates occupancies
+#: so a CTA takes a different ring at consecutive units. Under a sanitizer that
+#: is where a stage issued but not retired, or a parity one ring recorded and
+#: the other read, would be caught.
+K3_ADAPTIVE_FILE = "tests/test_kimi_k3_adaptive_gate_up.py"
+
 #: Every sanitizer gate, as ``(tool, files, expression)``.
 #:
 #: Three tools against the schedule that ships. The barrier schedule keeps the
@@ -331,17 +365,17 @@ K3_SCHEDULE_FILE = "tests/test_kimi_k3_dependency_schedule.py"
 K3_SANITIZER_GATES = {
     "memcheck": (
         "memcheck",
-        f"{K3_DECODE_FILE},{K3_SCHEDULE_FILE}",
+        f"{K3_ADAPTIVE_FILE},{K3_DECODE_FILE},{K3_SCHEDULE_FILE}",
         K3_SANITIZER_SELECTION["memcheck"],
     ),
     "racecheck": (
         "racecheck",
-        K3_DECODE_FILE,
+        f"{K3_ADAPTIVE_FILE},{K3_DECODE_FILE}",
         K3_SANITIZER_SELECTION["racecheck"],
     ),
     "synccheck": (
         "synccheck",
-        f"{K3_DECODE_FILE},{K3_SCHEDULE_FILE}",
+        f"{K3_ADAPTIVE_FILE},{K3_DECODE_FILE},{K3_SCHEDULE_FILE}",
         K3_SANITIZER_SELECTION["synccheck"],
     ),
 }

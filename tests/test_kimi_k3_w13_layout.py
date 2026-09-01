@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
-from pathlib import Path
 
 import pytest
 import torch
@@ -42,6 +41,8 @@ from mok.kimi_k3_w13 import (
     KIMI_K3_W13_TASK_ROWS,
     KIMI_K3_W13_TASK_SLABS,
 )
+
+from . import kimi_k3_decode_sources as decode_sources
 
 #: Packed source bytes at the front of each sixteen-byte shared atom. The other
 #: eight are the format's container padding, which the MMA never reads and no
@@ -409,12 +410,7 @@ def test_the_probe_is_the_descriptor_production_launches_with(
     engine's transaction count and the probe's are one constant and the shapes
     the probe accepts are the shapes the operator validates.
     """
-    source = (
-        Path(__file__).resolve().parent.parent
-        / "csrc"
-        / "kimi_k3_decode"
-        / "expert_mxfp4_fused_w13.cuh"
-    ).read_text()
+    source = decode_sources.read("expert_mxfp4_fused_w13.cuh")
     probe = source.split("fused_w13_tma_probe_kernel")[1]
     assert "load_fused_slab_async(payload, &packed" in probe
     entrypoint = source.split("kimi_k3_fused_w13_tma_probe_entrypoint")[1]

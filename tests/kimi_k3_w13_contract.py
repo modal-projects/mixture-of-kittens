@@ -668,7 +668,8 @@ def check_operator_schema_and_its_fake_name_the_fused_pair() -> None:
     # The CUDA implementation is registered through a decorator that returns
     # nothing, so it has no module attribute to read a signature off; its
     # argument list is read out of the source instead, which is the same claim.
-    cuda_source = inspect.getsource(ops).split(
+    # `mok.ops` only re-exports the step, so the source wanted is its definer's.
+    cuda_source = inspect.getsource(inspect.getmodule(ops.kimi_k3_decode)).split(
         '@torch.library.impl("mok::kimi_k3_decode", "cuda")', 1
     )[1].split(") -> None:", 1)[0]
     cuda_tensors = [
