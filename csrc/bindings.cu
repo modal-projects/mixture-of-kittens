@@ -1,15 +1,313 @@
+#include "kimi_k3_decode/entrypoints.cuh"
+#include "kimi_k3_decode/expert_mxfp4.cuh"
+#include "kimi_k3_decode/expert_mxfp4_batch_probe.cuh"
 #include "megakernel/entrypoints.cuh"
 #include "mxfp8.cuh"
 #include "scheduler.cuh"
 #include "utils.cuh"
 
+#include <cstdint>
+#include <string>
+#include <tuple>
+#include <vector>
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("kimi_k3_decode", &kimi_k3_decode::kimi_k3_decode_entrypoint, "",
+          pybind11::arg("hidden_states"),
+          pybind11::arg("router_weight"), pybind11::arg("router_correction_bias"),
+          pybind11::arg("routed_expert_down_proj"), pybind11::arg("routed_expert_up_proj"),
+          pybind11::arg("routed_latent_rmsnorm_weight"),
+          pybind11::arg("expert_w13_packed"), pybind11::arg("expert_w13_scale"),
+          pybind11::arg("expert_w2_packed"), pybind11::arg("expert_w2_scale"),
+          pybind11::arg("shared_gate_proj"), pybind11::arg("shared_up_proj"),
+          pybind11::arg("shared_down_proj"),
+          pybind11::arg("scratch"),
+          pybind11::arg("collective_buffer"), pybind11::arg("collective_buffer_ptrs"),
+          pybind11::arg("collective_buffer_multicast_ptr"),
+          pybind11::arg("output_mailbox"), pybind11::arg("output_mailbox_ptrs"),
+          pybind11::arg("output_mailbox_multicast_ptr"),
+          pybind11::arg("barrier_buffer"), pybind11::arg("barrier_buffer_ptrs"),
+          pybind11::arg("barrier_buffer_multicast_ptr"),
+          pybind11::arg("barrier_target"),
+          pybind11::arg("error_flag"),
+          pybind11::arg("tp_rank"), pybind11::arg("active_tokens"),
+          pybind11::arg("workspace_signature"));
+    m.def("kimi_k3_decode_workspace_bytes",
+          &kimi_k3_decode::kimi_k3_decode_workspace_bytes);
+    m.def("_kimi_k3_fused_w13_tma_probe",
+          &kimi_k3_decode::expert_mxfp4::fused_w13::
+              kimi_k3_fused_w13_tma_probe_entrypoint,
+          "",
+          pybind11::arg("expert_w13_packed"),
+          pybind11::arg("expert"),
+          pybind11::arg("task_slab"),
+          pybind11::arg("transaction_bytes"));
+    m.def("_kimi_k3_fused_w13_geometry",
+          &kimi_k3_decode::expert_mxfp4::fused_w13::
+              fused_w13_geometry_for_testing);
+    m.def("_kimi_k3_fused_w13_shared_footprint",
+          &kimi_k3_decode::expert_mxfp4::fused_w13::
+              kimi_k3_fused_w13_shared_footprint_entrypoint);
+    m.def("_kimi_k3_fused_w13_packed_maps_encoded",
+          &kimi_k3_decode::expert_mxfp4::fused_w13::
+              fused_w13_packed_maps_encoded_for_testing);
+    m.def("_kimi_k3_decode_task_plan",
+          &kimi_k3_decode::persistent::task_plan_for_testing, "",
+          pybind11::arg("active_tokens"));
+    m.def("_kimi_k3_decode_validate_residency",
+          &kimi_k3_decode::persistent::validate_residency, "",
+          pybind11::arg("available_sms"),
+          pybind11::arg("blocks_per_sm"));
+    m.def("_kimi_k3_decode_resident_blocks_per_sm",
+          &kimi_k3_decode::persistent::resident_blocks_per_sm_for_testing, "",
+          pybind11::arg("tensor_path"));
+    m.def("_kimi_k3_decode_shared_memory_reservations",
+          &kimi_k3_decode::persistent::shared_memory_reservations_for_testing,
+          "", pybind11::arg("device"));
+    m.def("_kimi_k3_decode_timeout_metadata",
+          &kimi_k3_decode::persistent::timeout_metadata_for_testing);
+    m.def("_kimi_k3_decode_queue_bound",
+          &kimi_k3_decode::persistent::queue_bound_for_testing);
+    m.def("_kimi_k3_decode_wait_timeout_clocks", []() {
+        return kimi_k3_decode::persistent::kWaitTimeoutClocks;
+    });
+    // The budget as compiled, broken into what production ships and what this
+    // build scaled it by. A sanitizer image raises the scale so racecheck can
+    // reach a verdict about races rather than about the watchdog; every other
+    // image must report a scale of one.
+    m.def("_kimi_k3_decode_wait_timeout_budget", []() {
+        return std::make_tuple(
+            static_cast<std::int64_t>(serial_sync::kWaitTimeoutBaseClocks),
+            static_cast<std::int64_t>(serial_sync::kWaitTimeoutScale),
+            static_cast<std::int64_t>(serial_sync::kWaitTimeoutClocks));
+    });
+    m.def("_kimi_k3_timeout_sites", []() {
+        std::vector<std::tuple<std::string, std::int64_t, std::int64_t,
+                               std::int64_t>> sites;
+        for (const auto &site : kimi_k3_decode::kTimeoutSites) {
+            sites.emplace_back(
+                site.name, static_cast<std::int64_t>(site.code),
+                static_cast<std::int64_t>(site.timeout_slot),
+                static_cast<std::int64_t>(site.counter));
+        }
+        return sites;
+    });
+    m.def("_kimi_k3_decode_grid_shape", []() {
+        return std::make_tuple(
+            static_cast<std::int64_t>(kimi_k3_decode::persistent::kPersistentCtas),
+            static_cast<std::int64_t>(kimi_k3_decode::kDecodeCtaThreads),
+            static_cast<std::int64_t>(
+                kimi_k3_decode::persistent::kPersistentSharedBytes));
+    });
+    m.def("_kimi_k3_decode_set_benchmark_grid",
+          &kimi_k3_decode::persistent::set_benchmark_grid_ctas_for_testing, "",
+          pybind11::arg("grid_ctas"));
+    m.def("_kimi_k3_decode_benchmark_grid",
+          &kimi_k3_decode::persistent::benchmark_grid_ctas_for_testing);
+    m.def("_kimi_k3_decode_set_phase_profile",
+          &kimi_k3_decode::persistent::set_benchmark_phase_profile_for_testing,
+          "", pybind11::arg("enabled"));
+    m.def("_kimi_k3_decode_phase_profile",
+          &kimi_k3_decode::persistent::benchmark_phase_profile_for_testing);
+    m.def("_kimi_k3_decode_phase_clock_metadata",
+          &kimi_k3_decode::persistent::phase_clock_metadata_for_testing);
+    m.def("_kimi_k3_decode_set_dependency_schedule",
+          &kimi_k3_decode::persistent::set_dependency_schedule_for_testing,
+          "", pybind11::arg("enabled"));
+    m.def("_kimi_k3_decode_dependency_schedule",
+          &kimi_k3_decode::persistent::dependency_schedule_for_testing);
+    m.def("_kimi_k3_decode_set_gate_up_engine",
+          &kimi_k3_decode::persistent::set_gate_up_engine_for_testing, "",
+          pybind11::arg("engine"));
+    m.def("_kimi_k3_decode_gate_up_engine",
+          &kimi_k3_decode::persistent::gate_up_engine_for_testing);
+    m.def("_kimi_k3_decode_gate_up_engine_ledger",
+          &kimi_k3_decode::persistent::gate_up_engine_ledger_for_testing, "",
+          pybind11::arg("engine"));
+    m.def("_kimi_k3_decode_schedule_resident_blocks_per_sm",
+          &kimi_k3_decode::persistent::
+              schedule_resident_blocks_per_sm_for_testing,
+          "", pybind11::arg("tensor_path"),
+          pybind11::arg("engine") =
+              kimi_k3_decode::expert_mxfp4::fused_w13::kEngineFusedAdaptive);
+    m.def("_kimi_k3_decode_schedule_edges",
+          &kimi_k3_decode::persistent::schedule::schedule_edges_for_testing);
+    m.def("_kimi_k3_decode_schedule_edge_diagnostics",
+          &kimi_k3_decode::persistent::schedule::
+              schedule_edge_diagnostics_for_testing,
+          "", pybind11::arg("unit"));
+    m.def("_kimi_k3_decode_schedule_queues",
+          &kimi_k3_decode::persistent::schedule::
+              schedule_queue_names_for_testing);
+    m.def("_kimi_k3_decode_schedule_clock_metadata",
+          &kimi_k3_decode::persistent::schedule::
+              schedule_clock_metadata_for_testing);
+    m.def("_kimi_k3_decode_schedule_counter_bounds",
+          &kimi_k3_decode::persistent::schedule::
+              schedule_counter_bounds_for_testing);
+    m.def("_kimi_k3_decode_schedule_queue_units",
+          &kimi_k3_decode::persistent::schedule::
+              schedule_queue_units_for_testing,
+          "", pybind11::arg("active_tokens"));
+    m.def("_kimi_k3_decode_schedule_wait_probe",
+          &kimi_k3_decode::persistent::schedule::
+              schedule_wait_probe_for_testing,
+          "", pybind11::arg("scratch"), pybind11::arg("error_flag"),
+          pybind11::arg("edge"), pybind11::arg("unit"),
+          pybind11::arg("target"));
+    m.def("_kimi_k3_decode_schedule_wait_probe_concurrent",
+          &kimi_k3_decode::persistent::schedule::
+              schedule_wait_probe_concurrent_for_testing,
+          "", pybind11::arg("scratch"), pybind11::arg("error_flag"),
+          pybind11::arg("units_per_edge"), pybind11::arg("target"));
+    m.def("_kimi_k3_decode_timeout_claim", [](const std::int64_t claim) {
+        return static_cast<std::int64_t>(
+            kimi_k3_decode::timeout::claiming_block(
+                static_cast<unsigned int>(claim)));
+    }, "", pybind11::arg("claim"));
+    m.def("_kimi_k3_decode_benchmark_grids", []() {
+        const auto &grids =
+            kimi_k3_decode::persistent::kBenchmarkGridCtas;
+        return std::make_tuple(
+            static_cast<std::int64_t>(grids[0]),
+            static_cast<std::int64_t>(grids[1]),
+            static_cast<std::int64_t>(grids[2]),
+            static_cast<std::int64_t>(grids[3]));
+    });
+    m.def("_kimi_k3_route_and_project",
+          &kimi_k3_decode::route_and_project_entrypoint, "",
+          pybind11::arg("hidden_states"),
+          pybind11::arg("router_weight"), pybind11::arg("router_correction_bias"),
+          pybind11::arg("routed_expert_down_proj"),
+          pybind11::arg("scratch"), pybind11::arg("active_tokens"));
+    m.def("_kimi_k3_routed_experts",
+          &kimi_k3_decode::routed_experts_entrypoint, "",
+          pybind11::arg("latent_x"),
+          pybind11::arg("expert_w1_packed"),
+          pybind11::arg("expert_w1_scale"),
+          pybind11::arg("expert_w3_packed"),
+          pybind11::arg("expert_w3_scale"),
+          pybind11::arg("expert_w2_packed"),
+          pybind11::arg("expert_w2_scale"),
+          pybind11::arg("routed_output"),
+          pybind11::arg("scratch"),
+          pybind11::arg("active_tokens"));
+    m.def("_kimi_k3_shared_experts",
+          &kimi_k3_decode::shared_experts_entrypoint, "",
+          pybind11::arg("hidden_states"),
+          pybind11::arg("shared_gate_proj"),
+          pybind11::arg("shared_up_proj"),
+          pybind11::arg("shared_down_proj"),
+          pybind11::arg("scratch"),
+          pybind11::arg("collective_buffer"),
+          pybind11::arg("active_tokens"));
+    m.def("_kimi_k3_shared_experts_role_plan",
+          &kimi_k3_decode::shared_experts::role_plan_for_testing, "",
+          pybind11::arg("active_tokens"));
+    m.def("_kimi_k3_shared_experts_validate_residency",
+          &kimi_k3_decode::shared_experts::validate_residency, "",
+          pybind11::arg("active_tokens"),
+          pybind11::arg("available_sms"));
+    m.def("_kimi_k3_shared_experts_generation_advanced",
+          &kimi_k3_decode::shared_experts::generation_advanced, "",
+          pybind11::arg("observed"),
+          pybind11::arg("consumed"));
+    m.def("_kimi_k3_shared_experts_wait_timeout_clocks", []() {
+        return kimi_k3_decode::shared_experts::kGenerationWaitTimeoutClocks;
+    });
+    m.def("_kimi_k3_shared_experts_wait_timed_out",
+          &kimi_k3_decode::shared_experts::wait_timed_out, "",
+          pybind11::arg("started"),
+          pybind11::arg("current"));
+    m.def("_kimi_k3_shared_experts_timeout_metadata",
+          &kimi_k3_decode::shared_experts::timeout_metadata_for_testing);
+    m.def("_kimi_k3_tail", &kimi_k3_decode::kimi_k3_tail_entrypoint, "",
+          pybind11::arg("routed_latent_rmsnorm_weight"),
+          pybind11::arg("latent_up_proj"),
+          pybind11::arg("collective_buffer"),
+          pybind11::arg("collective_buffer_ptrs"),
+          pybind11::arg("collective_buffer_multicast_ptr"),
+          pybind11::arg("output_mailbox"),
+          pybind11::arg("output_mailbox_ptrs"),
+          pybind11::arg("output_mailbox_multicast_ptr"),
+          pybind11::arg("barrier_buffer"),
+          pybind11::arg("barrier_buffer_ptrs"),
+          pybind11::arg("barrier_buffer_multicast_ptr"),
+          pybind11::arg("barrier_target"),
+          pybind11::arg("scratch"),
+          pybind11::arg("error_flag"),
+          pybind11::arg("tp_rank"),
+          pybind11::arg("active_tokens"),
+          pybind11::arg("workspace_signature"));
+    m.def("_kimi_k3_workspace_signature",
+          &kimi_k3_decode::kimi_k3_workspace_signature_entrypoint, "",
+          pybind11::arg("collective_buffer"),
+          pybind11::arg("collective_buffer_ptrs"),
+          pybind11::arg("collective_buffer_multicast_ptr"),
+          pybind11::arg("output_mailbox"),
+          pybind11::arg("output_mailbox_ptrs"),
+          pybind11::arg("output_mailbox_multicast_ptr"),
+          pybind11::arg("barrier_buffer"),
+          pybind11::arg("barrier_buffer_ptrs"),
+          pybind11::arg("barrier_buffer_multicast_ptr"),
+          pybind11::arg("tp_rank"));
+    m.def("_kimi_k3_tail_shared_memory_reservations",
+          &kimi_k3_decode::tail::shared_memory_reservations_for_testing, "",
+          pybind11::arg("device"));
+    m.def("_kimi_k3_tail_role_plan",
+          &kimi_k3_decode::tail::role_plan_for_testing, "",
+          pybind11::arg("active_tokens"));
+    m.def("_kimi_k3_tail_validate_residency",
+          &kimi_k3_decode::tail::validate_residency, "",
+          pybind11::arg("active_tokens"),
+          pybind11::arg("available_sms"));
+    m.def("_kimi_k3_tail_generation_advanced",
+          &kimi_k3_decode::tail::generation_advanced, "",
+          pybind11::arg("observed"), pybind11::arg("consumed"));
+    m.def("_kimi_k3_tail_barrier_reached",
+          &kimi_k3_decode::tail::barrier_reached, "",
+          pybind11::arg("observed"), pybind11::arg("target"));
+    m.def("_kimi_k3_tail_wait_timeout_clocks", []() {
+        return kimi_k3_decode::tail::kGenerationWaitTimeoutClocks;
+    });
+    m.def("_kimi_k3_tail_wait_timed_out",
+          &kimi_k3_decode::tail::wait_timed_out, "",
+          pybind11::arg("started"), pybind11::arg("current"));
+    m.def("_kimi_k3_tail_timeout_metadata",
+          &kimi_k3_decode::tail::timeout_metadata_for_testing);
+    m.def("pack_kimi_k3_mxfp4", &kimi_k3_decode::mxfp4::pack_entrypoint, "",
+          pybind11::arg("weight"), pybind11::arg("padded_k"));
+    m.def("dequant_kimi_k3_mxfp4", &kimi_k3_decode::mxfp4::dequant_entrypoint, "",
+          pybind11::arg("packed"), pybind11::arg("scale"),
+          pybind11::arg("logical_k"));
+    m.def("_kimi_k3_mixed_mma_probe",
+          &kimi_k3_decode::expert_mxfp4::mixed_mma_probe_entrypoint, "",
+          pybind11::arg("a"), pybind11::arg("b_packed"),
+          pybind11::arg("b_scale"));
+    m.def(
+        "_kimi_k3_batched_expert_probe",
+        &kimi_k3_decode::expert_mxfp4::batch_probe::
+            batched_expert_probe_entrypoint,
+        "",
+        pybind11::arg("latent_x"),
+        pybind11::arg("expert_w1_packed"),
+        pybind11::arg("expert_w1_scale"),
+        pybind11::arg("expert_w3_packed"),
+        pybind11::arg("expert_w3_scale"),
+        pybind11::arg("expert_w2_packed"),
+        pybind11::arg("expert_w2_scale"),
+        pybind11::arg("output"),
+        pybind11::arg("scratch"),
+        pybind11::arg("expert"),
+        pybind11::arg("use_batch_probe"));
     m.def("all_gather_top_experts", &utils::all_gather_top_experts::all_gather_top_experts_entrypoint, "",
           pybind11::arg("top_experts"), pybind11::arg("all_gather_top_experts_buffer"),
           pybind11::arg("all_gather_top_experts_buffer_multicast_ptr"), pybind11::arg("rank"), pybind11::arg("chunk_bytes"));
     m.def("barrier_all", &utils::barrier_all::barrier_all_entrypoint, "",
           pybind11::arg("barrier_buffer"), pybind11::arg("barrier_buffer_ptrs"),
           pybind11::arg("barrier_buffer_multicast_ptr"), pybind11::arg("target"));
+    m.def("_barrier_all_wait_timeout_clocks",
+          &utils::barrier_all::barrier_all_wait_timeout_clocks, "");
     m.def("schedule", &scheduler::schedule_entrypoint, "",
           pybind11::arg("topk_all"), pybind11::arg("num_local_experts"), pybind11::arg("schedule_capacity"), pybind11::arg("rank"));
     m.def("mxfp8_quantize", &mxfp8::quantize_entrypoint, "",

@@ -1,0 +1,23 @@
+command: compute-sanitizer --tool racecheck --error-exitcode 99 --target-processes all python -m torch.distributed.run --standalone --nproc-per-node=8 -m pytest -q -x tests/test_kimi_k3_decode.py -k pinned_route_distributions
+exit_code: 0
+reported_errors: 0
+fabric_denials: 0
+device_errors: 0
+========= COMPUTE-SANITIZER
+........................                                                                      [100%]
+3 passed, 60 deselected in 1240.89s (0:20:40)
+                                                                      [100%]
+3 passed, 60 deselected in 1240.90s (0:20:40)
+                                                                      [100%]
+3 passed, 60 deselected in 1241.00s (0:20:40)
+                                                                      [100%]
+3 passed, 60 deselected in 1241.13s (0:20:41)
+                                                                      [100%]
+3 passed, 60 deselected in 1241.17s (0:20:41)
+                                                                      [100%]
+3 passed, 60 deselected in 1241.19s (0:20:41)
+                                                                      [100%]
+3 passed, 60 deselected in 1241.21s (0:20:41)
+                                                                      [100%]
+3 passed, 60 deselected in 1241.22s (0:20:41)
+========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)

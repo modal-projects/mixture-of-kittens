@@ -1,6 +1,143 @@
 import torch
 
 from . import ops as _ops  # noqa: F401
+from .kimi_k3 import KIMI_K3_TOPK
+
+
+@torch.library.register_fake("mok::kimi_k3_decode")
+def _kimi_k3_decode_fake(
+    hidden_states: torch.Tensor,
+    router_weight: torch.Tensor,
+    router_correction_bias: torch.Tensor,
+    routed_expert_down_proj: torch.Tensor,
+    routed_expert_up_proj: torch.Tensor,
+    routed_latent_rmsnorm_weight: torch.Tensor,
+    expert_w13_packed: torch.Tensor,
+    expert_w13_scale: torch.Tensor,
+    expert_w2_packed: torch.Tensor,
+    expert_w2_scale: torch.Tensor,
+    shared_gate_proj: torch.Tensor,
+    shared_up_proj: torch.Tensor,
+    shared_down_proj: torch.Tensor,
+    scratch: torch.Tensor,
+    collective_buffer: torch.Tensor,
+    collective_buffer_ptrs: list[int],
+    collective_buffer_multicast_ptr: int,
+    output_mailbox: torch.Tensor,
+    output_mailbox_ptrs: list[int],
+    output_mailbox_multicast_ptr: int,
+    barrier_buffer: torch.Tensor,
+    barrier_buffer_ptrs: list[int],
+    barrier_buffer_multicast_ptr: int,
+    barrier_target: torch.Tensor,
+    error_flag: torch.Tensor,
+    tp_rank: int,
+    active_tokens: int,
+    workspace_signature: int,
+) -> None:
+    # The step writes only into tensors the caller already owns, so a trace has
+    # nothing to allocate. A trace also carries placeholder addresses, so
+    # `workspace_signature` is the documented placeholder zero here rather than
+    # a real workspace's value; `mok.ops` enforces that, and nothing in a trace
+    # depends on it.
+    return None
+
+
+@torch.library.register_fake("mok::_kimi_k3_route_and_project")
+def _kimi_k3_route_and_project_fake(
+    hidden_states: torch.Tensor,
+    router_weight: torch.Tensor,
+    router_correction_bias: torch.Tensor,
+    routed_expert_down_proj: torch.Tensor,
+    scratch: torch.Tensor,
+    active_tokens: int,
+) -> tuple[
+    torch.Tensor, torch.Tensor,  # expert_ids, expert_weights
+    torch.Tensor,  # latent_x
+]:
+    tokens = hidden_states.shape[0]
+    return (
+        hidden_states.new_empty((tokens, KIMI_K3_TOPK), dtype=torch.int32),
+        hidden_states.new_empty((tokens, KIMI_K3_TOPK), dtype=torch.float32),
+        hidden_states.new_empty((tokens, routed_expert_down_proj.shape[0])),
+    )
+
+
+@torch.library.register_fake("mok::_kimi_k3_routed_experts")
+def _kimi_k3_routed_experts_fake(
+    latent_x: torch.Tensor,
+    expert_w1_packed: torch.Tensor,
+    expert_w1_scale: torch.Tensor,
+    expert_w3_packed: torch.Tensor,
+    expert_w3_scale: torch.Tensor,
+    expert_w2_packed: torch.Tensor,
+    expert_w2_scale: torch.Tensor,
+    routed_output: torch.Tensor,
+    scratch: torch.Tensor,
+    active_tokens: int,
+) -> torch.Tensor:
+    return routed_output[:active_tokens]
+
+
+@torch.library.register_fake("mok::_kimi_k3_shared_experts")
+def _kimi_k3_shared_experts_fake(
+    hidden_states: torch.Tensor,
+    shared_gate_proj: torch.Tensor,
+    shared_up_proj: torch.Tensor,
+    shared_down_proj: torch.Tensor,
+    scratch: torch.Tensor,
+    collective_buffer: torch.Tensor,
+    active_tokens: int,
+) -> torch.Tensor:
+    return collective_buffer[:active_tokens, 3584:10752]
+
+
+@torch.library.register_fake("mok::_kimi_k3_tail")
+def _kimi_k3_tail_fake(
+    routed_latent_rmsnorm_weight: torch.Tensor,
+    latent_up_proj: torch.Tensor,
+    collective_buffer: torch.Tensor,
+    collective_buffer_ptrs: list[int],
+    collective_buffer_multicast_ptr: int,
+    output_mailbox: torch.Tensor,
+    output_mailbox_ptrs: list[int],
+    output_mailbox_multicast_ptr: int,
+    barrier_buffer: torch.Tensor,
+    barrier_buffer_ptrs: list[int],
+    barrier_buffer_multicast_ptr: int,
+    barrier_target: torch.Tensor,
+    scratch: torch.Tensor,
+    error_flag: torch.Tensor,
+    tp_rank: int,
+    active_tokens: int,
+    workspace_signature: int,
+) -> None:
+    # A trace carries placeholder addresses, so `workspace_signature` is the
+    # documented placeholder zero here rather than a real workspace's value;
+    # `mok.ops` enforces that, and nothing in a trace depends on it.
+    return None
+
+
+@torch.library.register_fake("mok::pack_kimi_k3_mxfp4")
+def _pack_kimi_k3_mxfp4_fake(
+    weight: torch.Tensor,
+    padded_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:  # packed, scale
+    experts, rows, _ = weight.shape
+    return (
+        weight.new_empty((experts, rows, padded_k // 2), dtype=torch.uint8),
+        weight.new_empty((experts, rows, padded_k // 32), dtype=torch.uint8),
+    )
+
+
+@torch.library.register_fake("mok::dequant_kimi_k3_mxfp4")
+def _dequant_kimi_k3_mxfp4_fake(
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    logical_k: int,
+) -> torch.Tensor:  # weight
+    experts, rows, _ = packed.shape
+    return packed.new_empty((experts, rows, logical_k), dtype=torch.bfloat16)
 
 
 @torch.library.register_fake("mok::all_gather_top_experts")

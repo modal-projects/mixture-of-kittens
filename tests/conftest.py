@@ -6,11 +6,14 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from mok.functional import clear_workspace_cache
-
 
 @pytest.fixture(scope="session")
 def context() -> Iterator[tuple[int, int, torch.device]]:
+    if "RANK" not in os.environ:
+        pytest.skip("distributed tests must be launched through torchrun")
+
+    from mok.functional import clear_workspace_cache
+
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -31,3 +34,21 @@ def context() -> Iterator[tuple[int, int, torch.device]]:
         clear_workspace_cache()
         gc.collect()
         dist.destroy_process_group()
+
+
+@pytest.fixture(scope="session")
+def tp8_context(
+    context: tuple[int, int, torch.device],
+) -> Iterator[tuple[int, int, torch.device]]:
+    rank, world_size, device = context
+    if world_size != 8:
+        pytest.skip("Kimi K3 decode requires TP8")
+    if torch.cuda.get_device_capability(device) != (10, 3):
+        pytest.skip("Kimi K3 decode requires SM103 B300")
+
+    try:
+        yield rank, world_size, device
+    finally:
+        dist.barrier()
+        from mok.kimi_k3 import clear_kimi_k3_decode_workspace_cache
+        clear_kimi_k3_decode_workspace_cache()

@@ -1,0 +1,56 @@
+command: compute-sanitizer --tool memcheck --error-exitcode 99 --target-processes all python -m torch.distributed.run --standalone --nproc-per-node=8 -m pytest -q -x tests/test_kimi_k3_decode.py -k pinned_route_distributions
+exit_code: 99
+trimmed: host backtrace frames only; every marker line is verbatim
+reported_errors: 16
+fabric_denials: 16
+device_errors: 0
+========= COMPUTE-SANITIZER
+========= CUDA API Error: Failed to allocate physical memory
+========= 
+========= CUDA API Error: Failed to allocate physical memory
+========= 
+========= CUDA API Error: Failed to allocate physical memory
+========= 
+========= CUDA API Error: Failed to allocate physical memory
+========= 
+========= CUDA API Error: Failed to allocate physical memory
+========= 
+========= CUDA API Error: Failed to allocate physical memory
+========= 
+========= CUDA API Error: Failed to allocate physical memory
+========= 
+========= CUDA API Error: Failed to allocate physical memory
+========= 
+========= Program hit CUDA_ERROR_NOT_PERMITTED (error 800) due to "operation not permitted" on CUDA API call to cuMemCreate.
+========= 
+========= Program hit CUDA_ERROR_NOT_PERMITTED (error 800) due to "operation not permitted" on CUDA API call to cuMemCreate.
+========= 
+========= Program hit CUDA_ERROR_NOT_PERMITTED (error 800) due to "operation not permitted" on CUDA API call to cuMemCreate.
+========= 
+========= Program hit CUDA_ERROR_NOT_PERMITTED (error 800) due to "operation not permitted" on CUDA API call to cuMemCreate.
+========= 
+========= Program hit CUDA_ERROR_NOT_PERMITTED (error 800) due to "operation not permitted" on CUDA API call to cuMemCreate.
+========= 
+========= Program hit CUDA_ERROR_NOT_PERMITTED (error 800) due to "operation not permitted" on CUDA API call to cuMemCreate.
+========= 
+========= Program hit CUDA_ERROR_NOT_PERMITTED (error 800) due to "operation not permitted" on CUDA API call to cuMemCreate.
+========= 
+========= Program hit CUDA_ERROR_NOT_PERMITTED (error 800) due to "operation not permitted" on CUDA API call to cuMemCreate.
+========= 
+........................                                                                      [100%]
+3 passed, 60 deselected in 250.06s (0:04:10)
+                                                                      [100%]
+3 passed, 60 deselected in 250.16s (0:04:10)
+                                                                      [100%]
+3 passed, 60 deselected in 250.19s (0:04:10)
+                                                                      [100%]
+3 passed, 60 deselected in 250.26s (0:04:10)
+                                                                      [100%]
+3 passed, 60 deselected in 250.23s (0:04:10)
+                                                                      [100%]
+3 passed, 60 deselected in 250.27s (0:04:10)
+                                                                      [100%]                                                                      [100%]
+
+3 passed, 60 deselected in 250.25s (0:04:10)
+3 passed, 60 deselected in 250.27s (0:04:10)
+========= ERROR SUMMARY: 16 errors

@@ -15,6 +15,16 @@ dist/
 .venv/
 __pycache__/
 
+# Kimi K3 gate evidence fetched from the Modal volume.
+#
+# Every gate writes its artifact into the volume and it is pulled back with
+# `modal volume get` into a directory named for the run. Those are generated
+# outputs of a measurement, not sources: they are large, they are not
+# reproducible from the tree, and a diff that carries them buries the change
+# that produced them. The numbers that matter are read out of them and written
+# into the Task 11b report instead.
+/kimi_k3_*/
+
 # Misc
 .DS_store
 .vscode

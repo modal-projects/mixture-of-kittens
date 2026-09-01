@@ -132,6 +132,11 @@ class MoKBuildExtension(build_ext):
             f"SRC={REPO_ROOT / 'csrc' / 'bindings.cu'}",
             f"NVCC={os.environ.get('MOK_NVCC', 'nvcc')}",
             f"ARCH={os.environ.get('MOK_ARCH', 'SM103')}",
+            # One unless a compute-sanitizer image asked for a wider bounded
+            # spin. Compile-time, so a build that leaves it alone is
+            # byte-identical to one from before the knob existed.
+            f"WAIT_TIMEOUT_SCALE="
+            f"{os.environ.get('MOK_WAIT_TIMEOUT_SCALE', '1')}",
             f"PYTHON={sys.executable}",
             f"THUNDERKITTENS_ROOT={THUNDERKITTENS_ROOT}",
             f"OUT={output_path}",

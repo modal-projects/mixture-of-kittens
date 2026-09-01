@@ -1,0 +1,448 @@
+"""CPU contract checks for the Kimi K3 public and custom-operator APIs.
+
+Loading ``mok.kimi_k3``, ``mok.ops``, and ``mok._fake_impls`` behind a stubbed
+extension is what lets these checks run on a machine with no compiled ``mok._C``.
+It also replaces the ``mok`` package in ``sys.modules`` and rebinds every ``mok::``
+operator to a stub-backed implementation, and neither effect can be undone: the
+dispatcher has no way to drop a registration. Both would otherwise outlive this
+file and reach the GPU test files that run after it in the same pytest process.
+
+``tests/test_kimi_k3_api.py`` therefore runs this module as its own process and
+asserts on the per-check results printed below ``RESULT_MARKER``.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import inspect
+import json
+import sys
+import traceback
+from collections.abc import Callable
+from dataclasses import FrozenInstanceError, fields, replace
+from functools import partial
+from pathlib import Path
+from types import ModuleType
+
+import pytest
+import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
+
+
+RESULT_MARKER = "KIMI_K3_API_CONTRACT_RESULTS "
+
+WEIGHT_FIELDS = (
+    "router_weight",
+    "router_correction_bias",
+    "routed_expert_down_proj",
+    "routed_expert_up_proj",
+    "routed_latent_rmsnorm_weight",
+    "expert_w13_packed",
+    "expert_w13_scale",
+    "expert_w2_packed",
+    "expert_w2_scale",
+    "shared_gate_proj",
+    "shared_up_proj",
+    "shared_down_proj",
+    "tp_rank",
+)
+LOW_LEVEL_ARGUMENTS = (
+    "hidden_states",
+    *WEIGHT_FIELDS[:-1],
+    "scratch",
+    "collective_buffer",
+    "collective_buffer_ptrs",
+    "collective_buffer_multicast_ptr",
+    "output_mailbox",
+    "output_mailbox_ptrs",
+    "output_mailbox_multicast_ptr",
+    "barrier_buffer",
+    "barrier_buffer_ptrs",
+    "barrier_buffer_multicast_ptr",
+    "barrier_target",
+    "error_flag",
+    "tp_rank",
+    "active_tokens",
+    "workspace_signature",
+)
+# Every tensor the step writes into, in schema order. A missing alias
+# annotation would let a compiler reorder the call against a reader of one of
+# these, which is exactly what the schema exists to prevent.
+LOW_LEVEL_MUTATED_ARGUMENTS = (
+    "scratch",
+    "collective_buffer",
+    "output_mailbox",
+    "barrier_buffer",
+    "barrier_target",
+    "error_flag",
+)
+# A fake trace has no addresses to fold, so it carries this placeholder in
+# place of a real workspace signature.
+TRACE_SIGNATURE = 0
+# The routed gate and up projections are one fused tile-major payload: 42
+# `(task, slab)` tiles of 128 rows, gate channels in the low half of a tile and
+# their own up rows in the high half. Same bytes as the four tensors it replaced,
+# in the order the gate/up unit's descriptor reads them.
+MXFP4_LAYOUTS = (
+    ("expert_w13_packed", (896, 5376, 256)),
+    ("expert_w13_scale", (896, 42, 2048)),
+    ("expert_w2_packed", (896, 3584, 192)),
+    ("expert_w2_scale", (896, 3584, 12)),
+)
+# The per-projection layout the prepared contract carried before the fused
+# gate/up engine landed. It is exactly as many bytes as the pair above, which is
+# why the pair replaced it rather than joining it -- but it is not the order the
+# descriptor reads, so it must no longer validate.
+STALE_SPLIT_MXFP4_LAYOUTS = (
+    ("expert_w13_packed", (896, 384, 1792)),
+    ("expert_w13_scale", (896, 384, 112)),
+)
+NONCONTRACT_HIDDEN_SHAPES = ((8, 7167), (8, 7168, 1))
+
+_MODULES: tuple[ModuleType, ModuleType, ModuleType] | None = None
+
+
+def _load_source_module(name: str, path: Path) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ModuleNotFoundError(f"Cannot load {name} from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_contract_modules() -> tuple[ModuleType, ModuleType, ModuleType]:
+    """Load source modules behind a controlled package and extension stub."""
+    global _MODULES
+    if _MODULES is not None:
+        return _MODULES
+
+    root = Path(__file__).parents[1]
+    package_dir = root / "mok"
+    package = ModuleType("mok")
+    package.__path__ = [str(package_dir)]
+    package.__package__ = "mok"
+    extension = ModuleType("mok._C")
+    extension.kimi_k3_decode = lambda *args: None
+    extension.kimi_k3_decode_workspace_bytes = lambda: 0
+    package._C = extension
+    sys.modules["mok"] = package
+    sys.modules["mok._C"] = extension
+
+    kimi_k3 = _load_source_module("mok.kimi_k3", package_dir / "kimi_k3.py")
+    ops = _load_source_module("mok.ops", package_dir / "ops.py")
+    fake_impls = _load_source_module(
+        "mok._fake_impls", package_dir / "_fake_impls.py"
+    )
+    _MODULES = kimi_k3, ops, fake_impls
+    return _MODULES
+
+
+def _valid_weights(kimi_k3: ModuleType):
+    meta_bf16 = lambda shape: torch.empty(  # noqa: E731
+        shape, dtype=torch.bfloat16, device="meta"
+    )
+    meta_uint8 = lambda shape: torch.empty(  # noqa: E731
+        shape, dtype=torch.uint8, device="meta"
+    )
+    return kimi_k3.KimiK3DecodeWeights(
+        router_weight=meta_bf16((896, 7168)),
+        router_correction_bias=torch.empty(896, dtype=torch.float32, device="meta"),
+        routed_expert_down_proj=meta_bf16((3584, 7168)),
+        routed_expert_up_proj=meta_bf16((7168, 3584)),
+        routed_latent_rmsnorm_weight=meta_bf16((3584,)),
+        expert_w13_packed=meta_uint8((896, 5376, 256)),
+        expert_w13_scale=meta_uint8((896, 42, 2048)),
+        expert_w2_packed=meta_uint8((896, 3584, 192)),
+        expert_w2_scale=meta_uint8((896, 3584, 12)),
+        shared_gate_proj=meta_bf16((768, 7168)),
+        shared_up_proj=meta_bf16((768, 7168)),
+        shared_down_proj=meta_bf16((7168, 768)),
+        tp_rank=0,
+    )
+
+
+def _fake_operator_args(hidden_states: torch.Tensor) -> tuple[object, ...]:
+    weights = tuple(hidden_states.new_empty((1,)) for _ in range(12))
+    scratch = hidden_states.new_empty((1,), dtype=torch.uint8)
+    collective_buffer = hidden_states.new_empty((1,))
+    output_mailbox = hidden_states.new_empty((1,))
+    barrier_buffer = hidden_states.new_empty((1,), dtype=torch.int32)
+    barrier_target = hidden_states.new_empty((1,), dtype=torch.int32)
+    error_flag = hidden_states.new_empty((1,), dtype=torch.int32)
+    # Distinct placeholder pointers and multicast aliases, because the
+    # operator's shape rules apply to a trace even though its address rules
+    # cannot.
+    return (
+        hidden_states,
+        *weights,
+        scratch,
+        collective_buffer,
+        list(range(16, 16 + 8 * 16, 16)),
+        1024,
+        output_mailbox,
+        list(range(2048, 2048 + 8 * 16, 16)),
+        4096,
+        barrier_buffer,
+        list(range(8192, 8192 + 8 * 4, 4)),
+        8448,
+        barrier_target,
+        error_flag,
+        0,
+        16,
+        TRACE_SIGNATURE,
+    )
+
+
+def check_weight_contract_has_exact_immutable_fields() -> None:
+    kimi_k3, _, _ = _load_contract_modules()
+    weight_type = kimi_k3.KimiK3DecodeWeights
+
+    assert tuple(field.name for field in fields(weight_type)) == WEIGHT_FIELDS
+    weights = _valid_weights(kimi_k3)
+    with pytest.raises(FrozenInstanceError):
+        weights.tp_rank = 1
+
+
+def check_decode_accepts_canonical_prepared_layouts() -> None:
+    kimi_k3, _, _ = _load_contract_modules()
+    hidden_states = torch.empty(16, 7168, dtype=torch.bfloat16, device="meta")
+
+    assert (
+        kimi_k3.validate_kimi_k3_decode_inputs(
+            hidden_states, _valid_weights(kimi_k3)
+        )
+        is None
+    )
+
+
+def check_decode_requires_tp8_sharded_shared_weights() -> None:
+    kimi_k3, _, _ = _load_contract_modules()
+    hidden_states = torch.empty(16, 7168, dtype=torch.bfloat16, device="meta")
+    weights = _valid_weights(kimi_k3)
+    sharded_weights = replace(
+        weights,
+        shared_gate_proj=torch.empty(
+            768, 7168, dtype=torch.bfloat16, device="meta"
+        ),
+        shared_up_proj=torch.empty(
+            768, 7168, dtype=torch.bfloat16, device="meta"
+        ),
+        shared_down_proj=torch.empty(
+            7168, 768, dtype=torch.bfloat16, device="meta"
+        ),
+    )
+
+    assert (
+        kimi_k3.validate_kimi_k3_decode_inputs(hidden_states, sharded_weights)
+        is None
+    )
+    full_width_weights = replace(
+        sharded_weights,
+        shared_gate_proj=torch.empty(
+            6144, 7168, dtype=torch.bfloat16, device="meta"
+        ),
+    )
+    with pytest.raises(
+        ValueError, match=r"shared_gate_proj must have shape \(768, 7168\)"
+    ):
+        kimi_k3.validate_kimi_k3_decode_inputs(hidden_states, full_width_weights)
+
+
+def check_prepared_contract_uses_native_k32_layout() -> None:
+    """Mixed W4A8 `kind::mxf8f6f4` runs at K=32, so W1/W3 store native K."""
+    kimi_k3, _, _ = _load_contract_modules()
+
+    assert kimi_k3.KIMI_K3_W1W3_K == kimi_k3.KIMI_K3_LATENT_SIZE == 3584
+    assert "KIMI_K3_W1W3_K" in kimi_k3.__all__
+    assert not hasattr(kimi_k3, "KIMI_K3_W1W3_PADDED_K")
+    assert "KIMI_K3_W1W3_PADDED_K" not in kimi_k3.__all__
+
+
+def check_decode_rejects_stale_split_mxfp4_layout() -> None:
+    """The per-projection prepared layout must no longer validate."""
+    kimi_k3, _, _ = _load_contract_modules()
+    hidden_states = torch.empty(16, 7168, dtype=torch.bfloat16, device="meta")
+    stale = {
+        field_name: torch.empty(shape, dtype=torch.uint8, device="meta")
+        for field_name, shape in STALE_SPLIT_MXFP4_LAYOUTS
+    }
+
+    with pytest.raises(ValueError, match="expert_w13_packed"):
+        kimi_k3.validate_kimi_k3_decode_inputs(
+            hidden_states, replace(_valid_weights(kimi_k3), **stale)
+        )
+
+
+def check_decode_rejects_noncanonical_mxfp4_layout(
+    field_name: str, expected_shape: tuple[int, ...]
+) -> None:
+    kimi_k3, _, _ = _load_contract_modules()
+    hidden_states = torch.empty(16, 7168, dtype=torch.bfloat16, device="meta")
+    weights = _valid_weights(kimi_k3)
+    invalid = torch.empty((*expected_shape[:-1], expected_shape[-1] - 1),
+                          dtype=torch.uint8, device="meta")
+
+    with pytest.raises(ValueError, match=field_name):
+        kimi_k3.validate_kimi_k3_decode_inputs(
+            hidden_states, replace(weights, **{field_name: invalid})
+        )
+
+
+def check_decode_accepts_token_count_at_contract_bounds(tokens: int) -> None:
+    kimi_k3, _, _ = _load_contract_modules()
+    hidden_states = torch.empty(tokens, 7168, dtype=torch.bfloat16, device="meta")
+
+    assert kimi_k3.validate_kimi_k3_decode_hidden_states(hidden_states) is None
+
+
+def check_decode_rejects_token_count_outside_contract(tokens: int) -> None:
+    kimi_k3, _, _ = _load_contract_modules()
+    hidden_states = torch.empty(tokens, 7168, dtype=torch.bfloat16, device="meta")
+
+    with pytest.raises(ValueError, match=r"between 1 and 128"):
+        kimi_k3.validate_kimi_k3_decode_hidden_states(hidden_states)
+
+
+def check_decode_rejects_noncontract_hidden_shape(shape: tuple[int, ...]) -> None:
+    kimi_k3, _, _ = _load_contract_modules()
+    hidden_states = torch.empty(shape, dtype=torch.bfloat16, device="meta")
+
+    with pytest.raises(ValueError, match=r"shape \[M, 7168\]"):
+        kimi_k3.validate_kimi_k3_decode_hidden_states(hidden_states)
+
+
+def check_decode_rejects_non_bf16_hidden_states() -> None:
+    kimi_k3, _, _ = _load_contract_modules()
+    hidden_states = torch.empty(8, 7168, dtype=torch.float32, device="meta")
+
+    with pytest.raises(TypeError, match="torch.bfloat16"):
+        kimi_k3.validate_kimi_k3_decode_hidden_states(hidden_states)
+
+
+def check_decode_rejects_noncontiguous_hidden_states() -> None:
+    kimi_k3, _, _ = _load_contract_modules()
+    hidden_states = torch.empty(
+        7168, 8, dtype=torch.bfloat16, device="meta"
+    ).transpose(0, 1)
+
+    with pytest.raises(ValueError, match="contiguous"):
+        kimi_k3.validate_kimi_k3_decode_hidden_states(hidden_states)
+
+
+def check_fake_decode_traces_and_returns_nothing() -> None:
+    """The step writes into the caller's mailbox, so a trace allocates nothing."""
+    _, ops, _ = _load_contract_modules()
+    with FakeTensorMode():
+        hidden_states = torch.empty(
+            16, 7168, dtype=torch.bfloat16, device="cuda"
+        )
+        assert ops.kimi_k3_decode(*_fake_operator_args(hidden_states)) is None
+
+
+def check_fake_decode_requires_the_placeholder_signature() -> None:
+    """A trace must carry the documented zero, not an invented value.
+
+    A trace's pointers are placeholders, so the operator cannot recompute a
+    signature from them. Accepting an arbitrary number there would let a
+    traced call carry a signature that was never checked against anything;
+    pinning it to zero keeps the placeholder a placeholder.
+    """
+    _, ops, _ = _load_contract_modules()
+    with FakeTensorMode():
+        hidden_states = torch.empty(
+            16, 7168, dtype=torch.bfloat16, device="cuda"
+        )
+        arguments = list(_fake_operator_args(hidden_states))
+        assert arguments[-1] == TRACE_SIGNATURE
+        arguments[-1] = 1
+        with pytest.raises(RuntimeError, match="while tracing fake tensors"):
+            ops.kimi_k3_decode(*arguments)
+
+
+def check_fake_decode_signature_matches_custom_op() -> None:
+    _, _, fake_impls = _load_contract_modules()
+    schema = torch.ops.mok.kimi_k3_decode.default._schema
+    schema_names = tuple(
+        argument.name for argument in schema.arguments
+    )
+
+    assert schema_names == LOW_LEVEL_ARGUMENTS
+    assert tuple(
+        inspect.signature(fake_impls._kimi_k3_decode_fake).parameters
+    ) == schema_names
+    assert schema.returns == []
+    assert tuple(
+        argument.name
+        for argument in schema.arguments
+        if argument.alias_info is not None and argument.alias_info.is_write
+    ) == LOW_LEVEL_MUTATED_ARGUMENTS
+
+
+CHECKS: dict[str, Callable[[], None]] = {
+    "weight_contract_has_exact_immutable_fields":
+        check_weight_contract_has_exact_immutable_fields,
+    "decode_accepts_canonical_prepared_layouts":
+        check_decode_accepts_canonical_prepared_layouts,
+    "decode_requires_tp8_sharded_shared_weights":
+        check_decode_requires_tp8_sharded_shared_weights,
+    "prepared_contract_uses_native_k32_layout":
+        check_prepared_contract_uses_native_k32_layout,
+    "decode_rejects_stale_split_mxfp4_layout":
+        check_decode_rejects_stale_split_mxfp4_layout,
+    **{
+        f"decode_rejects_noncanonical_mxfp4_layout[{field_name}]": partial(
+            check_decode_rejects_noncanonical_mxfp4_layout, field_name, shape
+        )
+        for field_name, shape in MXFP4_LAYOUTS
+    },
+    **{
+        f"decode_accepts_token_count_at_contract_bounds[{tokens}]": partial(
+            check_decode_accepts_token_count_at_contract_bounds, tokens
+        )
+        for tokens in (1, 128)
+    },
+    **{
+        f"decode_rejects_token_count_outside_contract[{tokens}]": partial(
+            check_decode_rejects_token_count_outside_contract, tokens
+        )
+        for tokens in (0, 129)
+    },
+    **{
+        f"decode_rejects_noncontract_hidden_shape[{shape}]": partial(
+            check_decode_rejects_noncontract_hidden_shape, shape
+        )
+        for shape in NONCONTRACT_HIDDEN_SHAPES
+    },
+    "decode_rejects_non_bf16_hidden_states":
+        check_decode_rejects_non_bf16_hidden_states,
+    "decode_rejects_noncontiguous_hidden_states":
+        check_decode_rejects_noncontiguous_hidden_states,
+    "fake_decode_traces_and_returns_nothing":
+        check_fake_decode_traces_and_returns_nothing,
+    "fake_decode_requires_the_placeholder_signature":
+        check_fake_decode_requires_the_placeholder_signature,
+    "fake_decode_signature_matches_custom_op":
+        check_fake_decode_signature_matches_custom_op,
+}
+
+
+def main() -> int:
+    results: dict[str, dict[str, str]] = {}
+    for name, check in CHECKS.items():
+        try:
+            check()
+        except (Exception, pytest.fail.Exception):
+            # A missing `pytest.raises` failure is a Failed, not an Exception, so
+            # without it here one broken check would hide every later one.
+            results[name] = {"outcome": "failed", "detail": traceback.format_exc()}
+        else:
+            results[name] = {"outcome": "passed", "detail": ""}
+    print(RESULT_MARKER + json.dumps(results))
+    failures = sum(result["outcome"] == "failed" for result in results.values())
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

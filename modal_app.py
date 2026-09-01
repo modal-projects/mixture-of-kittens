@@ -1,175 +1,62 @@
 """Modal app for building and running Mixture-of-Kittens (MoK) on Blackwell GPUs.
 
-MoK is a MoE training megakernel that requires NVIDIA Blackwell GPUs, CUDA 13.0+, and
-PyTorch 2.10+. Those GPUs are not present on a typical dev box, so this app builds and
-runs MoK on Modal's Blackwell fleet instead.
-
-Target: 8x B300 (SM103). B300 requires CUDA 13.1+, and MoK's ``setup.py`` requires the
-nvcc version to match PyTorch's CUDA version, so B300 is built against CUDA 13.2 with
-``torch==2.13.0+cu132``. A B200 (SM100) spec is kept alongside it so the same machinery
-covers both architectures; each spec produces its own image that Modal content-addresses
-and caches independently, so a given architecture is compiled only once and reused across
-runs until its source or config changes.
-
-The CUDA extension is compiled once, inside the image build (a GPU-less CPU builder), by
-pointing the linker at the CUDA driver *stub* for ``-lcuda``. At runtime the real driver is
-injected by Modal on the GPU container.
+Every function and entrypoint lives in one of the five modules imported below.
+This file is the one `modal run` is pointed at, so it is the one place that has
+to import all of them: each `@app.function` and `@app.local_entrypoint` is
+registered by the import, and each is re-exported by name because `modal run
+modal_app.py::verify` resolves an attribute of *this* module. Importing the
+five modules alone would register everything and still leave every documented
+command below unresolvable, so `test_every_registered_name_is_reachable_by_name`
+holds the two lists together.
 
 Usage (from the repo root, with MODAL_TOKEN_ID / MODAL_TOKEN_SECRET set):
 
     modal run modal_app.py                 # build check on a single B300
     modal run modal_app.py::gpu_info       # same, explicit
     modal run modal_app.py::bench          # 8x B300 benchmark + correctness check
+    modal run modal_app.py::verify         # the Kimi K3 gates
+    modal run modal_app.py::engine_probe   # the gate/up engine A/B
+    modal run modal_app.py::compare        # the pinned framework comparison
 
 Environment overrides:
-    MOK_GPU          (default B300)  which spec below to use (B300 or B200)
+    MOK_GPU          (default B300)  which spec to use (B300 or B200)
     MOK_BENCH_NPROC  (default 8)     GPUs / EP ranks for the benchmark (1, 4, or 8)
 """
 
-import os
-import subprocess
-from dataclasses import dataclass
-
-import modal
-
-
-@dataclass(frozen=True)
-class GPUSpec:
-    gpu: str          # Modal GPU type
-    cuda_tag: str     # nvidia/cuda devel image tag (nvcc)
-    torch_spec: str   # torch requirement
-    torch_index: str  # PyTorch wheel index (must match cuda_tag major.minor)
-    mok_arch: str     # MOK_ARCH passed to the build
-
-
-# One spec per architecture. Each yields a separately-cached Modal image.
-SPECS: dict[str, GPUSpec] = {
-    # B300 (Blackwell Ultra, SM103): CUDA 13.1+ required -> CUDA 13.2 + torch cu132.
-    "B300": GPUSpec(
-        gpu="B300",
-        cuda_tag="13.2.1-devel-ubuntu24.04",
-        torch_spec="torch==2.13.0",
-        torch_index="https://download.pytorch.org/whl/cu132",
-        mok_arch="SM103",
-    ),
-    # B200 (Blackwell, SM100): CUDA 13.0 + torch cu130.
-    "B200": GPUSpec(
-        gpu="B200",
-        cuda_tag="13.0.1-devel-ubuntu24.04",
-        torch_spec="torch==2.10.0",
-        torch_index="https://download.pytorch.org/whl/cu130",
-        mok_arch="SM100",
-    ),
-}
-
-GPU_TYPE = os.environ.get("MOK_GPU", "B300")
-SPEC = SPECS[GPU_TYPE]
-BENCH_NPROC = int(os.environ.get("MOK_BENCH_NPROC", "8"))  # 8x B300 by default
-
-# The CUDA driver stub satisfies `-lcuda` at build time (no GPU/driver on the builder).
-CUDA_STUBS = "/usr/local/cuda/lib64/stubs"
-
-app = modal.App("mixture-of-kittens")
-
-
-# Only the paths needed to build and run MoK are copied into the image. Using an explicit
-# allowlist (instead of the whole repo) keeps the image content-hash stable, so Modal's
-# layer cache is reused across runs and unrelated files (logs, .venv, .cursor, editor
-# state) never invalidate the cached compile.
-BUILD_DIRS = ("csrc", "mok", "benchmarks", "tests", "third_party/ThunderKittens")
-BUILD_FILES = ("setup.py", "pyproject.toml", "Makefile", "README.md", "LICENSE")
-REMOTE_ROOT = "/root/mok"
-
-
-def build_image(spec: GPUSpec) -> modal.Image:
-    """Build a MoK image for one architecture. Modal caches each distinct image."""
-    image = (
-        modal.Image.from_registry(f"nvidia/cuda:{spec.cuda_tag}", add_python="3.12")
-        .apt_install("build-essential", "git")
-        # setuptools>=80 is required by the repo build (PEP 639 license metadata);
-        # install it explicitly since we build with --no-build-isolation.
-        .pip_install("setuptools>=80", "wheel")
-        .pip_install(spec.torch_spec, index_url=spec.torch_index)
-        .pip_install("pytest>=9,<10", "numpy")
-        .env({"MOK_ARCH": spec.mok_arch})
-    )
-    for directory in BUILD_DIRS:
-        image = image.add_local_dir(
-            directory,
-            remote_path=f"{REMOTE_ROOT}/{directory}",
-            copy=True,
-            ignore=["**/__pycache__", "**/*.so", "**/*.egg-info", "**/.git"],
-        )
-    for file in BUILD_FILES:
-        image = image.add_local_file(file, remote_path=f"{REMOTE_ROOT}/{file}", copy=True)
-    return image.run_commands(
-        # Build the CUDA extension during image build; stub dir provides libcuda.
-        f"cd {REMOTE_ROOT} && LIBRARY_PATH={CUDA_STUBS} pip install -e . --no-build-isolation",
-    ).workdir(REMOTE_ROOT)
-
-
-IMAGE = build_image(SPEC)
-
-
-@app.function(image=IMAGE, gpu=SPEC.gpu, timeout=1800)
-def gpu_info() -> None:
-    """Confirm the compiled extension imports and the GPU is the expected Blackwell part."""
-    import torch
-
-    import mok
-
-    print("=" * 60)
-    print(f"torch             : {torch.__version__}")
-    print(f"torch CUDA        : {torch.version.cuda}")
-    print(f"mok.__version__   : {mok.__version__}")
-    name = torch.cuda.get_device_name(0)
-    major, minor = torch.cuda.get_device_capability(0)
-    print(f"GPU               : {name}")
-    print(f"compute capability: sm_{major}{minor}")
-    print(f"visible GPUs      : {torch.cuda.device_count()}")
-
-    # Exercise a real compiled kernel (mxfp8 weight quantization) end-to-end on the GPU.
-    from mok import ops
-
-    w = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
-    w_fp8, w_sc, _, _ = ops.mxfp8_quantize(w, True, False)
-    torch.cuda.synchronize()
-    print(f"mxfp8_quantize    : out={tuple(w_fp8.shape)} dtype={w_fp8.dtype} scale={tuple(w_sc.shape)}")
-    print("BUILD + KERNEL OK")
-    print("=" * 60)
-
-
-def _run_bench(nproc: int) -> None:
-    env = os.environ.copy()
-    env.setdefault("PYTHONUNBUFFERED", "1")
-    # A modest, cheap-but-representative config. NUM_EXPERTS must be divisible by nproc.
-    env.setdefault("NUM_EXPERTS", str(8 * nproc))
-    env.setdefault("HIDDEN_DIM", "2048")
-    env.setdefault("INTERMEDIATE_DIM", "2048")
-    env.setdefault("TOPK", "4")
-    env.setdefault("NUM_LOCAL_TOKENS", "2048")
-    env.setdefault("MINIBATCH_SIZE", "2048")
-    env.setdefault("MACROBATCH_SIZE", "8192")
-    cmd = [
-        "python",
-        "-m",
-        "torch.distributed.run",
-        "--standalone",
-        f"--nproc-per-node={nproc}",
-        "-m",
-        "benchmarks.bench_mok",
-    ]
-    print(f"Launching: {' '.join(cmd)} on {nproc} x {SPEC.gpu}")
-    subprocess.run(cmd, cwd="/root/mok", env=env, check=True)
-
-
-@app.function(image=IMAGE, gpu=f"{SPEC.gpu}:{BENCH_NPROC}", timeout=3600)
-def bench() -> None:
-    """Run the MoK benchmark (BF16 + MXFP8 forward/backward, correctness + TFLOP/s)."""
-    import torch
-
-    print(f"visible GPUs: {torch.cuda.device_count()} ({torch.cuda.get_device_name(0)})")
-    _run_bench(BENCH_NPROC)
+from modal_images import app
+from modal_bench import (  # noqa: F401
+    bench,
+    bench_kimi_k3_decode,
+    gpu_info,
+    test_kimi_k3_decode,
+)
+from modal_k3_gates import (  # noqa: F401
+    bench_kimi_k3_decode_persisted,
+    sanitize_kimi_k3_decode,
+    sass_kimi_k3_decode,
+    stress_kimi_k3_schedule,
+    trap_kimi_k3_schedule,
+    verify,
+    verify_kimi_k3,
+)
+from modal_k3_probes import (  # noqa: F401
+    batched_expert_diagnostic,
+    batched_expert_probe,
+    bench_kimi_k3_batched_expert_probe,
+    bench_kimi_k3_engine_probe,
+    bench_kimi_k3_schedule_probe,
+    diagnose_kimi_k3_batched_expert_probe,
+    engine_probe,
+    schedule_probe,
+)
+from modal_frameworks import (  # noqa: F401
+    compare,
+    compare_sglang,
+    compare_vllm,
+    graph_routes,
+    graph_routes_sglang,
+    graph_routes_vllm,
+)
 
 
 @app.local_entrypoint()
