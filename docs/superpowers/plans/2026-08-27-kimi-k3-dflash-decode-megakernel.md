@@ -1098,6 +1098,7 @@ git commit -m "bench: compare Kimi K3 kernel with serving backends"
 
 **Files:**
 - Create: `benchmarks/smoke_dflash_server.py`
+- Create: `tests/test_kimi_k3_dflash_smoke.py`
 - Modify: `modal_app.py`
 
 **Interfaces:**
@@ -1109,6 +1110,11 @@ git commit -m "bench: compare Kimi K3 kernel with serving backends"
 Mount a Modal Volume named `kimi-k3-dflash-checkpoint`. Download
 `moonshotai/Kimi-K3` and `modal-labs/Kimi-K3-DFlash` at runtime with resume,
 never during image build.
+
+Before transfer, query repository metadata, persist the exact revisions and
+declared byte counts, and verify the Modal Volume has enough free space.
+Authentication, quota, missing revision, or insufficient-space errors must be
+recorded exactly and must not be presented as serving results.
 
 - [ ] **Step 2: Add the SGLang smoke command**
 
@@ -1137,8 +1143,8 @@ Task 11.
 Run:
 
 ```bash
-modal run modal_app.py::dflash_smoke_sglang
-modal run modal_app.py::dflash_smoke_vllm
+modal run --env rahul-dev --write-result /opt/cursor/artifacts/dflash_smoke_sglang.json modal_app.py::dflash_smoke_sglang
+modal run --env rahul-dev --write-result /opt/cursor/artifacts/dflash_smoke_vllm.json modal_app.py::dflash_smoke_vllm
 ```
 
 Expected: SGLang serves a successful generation at every concurrency. The
@@ -1148,7 +1154,7 @@ error without masking it.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add benchmarks/smoke_dflash_server.py modal_app.py
+git add benchmarks/smoke_dflash_server.py tests/test_kimi_k3_dflash_smoke.py modal_app.py
 git commit -m "test: validate Kimi K3 DFlash serving"
 ```
 
